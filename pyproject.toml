@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "numpy", "pillow"]
 
 [build-system]
 requires = ["setuptools>=61"]
