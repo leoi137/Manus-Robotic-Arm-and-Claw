@@ -239,7 +239,7 @@ def main() -> int:
     from manus import specs
     from manus.objects import OBJECTS
     from manus.randomize import EpisodeDraw
-    from manus.task_scene import GraspSceneCfg
+    from manus.task_scene import grasp_scene_cfg
 
     dataset_dir = args_cli.root / "datasets" / "raw" / args_cli.dataset
     paths = chosen_episodes(dataset_dir, args_cli.episodes)
@@ -268,7 +268,7 @@ def main() -> int:
         )
 
     sim = sim_utils.SimulationContext(sim_utils.SimulationCfg(dt=physics_dt, device=args_cli.device))
-    scene = InteractiveScene(GraspSceneCfg(num_envs=1, env_spacing=2.0))
+    scene = InteractiveScene(grasp_scene_cfg(args_cli.object, num_envs=1, env_spacing=2.0))
     sim.reset()
     replayer = Replayer(sim, scene, spec)
 

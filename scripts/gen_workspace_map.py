@@ -565,7 +565,7 @@ def run_gate() -> int:
     )
     from manus.objects import OBJECTS
     from manus.randomize import draw_episode
-    from manus.task_scene import GraspSceneCfg, apply_randomization
+    from manus.task_scene import apply_randomization, grasp_scene_cfg
 
     physics_dt = 1.0 / 120.0
     decimation = 4
@@ -583,7 +583,7 @@ def run_gate() -> int:
     sim = sim_utils.SimulationContext(
         sim_utils.SimulationCfg(dt=physics_dt, device=args_cli.device)
     )
-    scene = InteractiveScene(GraspSceneCfg(num_envs=1, env_spacing=2.0))
+    scene = InteractiveScene(grasp_scene_cfg(args_cli.object, num_envs=1, env_spacing=2.0))
     sim.reset()
 
     robot = scene["robot"]

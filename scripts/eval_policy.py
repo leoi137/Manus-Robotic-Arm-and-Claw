@@ -805,7 +805,7 @@ def main(args: Any) -> int:  # noqa: PLR0915 - one linear run script
     from manus import recorder
     from manus.objects import OBJECTS
     from manus.randomize import draw_episode, stable_hash64
-    from manus.task_scene import GraspSceneCfg
+    from manus.task_scene import grasp_scene_cfg
 
     if not args.ckpt_run:
         raise SystemExit(
@@ -839,7 +839,7 @@ def main(args: Any) -> int:  # noqa: PLR0915 - one linear run script
     sim = sim_utils.SimulationContext(
         sim_utils.SimulationCfg(dt=recorder.PHYSICS_DT, device=args.device)
     )
-    scene = InteractiveScene(GraspSceneCfg(num_envs=1, env_spacing=2.0))
+    scene = InteractiveScene(grasp_scene_cfg(args.object, num_envs=1, env_spacing=2.0))
     sim.reset()
     runner = EvalRunner(sim, scene, spec, client)
 

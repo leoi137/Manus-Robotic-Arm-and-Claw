@@ -566,7 +566,12 @@ def main() -> int:
     sim = sim_utils.SimulationContext(
         sim_utils.SimulationCfg(dt=PHYSICS_DT, device=args_cli.device)
     )
-    scene = InteractiveScene(ProbeSceneCfg(num_envs=1, env_spacing=2.0))
+    # Mirror task_scene.grasp_scene_cfg: the class body bakes cube_3cm, so the
+    # requested object must be swapped in before the scene spawns.
+    probe_cfg = ProbeSceneCfg(num_envs=1, env_spacing=2.0)
+    probe_cfg.object.spawn = spec.make_spawn_cfg()
+    probe_cfg.object.init_state.pos = (*probe_cfg.object.init_state.pos[:2], spec.spawn_z)
+    scene = InteractiveScene(probe_cfg)
     sim.reset()
     runner = ProbeRunner(sim, scene, spec)
     print(f"  fixed-jaw sensor bodies : {runner.probes[0].body_names}")

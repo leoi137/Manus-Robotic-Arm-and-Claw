@@ -670,7 +670,7 @@ def main() -> int:
 
     from manus.expert import ExpertConfig
     from manus.objects import OBJECTS
-    from manus.task_scene import GraspSceneCfg
+    from manus.task_scene import grasp_scene_cfg
 
     dataset_dir = args_cli.root / "datasets" / "raw" / args_cli.dataset
     spec = OBJECTS[args_cli.object]
@@ -687,7 +687,7 @@ def main() -> int:
     sim = sim_utils.SimulationContext(
         sim_utils.SimulationCfg(dt=recorder.PHYSICS_DT, device=args_cli.device)
     )
-    scene = InteractiveScene(GraspSceneCfg(num_envs=1, env_spacing=2.0))
+    scene = InteractiveScene(grasp_scene_cfg(args_cli.object, num_envs=1, env_spacing=2.0))
     sim.reset()
     runner = EpisodeRunner(sim, scene, spec, config)
     env = env_block(sim, spec, config)
