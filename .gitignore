@@ -1,7 +1,32 @@
 __pycache__/
 *.pyc
 *.egg-info/
-runs/
 plans/SESSIONS.md
 .pytest_cache/
 imgui.ini
+.venv-lerobot/
+# scripts/fix_jaw_collision.py's pristine copy of the converter output; the
+# patched layer is what gets tracked, and --revert restores from this.
+*.orig-convexhull
+
+# Datasets and run outputs are too large to track, but the provenance that
+# makes them traceable is not: ignore the trees, then negate the ledgers,
+# manifests and reports back in. The directory negations are load-bearing --
+# git will not descend into an excluded directory to find a re-included file.
+# tests/test_gitignore_contract.py pins both halves of this contract.
+datasets/raw/**
+!datasets/raw/
+!datasets/raw/*/
+!datasets/raw/*/manifest.json
+!datasets/raw/*/attempts.jsonl
+runs/**
+!runs/
+!runs/**/
+!runs/**/report.md
+!runs/**/run.json
+# The converted copy carries no provenance of its own -- it is a pure function
+# of datasets/raw/<name>/ and scripts/convert_dataset.py, and the split it is
+# trained on is recorded in the raw manifest -- so none of it is negated back
+# in. tests/test_dataset_artifacts.py pins that, and that the tracked previews
+# in media/ stay tracked.
+datasets/lerobot/**
