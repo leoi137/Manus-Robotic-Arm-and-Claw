@@ -6,8 +6,10 @@ POV camera. No AI: structure and motor control only.
 
 ![wrist POV](media/wrist_cam_pov.png)
 
-Third-person demo video: [`media/demo_showcase.mp4`](media/demo_showcase.mp4) — the arm runs the
-scripted sequence while an exterior camera orbits it, wrist POV inset in the corner.
+![third-person demo](media/demo_showcase.gif)
+
+Third-person demo: the arm runs the scripted sequence while an exterior camera orbits it, wrist
+POV inset in the corner. Full-quality video: [`media/demo_showcase.mp4`](media/demo_showcase.mp4).
 
 ## What's here
 
