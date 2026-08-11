@@ -1,0 +1,863 @@
+{
+  "kind": "eval",
+  "run_name": "eval__grasp_cube_dev__20260811-0703__d0e26f30",
+  "dataset_name": "grasp_cube_dev",
+  "dataset_id": "9470164d469000798907ebe9d5fe3e816e3160ff2bff08ed432938b6325f6e6b",
+  "checkpoint": {
+    "run": "train__grasp_cube_dev__20260811-0657__d0e26f30",
+    "which": "best",
+    "path": "runs/train/train__grasp_cube_dev__20260811-0657__d0e26f30/checkpoints/00001500",
+    "step": 1500,
+    "sha256": "87c08433fd2b4dd748d6f96c72a3a88957dbe2a1186e4ded445144fa1171288b",
+    "train_steps": 2000,
+    "train_val_best": {
+      "step": 1500,
+      "loss": 0.13219132294662955,
+      "l1_loss": 0.13219132294662955,
+      "frames": 588,
+      "train_loss_mean": 1.399690819978714
+    }
+  },
+  "seeds": {
+    "namespace": "eval_dev",
+    "base": 10000000,
+    "first": 10000000,
+    "last": 10000009,
+    "held_out_floor": 10000000,
+    "overlap_with_training": false,
+    "note": "draw_episode hashes (namespace, attempt_index); the namespace differs from the training dataset's and every index is at or above the held-out floor"
+  },
+  "loop": {
+    "control_hz": 30,
+    "physics_dt": 0.008333333333333333,
+    "decimation": 4,
+    "max_control_steps": 450,
+    "settle_steps": 30,
+    "warmup_renders": 6,
+    "chunk_size": 50,
+    "ensemble_coeff": 0.1,
+    "ensemble": "ACT Algorithm 2, w_i = exp(-m i), w_0 on the oldest chunk",
+    "frame_hw": [
+      240,
+      320
+    ],
+    "native_hw": [
+      480,
+      640
+    ],
+    "resample": "PIL LANCZOS",
+    "jpeg_quality": 92
+  },
+  "success_predicate": {
+    "source": "manus.expert.GraspSuccessMonitor (the expert's, unchanged)",
+    "lift_m": 0.05,
+    "sustain_steps": 30,
+    "gripper_held_max_rad": 1.0
+  },
+  "result_detail": {
+    "episodes": 10,
+    "successes": 0,
+    "success_rate": 0.0,
+    "wilson95": {
+      "lower": 0.0,
+      "upper": 0.2775327998628892,
+      "z": 1.959963984540054
+    },
+    "outcomes": {
+      "no_lift": 10
+    },
+    "cells": {
+      "r0_az0": {
+        "n": 1,
+        "successes": 0,
+        "rate": 0.0
+      },
+      "r0_az1": {
+        "n": 1,
+        "successes": 0,
+        "rate": 0.0
+      },
+      "r0_az5": {
+        "n": 1,
+        "successes": 0,
+        "rate": 0.0
+      },
+      "r1_az0": {
+        "n": 2,
+        "successes": 0,
+        "rate": 0.0
+      },
+      "r1_az2": {
+        "n": 1,
+        "successes": 0,
+        "rate": 0.0
+      },
+      "r2_az0": {
+        "n": 2,
+        "successes": 0,
+        "rate": 0.0
+      },
+      "r2_az2": {
+        "n": 1,
+        "successes": 0,
+        "rate": 0.0
+      },
+      "r2_az3": {
+        "n": 1,
+        "successes": 0,
+        "rate": 0.0
+      }
+    }
+  },
+  "motion": {
+    "episodes": 10,
+    "total_path_rad": {
+      "min": 9.415134875962792,
+      "mean": 12.554756820695001,
+      "max": 16.420116743472192
+    },
+    "max_excursion_rad": {
+      "min": 1.7227803468704224,
+      "mean": 2.014168858528137,
+      "max": 2.6888587474823
+    },
+    "episodes_with_no_motion": 0
+  },
+  "latency": {
+    "roundtrip": {
+      "requests": 4500,
+      "p50_ms": 43.568417997448705,
+      "p95_ms": 101.85624100267887,
+      "max_ms": 152.59207700000843,
+      "mean_ms": 48.49547386959279
+    },
+    "server": {
+      "requests": 4500,
+      "p50_ms": 43.01042699808022,
+      "p95_ms": 100.76609200041275,
+      "max_ms": 151.65931600495242,
+      "mean_ms": 47.87786641883819
+    },
+    "note": "round-trip includes JPEG encode, socket IPC and the server's inference"
+  },
+  "episodes": [
+    {
+      "episode": 0,
+      "seed_index": 10000000,
+      "draw": {
+        "object_x": 0.008058032954552635,
+        "object_y": -0.17303231098961727,
+        "object_yaw": -3.011746945891637,
+        "object_color": [
+          0.2820463679518099,
+          0.6666609855627846,
+          0.46959862956109977
+        ],
+        "object_static_friction": 1.1038822693378054,
+        "object_dynamic_friction": 1.1038822693378054,
+        "dome_intensity": 557.6923135696009,
+        "distant_intensity": 1144.8946745748774,
+        "distant_azimuth": 5.815686895985438,
+        "distant_elevation": 1.2707633799972633,
+        "cam_dpos": [
+          -0.002356282558853568,
+          -0.0002986693615359584,
+          -0.0027757434635162248
+        ],
+        "cam_dquat_xyzw": [
+          -0.00744047273778593,
+          -0.012677800341016378,
+          0.0022512677765598485,
+          0.9998894161542815
+        ],
+        "ground_albedo": 0.24600501537168123
+      },
+      "cell": "r1_az0",
+      "success": false,
+      "outcome": "no_lift",
+      "stop_reason": "max_steps",
+      "steps": 450,
+      "rest_z": 0.014999988488852978,
+      "monitor": {
+        "success": false,
+        "peak_z": 0.021228784695267677,
+        "threshold_z": 0.065,
+        "best_streak": 0,
+        "sustain": 30
+      },
+      "chunk_size": 50,
+      "motion": {
+        "path_length_rad": [
+          3.0467480338963355,
+          1.170407697558403,
+          1.250485185533762,
+          1.7134206565096974,
+          2.786741420534658,
+          3.198082345201888
+        ],
+        "peak_excursion_rad": [
+          1.7227803468704224,
+          0.7210040092468262,
+          1.1407520771026611,
+          1.376147747039795,
+          1.0393425226211548,
+          1.7160632610321045
+        ],
+        "total_path_rad": 13.165885339234743,
+        "max_excursion_rad": 1.7227803468704224
+      },
+      "wall_clock_s": 51.46968721199664,
+      "seed": 11238440008792013433
+    },
+    {
+      "episode": 1,
+      "seed_index": 10000001,
+      "draw": {
+        "object_x": 0.06751413387040259,
+        "object_y": -0.14226516479530252,
+        "object_yaw": -2.772399431636406,
+        "object_color": [
+          0.26936633425446754,
+          0.7369929003387161,
+          0.6272589312264675
+        ],
+        "object_static_friction": 0.8052097711050074,
+        "object_dynamic_friction": 0.8052097711050074,
+        "dome_intensity": 1047.952132487097,
+        "distant_intensity": 1915.2421897587421,
+        "distant_azimuth": 0.788665645660681,
+        "distant_elevation": 0.6291505078760348,
+        "cam_dpos": [
+          -0.0006165448465701622,
+          0.00044838657413798786,
+          -0.0006123348107149552
+        ],
+        "cam_dquat_xyzw": [
+          -0.009880852821135908,
+          -0.0012341834692260023,
+          -0.002546679752508667,
+          0.9999471785854139
+        ],
+        "ground_albedo": 0.16848020160051183
+      },
+      "cell": "r0_az0",
+      "success": false,
+      "outcome": "no_lift",
+      "stop_reason": "max_steps",
+      "steps": 450,
+      "rest_z": 0.01499996893107891,
+      "monitor": {
+        "success": false,
+        "peak_z": 0.014999995939433575,
+        "threshold_z": 0.065,
+        "best_streak": 0,
+        "sustain": 30
+      },
+      "chunk_size": 50,
+      "motion": {
+        "path_length_rad": [
+          3.808464918463244,
+          1.4739294741302729,
+          1.382270086556673,
+          1.8021791251376271,
+          3.915056888571722,
+          4.038216250612654
+        ],
+        "peak_excursion_rad": [
+          1.151778221130371,
+          1.0251578092575073,
+          1.142467737197876,
+          1.4057508707046509,
+          0.6915775537490845,
+          1.7453303337097168
+        ],
+        "total_path_rad": 16.420116743472192,
+        "max_excursion_rad": 1.7453303337097168
+      },
+      "wall_clock_s": 50.755350478000764,
+      "seed": 3398844691451201207
+    },
+    {
+      "episode": 2,
+      "seed_index": 10000002,
+      "draw": {
+        "object_x": 0.05747080028877112,
+        "object_y": -0.21155676795581868,
+        "object_yaw": 2.3303494481839024,
+        "object_color": [
+          0.8580876283795194,
+          0.7837529326663648,
+          0.6454658106313729
+        ],
+        "object_static_friction": 0.8641228404456018,
+        "object_dynamic_friction": 0.8641228404456018,
+        "dome_intensity": 847.2473133001722,
+        "distant_intensity": 1106.1322223013362,
+        "distant_azimuth": 3.3091619669192722,
+        "distant_elevation": 1.158594598650582,
+        "cam_dpos": [
+          -0.00025081460008640746,
+          0.0005650877116771839,
+          0.0007481429900389022
+        ],
+        "cam_dquat_xyzw": [
+          0.0018427111140445743,
+          0.007884628654470024,
+          -0.0023457887338600996,
+          0.99996446652966
+        ],
+        "ground_albedo": 0.43488080466413304
+      },
+      "cell": "r2_az0",
+      "success": false,
+      "outcome": "no_lift",
+      "stop_reason": "max_steps",
+      "steps": 450,
+      "rest_z": 0.014999999664723873,
+      "monitor": {
+        "success": false,
+        "peak_z": 0.015000002458691597,
+        "threshold_z": 0.065,
+        "best_streak": 0,
+        "sustain": 30
+      },
+      "chunk_size": 50,
+      "motion": {
+        "path_length_rad": [
+          2.0216313779207553,
+          0.9519842602312565,
+          1.0210195444524288,
+          1.773360756225884,
+          2.7208746374573236,
+          2.8561841423057697
+        ],
+        "peak_excursion_rad": [
+          1.1587156057357788,
+          0.538431704044342,
+          0.9452162384986877,
+          1.4320429563522339,
+          2.1861321926116943,
+          1.7453302145004272
+        ],
+        "total_path_rad": 11.345054718593419,
+        "max_excursion_rad": 2.1861321926116943
+      },
+      "wall_clock_s": 49.88814008799818,
+      "seed": 8769725771034086513
+    },
+    {
+      "episode": 3,
+      "seed_index": 10000003,
+      "draw": {
+        "object_x": 0.22520827667470616,
+        "object_y": 0.06490052276789599,
+        "object_yaw": 2.3740533812825113,
+        "object_color": [
+          0.23358559210746332,
+          0.8982363273623462,
+          0.6079676422951884
+        ],
+        "object_static_friction": 0.8153310655135395,
+        "object_dynamic_friction": 0.8153310655135395,
+        "dome_intensity": 584.5088565610736,
+        "distant_intensity": 1849.7514614176307,
+        "distant_azimuth": 3.578208576437012,
+        "distant_elevation": 1.1366700096696718,
+        "cam_dpos": [
+          0.001442635228069744,
+          0.0026509351033670867,
+          -0.0019935392824433637
+        ],
+        "cam_dquat_xyzw": [
+          0.010718123774271789,
+          0.003989251901557969,
+          0.007211234370069769,
+          0.9999085987183455
+        ],
+        "ground_albedo": 0.46505919554235364
+      },
+      "cell": "r2_az3",
+      "success": false,
+      "outcome": "no_lift",
+      "stop_reason": "max_steps",
+      "steps": 450,
+      "rest_z": 0.014999980106949806,
+      "monitor": {
+        "success": false,
+        "peak_z": 0.014999994076788425,
+        "threshold_z": 0.065,
+        "best_streak": 0,
+        "sustain": 30
+      },
+      "chunk_size": 50,
+      "motion": {
+        "path_length_rad": [
+          2.1057838715466346,
+          0.9216419644653797,
+          1.0252494690939784,
+          1.7098099263384938,
+          1.3138366798858767,
+          2.33881296463243
+        ],
+        "peak_excursion_rad": [
+          1.228436827659607,
+          0.3302555978298187,
+          0.8275927305221558,
+          1.4181383848190308,
+          0.19310857355594635,
+          1.7453300952911377
+        ],
+        "total_path_rad": 9.415134875962792,
+        "max_excursion_rad": 1.7453300952911377
+      },
+      "wall_clock_s": 51.61551464100194,
+      "seed": 136604072450558623
+    },
+    {
+      "episode": 4,
+      "seed_index": 10000004,
+      "draw": {
+        "object_x": 0.20617294771673916,
+        "object_y": -0.014164001616030559,
+        "object_yaw": 2.9431799886116297,
+        "object_color": [
+          0.7103026713778821,
+          0.4903890641212056,
+          0.18932119158328037
+        ],
+        "object_static_friction": 1.086583460657423,
+        "object_dynamic_friction": 1.0692137972987346,
+        "dome_intensity": 937.0458370927595,
+        "distant_intensity": 753.6111203494806,
+        "distant_azimuth": 3.8900706540557195,
+        "distant_elevation": 0.734164404248264,
+        "cam_dpos": [
+          -0.0005550525302523996,
+          -0.002916036432277165,
+          0.00292669868969583
+        ],
+        "cam_dquat_xyzw": [
+          0.0002884145588250433,
+          0.012542027823013896,
+          0.015484933440278468,
+          0.9998013958739401
+        ],
+        "ground_albedo": 0.527710494446506
+      },
+      "cell": "r1_az2",
+      "success": false,
+      "outcome": "no_lift",
+      "stop_reason": "max_steps",
+      "steps": 450,
+      "rest_z": 0.014999961480498314,
+      "monitor": {
+        "success": false,
+        "peak_z": 0.022292252629995346,
+        "threshold_z": 0.065,
+        "best_streak": 0,
+        "sustain": 30
+      },
+      "chunk_size": 50,
+      "motion": {
+        "path_length_rad": [
+          2.516295437529436,
+          1.4469822887331247,
+          1.2895056493580341,
+          1.9815870793536305,
+          2.8296071291889673,
+          4.204181062652983
+        ],
+        "peak_excursion_rad": [
+          1.8964197635650635,
+          0.8368151187896729,
+          1.0612003803253174,
+          1.4230430126190186,
+          2.3512656688690186,
+          1.7453302145004272
+        ],
+        "total_path_rad": 14.268158646816177,
+        "max_excursion_rad": 2.3512656688690186
+      },
+      "wall_clock_s": 51.135318063999875,
+      "seed": 17881565659411457808
+    },
+    {
+      "episode": 5,
+      "seed_index": 10000005,
+      "draw": {
+        "object_x": 0.15135977452787286,
+        "object_y": -0.08109944495348602,
+        "object_yaw": -0.0981962438031525,
+        "object_color": [
+          0.6286315303505531,
+          0.2950521528332322,
+          0.766565570787475
+        ],
+        "object_static_friction": 0.8553728278313023,
+        "object_dynamic_friction": 0.8553728278313023,
+        "dome_intensity": 536.7084462951041,
+        "distant_intensity": 1271.6878395916597,
+        "distant_azimuth": 2.0623395763411216,
+        "distant_elevation": 0.5620706342571693,
+        "cam_dpos": [
+          9.773211483324459e-05,
+          -0.0028016799858853244,
+          -0.0016924513446055606
+        ],
+        "cam_dquat_xyzw": [
+          0.01246315912538324,
+          0.00015458577244935825,
+          -0.00028238008784598146,
+          0.9999222799944705
+        ],
+        "ground_albedo": 0.34269018701163145
+      },
+      "cell": "r0_az1",
+      "success": false,
+      "outcome": "no_lift",
+      "stop_reason": "max_steps",
+      "steps": 450,
+      "rest_z": 0.014999988488852978,
+      "monitor": {
+        "success": false,
+        "peak_z": 0.014999999664723873,
+        "threshold_z": 0.065,
+        "best_streak": 0,
+        "sustain": 30
+      },
+      "chunk_size": 50,
+      "motion": {
+        "path_length_rad": [
+          2.1901573731417443,
+          0.7869928013533354,
+          0.9872086867690086,
+          1.6622567446902394,
+          2.9293451310123926,
+          2.809860187246718
+        ],
+        "peak_excursion_rad": [
+          1.2417901754379272,
+          0.6078173518180847,
+          0.9896070957183838,
+          1.3803222179412842,
+          2.466000556945801,
+          1.7453300952911377
+        ],
+        "total_path_rad": 11.36582092421344,
+        "max_excursion_rad": 2.466000556945801
+      },
+      "wall_clock_s": 50.60443824599497,
+      "seed": 10616373249057010071
+    },
+    {
+      "episode": 6,
+      "seed_index": 10000006,
+      "draw": {
+        "object_x": 0.2558122760984298,
+        "object_y": -0.021118018179438657,
+        "object_yaw": -1.3106083653404024,
+        "object_color": [
+          0.1862423316980265,
+          0.06486041301880688,
+          0.08143508046543521
+        ],
+        "object_static_friction": 0.9862141028595464,
+        "object_dynamic_friction": 0.8204952628798675,
+        "dome_intensity": 717.2875084613784,
+        "distant_intensity": 638.5709471725345,
+        "distant_azimuth": 4.178761925694317,
+        "distant_elevation": 1.1706957431696954,
+        "cam_dpos": [
+          -0.001926778821021646,
+          0.001311752548327924,
+          0.0020993681043737222
+        ],
+        "cam_dquat_xyzw": [
+          0.004200709657548604,
+          -0.013477345236141382,
+          -0.013036072256060202,
+          0.9998153709680071
+        ],
+        "ground_albedo": 0.2687422222109464
+      },
+      "cell": "r2_az2",
+      "success": false,
+      "outcome": "no_lift",
+      "stop_reason": "max_steps",
+      "steps": 450,
+      "rest_z": 0.014999943785369396,
+      "monitor": {
+        "success": false,
+        "peak_z": 0.014999977312982082,
+        "threshold_z": 0.065,
+        "best_streak": 0,
+        "sustain": 30
+      },
+      "chunk_size": 50,
+      "motion": {
+        "path_length_rad": [
+          3.5733462042960014,
+          1.2586740162223577,
+          1.3205064870417118,
+          1.7508913548663259,
+          2.6294928156759267,
+          2.840807693674483
+        ],
+        "peak_excursion_rad": [
+          1.3370137214660645,
+          0.7530173659324646,
+          1.1536707878112793,
+          1.3988878726959229,
+          0.4152601957321167,
+          1.7453302145004272
+        ],
+        "total_path_rad": 13.373718571776807,
+        "max_excursion_rad": 1.7453302145004272
+      },
+      "wall_clock_s": 51.512212836998515,
+      "seed": 1613317575216987979
+    },
+    {
+      "episode": 7,
+      "seed_index": 10000007,
+      "draw": {
+        "object_x": 0.06554204999279145,
+        "object_y": -0.16654083613375315,
+        "object_yaw": -0.36770560042524103,
+        "object_color": [
+          0.3514426083262198,
+          0.33533843455684886,
+          0.21567708042329525
+        ],
+        "object_static_friction": 0.9302923829148397,
+        "object_dynamic_friction": 0.8984844354173724,
+        "dome_intensity": 792.6971550816648,
+        "distant_intensity": 1346.1647310246085,
+        "distant_azimuth": 2.4364472491140945,
+        "distant_elevation": 0.7944573448588917,
+        "cam_dpos": [
+          0.0009610509149077786,
+          0.0026838852915114075,
+          0.0024937241200370603
+        ],
+        "cam_dquat_xyzw": [
+          0.0171434612499578,
+          0.0007478533538116222,
+          0.00334448418711379,
+          0.9998471667596276
+        ],
+        "ground_albedo": 0.3246742289058001
+      },
+      "cell": "r1_az0",
+      "success": false,
+      "outcome": "no_lift",
+      "stop_reason": "max_steps",
+      "steps": 450,
+      "rest_z": 0.01499998476356268,
+      "monitor": {
+        "success": false,
+        "peak_z": 0.014999990351498127,
+        "threshold_z": 0.065,
+        "best_streak": 0,
+        "sustain": 30
+      },
+      "chunk_size": 50,
+      "motion": {
+        "path_length_rad": [
+          3.08389952702845,
+          1.0316778123378754,
+          1.1920570619404316,
+          1.7435226710513234,
+          2.3266093261528438,
+          3.0608399087928913
+        ],
+        "peak_excursion_rad": [
+          1.1521202325820923,
+          0.560402512550354,
+          1.0665546655654907,
+          1.407211184501648,
+          0.7244166731834412,
+          1.7453303337097168
+        ],
+        "total_path_rad": 12.438606307303816,
+        "max_excursion_rad": 1.7453303337097168
+      },
+      "wall_clock_s": 51.36960327700217,
+      "seed": 6908556762548498102
+    },
+    {
+      "episode": 8,
+      "seed_index": 10000008,
+      "draw": {
+        "object_x": 0.04683750754971099,
+        "object_y": 0.11522785837845013,
+        "object_yaw": 2.8097184258117807,
+        "object_color": [
+          0.35159839511328617,
+          0.8496235510651192,
+          0.43070629709408237
+        ],
+        "object_static_friction": 0.9333769922121986,
+        "object_dynamic_friction": 0.8274563783165083,
+        "dome_intensity": 441.3687895559691,
+        "distant_intensity": 1319.4761535826783,
+        "distant_azimuth": 4.106661684440259,
+        "distant_elevation": 1.3407629172408142,
+        "cam_dpos": [
+          -0.001858282084728415,
+          0.00016680858080022742,
+          -0.00022718251486645007
+        ],
+        "cam_dquat_xyzw": [
+          0.004765304023728389,
+          0.001563561470227466,
+          -0.007743078731972967,
+          0.9999574450369577
+        ],
+        "ground_albedo": 0.4319965003791346
+      },
+      "cell": "r0_az5",
+      "success": false,
+      "outcome": "no_lift",
+      "stop_reason": "max_steps",
+      "steps": 450,
+      "rest_z": 0.014999991282820702,
+      "monitor": {
+        "success": false,
+        "peak_z": 0.01500000525265932,
+        "threshold_z": 0.065,
+        "best_streak": 0,
+        "sustain": 30
+      },
+      "chunk_size": 50,
+      "motion": {
+        "path_length_rad": [
+          2.234543987378231,
+          0.8420090898871422,
+          1.004491601139307,
+          1.7145643504336476,
+          3.2798585892643457,
+          3.6577197039865634
+        ],
+        "peak_excursion_rad": [
+          1.6265618801116943,
+          0.6336120367050171,
+          0.7813184857368469,
+          1.386359691619873,
+          2.6888587474823,
+          1.7453300952911377
+        ],
+        "total_path_rad": 12.733187322089238,
+        "max_excursion_rad": 2.6888587474823
+      },
+      "wall_clock_s": 49.97601740800019,
+      "seed": 5173110972353122291
+    },
+    {
+      "episode": 9,
+      "seed_index": 10000009,
+      "draw": {
+        "object_x": 0.0006283448174785947,
+        "object_y": -0.20359766604171206,
+        "object_yaw": -2.0602570792139354,
+        "object_color": [
+          0.7251610845577731,
+          0.4623633410419359,
+          0.5951460353125904
+        ],
+        "object_static_friction": 1.0075123688466139,
+        "object_dynamic_friction": 1.0075123688466139,
+        "dome_intensity": 815.94119792617,
+        "distant_intensity": 647.5924571229664,
+        "distant_azimuth": 5.762802251465855,
+        "distant_elevation": 0.6342990030590773,
+        "cam_dpos": [
+          -0.0007695228069215724,
+          0.00025692991201682917,
+          0.000778734062244543
+        ],
+        "cam_dquat_xyzw": [
+          0.01455859548482628,
+          0.008414540962840339,
+          0.0024731487476958433,
+          0.9998555527340764
+        ],
+        "ground_albedo": 0.1599956500539317
+      },
+      "cell": "r2_az0",
+      "success": false,
+      "outcome": "no_lift",
+      "stop_reason": "max_steps",
+      "steps": 450,
+      "rest_z": 0.015000000596046448,
+      "monitor": {
+        "success": false,
+        "peak_z": 0.01500000711530447,
+        "threshold_z": 0.065,
+        "best_streak": 0,
+        "sustain": 30
+      },
+      "chunk_size": 50,
+      "motion": {
+        "path_length_rad": [
+          2.910198680296787,
+          1.1149321128614247,
+          1.1980523951351643,
+          1.6964189084246755,
+          1.4770045281376367,
+          2.6252781326316974
+        ],
+        "peak_excursion_rad": [
+          1.124988079071045,
+          0.7193657159805298,
+          1.1652545928955078,
+          1.3858377933502197,
+          0.7594155073165894,
+          1.7453300952911377
+        ],
+        "total_path_rad": 11.021884757487387,
+        "max_excursion_rad": 1.7453300952911377
+      },
+      "wall_clock_s": 51.70884634999675,
+      "seed": 11098621303510417929
+    }
+  ],
+  "videos": [
+    {
+      "path": "videos/ep0000_no_lift.mp4",
+      "episode": 0,
+      "outcome": "no_lift",
+      "success": false,
+      "frames": 450
+    },
+    {
+      "path": "videos/ep0005_no_lift.mp4",
+      "episode": 5,
+      "outcome": "no_lift",
+      "success": false,
+      "frames": 450
+    }
+  ],
+  "gate": {
+    "lower_bound_required": null,
+    "lower_bound_observed": 0.0,
+    "passed": null
+  },
+  "gate_note": "No success gate on this run: the mini-eval checks the loop mechanically (actions move the arm, metrics and videos are written), and the smoke policy is weak by construction.",
+  "env": {
+    "python": "3.12.3",
+    "gpu": "NVIDIA GeForce RTX 2080",
+    "driver": "580.173.02",
+    "device": "cuda:0",
+    "free_vram_mib_at_start": 7295,
+    "object": "cube_3cm"
+  },
+  "git": {
+    "sha": "d0e26f309350c7433bdf2ec14414ffcfba5492ab",
+    "dirty": true
+  },
+  "wall_clock_s": 517.6408560276031,
+  "seconds_per_episode": 51.76408560276032,
+  "result": "0/10 = 0%, LB95 0.000",
+  "created": "2026-08-11T12:12:10Z"
+}
