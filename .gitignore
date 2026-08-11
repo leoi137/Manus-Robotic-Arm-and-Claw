@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.egg-info/
+runs/
+plans/SESSIONS.md
+.pytest_cache/
+imgui.ini

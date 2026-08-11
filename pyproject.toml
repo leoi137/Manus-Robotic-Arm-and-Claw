@@ -1,0 +1,20 @@
+[project]
+name = "manus"
+version = "0.1.0"
+description = "SO-ARM101 (exact official CAD) simulated in Isaac Lab: joint-space motor control + wrist-POV camera"
+requires-python = ">=3.10"
+# Isaac Lab / Isaac Sim come from ~/isaaclab-env — never listed here.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
