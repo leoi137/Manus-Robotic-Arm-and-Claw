@@ -21,7 +21,7 @@ States, in order -- :data:`STATE_SEQUENCE`:
     jaws open. Reached from wherever the arm happens to be.
 ``DESCEND``
     Straight down to the grasp pose: the *jaws* around the object, which is not
-    the TCP on the object -- see :func:`tcp_target`.
+    the TCP on the object -- see :func:`tcp_target` and :func:`grasp_height`.
 ``CLOSE``
     Arm frozen, jaws driven to ``spec.close_target_rad`` -- deliberately past
     contact, so the servo squeezes against its effort limit.
@@ -87,6 +87,7 @@ __all__ = [
     "ScriptedGraspExpert",
     "StateReport",
     "classify_outcome",
+    "grasp_height",
     "grasp_yaw_candidates",
     "joint_vector",
     "plan_grasp",
@@ -325,6 +326,23 @@ safer approach and a bigger shove at contact.
 """
 
 
+MIN_TIP_CLEARANCE: float = 0.005
+"""Gap left between the static fingertips and the table at the grasp, metres.
+
+Only binds on objects too short to centre the pads on: the pads sit
+:data:`~manus.kinematics.TCP_TO_PAD_CENTRE` below the TCP and the fingertips
+:data:`JAW_TIP_Z` below it, so centring on an object shorter than
+``2 * (JAW_TIP_Z - TCP_TO_PAD_CENTRE)`` = 4.6 mm would drive the tips into the
+ground outright, and anything under 14.6 mm leaves less than this clearance.
+The 15 mm domino scrapes past by 0.4 mm; the 10 mm puck is the only catalogue
+object :func:`grasp_height` actually has to raise. 5 mm is the compromise it
+spends there: the tips clear the table by 5 mm against a ~2 mm droop residual at
+convergence, and the pads still cover the puck's top half. Both directions cost
+something real -- lower and a sagging finger digs into the table, higher and the
+grip creeps towards the puck's top edge -- so this is the constant to move first
+if the puck misbehaves.
+"""
+
 YAW_MATCH_TOL: float = math.radians(2.0)
 """How far the solved tool yaw may sit from the requested one, radians.
 
@@ -341,6 +359,18 @@ def pad_lateral_offset(spec: ObjectSpec) -> float:
     finger and the closing moving finger seats the object against it.
     """
     return JAW_FIXED_FACE_X - 0.5 * spec.grasp_width_m - JAW_CLEARANCE
+
+
+def grasp_height(spec: ObjectSpec) -> float:
+    """Height above the table the jaw pads centre on for `spec`, metres.
+
+    The object's own mid-height, which puts the pads across the widest part of
+    it -- raised, for an object short enough to need it, until the fingertips
+    clear the table by :data:`MIN_TIP_CLEARANCE`. Nothing in the catalogue but
+    the 10 mm puck is short enough to be raised at all, and it is raised 2.3 mm.
+    """
+    lowest_centre = JAW_TIP_Z - TCP_TO_PAD_CENTRE + MIN_TIP_CLEARANCE
+    return max(spec.spawn_z, lowest_centre)
 
 
 def tcp_target(
@@ -370,26 +400,23 @@ def tcp_target(
     )
 
 
+YAW_PERIOD_RAD: dict[str, float] = {"quarter": math.pi / 2, "half": math.pi, "free": 0.0}
+"""Yaw period, in radians, of each :attr:`~manus.objects.ObjectSpec.yaw_symmetry` class."""
+
+
 def yaw_symmetry(spec: ObjectSpec) -> float:
     """Rotation about +z (radians) that maps `spec` onto itself, 0 if continuous.
 
-    Only the shapes the catalogue actually holds are answered: a square-section
-    cuboid (90 deg) and a cylinder (continuous). A rectangular cuboid would need
-    the jaws aligned with a *specific* face pair, which in turn needs the
-    jaw-closing axis pinned relative to :meth:`KinematicChain.tool_yaw` -- a
-    convention this pipeline has never had to fix, and guessing it wrong would
-    grasp the diagonal. Refuse instead.
+    Reads the object's declared symmetry class rather than re-deriving it:
+    :class:`~manus.objects.ObjectSpec` validates the declaration against the
+    geometry at construction, so the catalogue is the single place a wrong
+    answer can enter, and it cannot enter quietly.
+
+    A square-section cuboid answers a quarter turn, a rectangular one a half
+    turn (only two of the four quarter turns put the jaws across its short
+    axis), and anything round answers 0 -- continuous, no constraint at all.
     """
-    if spec.shape == "cylinder":
-        return 0.0
-    assert spec.half_extents is not None  # ObjectSpec.__post_init__ guarantees it
-    half_x, half_y, _ = spec.half_extents
-    if abs(half_x - half_y) > 1e-9:
-        raise NotImplementedError(
-            f"{spec.name}: grasp yaw for a rectangular cuboid needs the jaw axis convention "
-            "pinned; only square-section cuboids and cylinders are supported"
-        )
-    return math.pi / 2
+    return YAW_PERIOD_RAD[spec.yaw_symmetry]
 
 
 def grasp_yaw_candidates(
@@ -397,12 +424,16 @@ def grasp_yaw_candidates(
 ) -> tuple[float, ...]:
     """Grasp yaws to try for `spec` at `object_yaw`, best first.
 
-    A grasp yaw has to line the jaws up with a face pair, so the admissible set
-    is ``object_yaw + k * yaw_symmetry(spec)`` -- four branches for a cube,
-    anything at all for a cylinder. The preferred branch is the one nearest the
-    tool's current yaw, which is the cheapest wrist_roll travel and keeps that
-    joint (the one with the least margin: 320 deg of travel, so a 40 deg band of
-    tool yaws is unreachable at any given pan) furthest from its stops.
+    A grasp yaw has to line the jaws up across the object's grasp axis, so for
+    an object with a yaw period the admissible set is
+    ``object_yaw + k * yaw_symmetry(spec)`` -- four branches for a cube, two for
+    a domino (the other two would ask the jaws to span its 40 mm length), and
+    for a round object no constraint at all, in which case the *tool's own*
+    current yaw is taken as the base instead. The preferred branch is the one
+    nearest the tool's current yaw, which is the cheapest wrist_roll travel and
+    keeps that joint (the one with the least margin: 320 deg of travel, so a
+    40 deg band of tool yaws is unreachable at any given pan) furthest from its
+    stops.
 
     All **four** quarter turns are distinct here even though parallel jaws are
     pi-periodic, because this hand is not symmetric: one jaw is fixed to the
@@ -410,7 +441,10 @@ def grasp_yaw_candidates(
     opposite side of the object and moves the tool 32 mm
     (:func:`pad_lateral_offset` twice over). The extra branches are also what
     make the far corners of the region reachable -- the offset can point inward
-    instead of outward.
+    instead of outward. That is why a round object gets quarter turns off the
+    tool yaw as *fallbacks* rather than the single candidate its symmetry would
+    justify: they are placement branches, not symmetry branches, and dropping
+    them would forfeit reachability at the region's corners for nothing.
 
     Args:
         spec: Object being grasped.
@@ -420,10 +454,10 @@ def grasp_yaw_candidates(
     Returns:
         Grasp yaws in preference order, radians: nearest branch first.
     """
-    period = yaw_symmetry(spec) or math.pi / 2
-    base = tool_yaw if yaw_symmetry(spec) == 0.0 else object_yaw
-    quarter = int(round(2 * math.pi / period))
-    candidates = [base + index * period for index in range(quarter)]
+    period = yaw_symmetry(spec)
+    base = object_yaw if period else tool_yaw
+    step = period or math.pi / 2
+    candidates = [base + index * step for index in range(round(2 * math.pi / step))]
     return tuple(sorted(candidates, key=lambda yaw: abs(_wrap(yaw - tool_yaw))))
 
 
@@ -572,7 +606,7 @@ def plan_grasp(
     )
     best: GraspPlan | None = None
     for grasp_yaw in grasp_yaw_candidates(spec, object_yaw, _CHAIN.tool_yaw(start)):
-        tcp_grasp = tcp_target((x, y), spec.spawn_z, grasp_yaw, spec)
+        tcp_grasp = tcp_target((x, y), grasp_height(spec), grasp_yaw, spec)
         tcp_pregrasp = tcp_grasp + np.array([0.0, 0.0, config.hover_height])
         q_pregrasp, pregrasp_ok = ik_solve(tcp_pregrasp, grasp_yaw)
         q_grasp, grasp_ok = ik_solve(tcp_grasp, grasp_yaw)

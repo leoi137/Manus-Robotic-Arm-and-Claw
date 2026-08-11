@@ -109,6 +109,30 @@ class GraspSceneCfg(SoArmSceneCfg):
     )
 
 
+def grasp_scene_cfg(object_name: str = DEFAULT_OBJECT, **kwargs) -> GraspSceneCfg:
+    """A :class:`GraspSceneCfg` that spawns `object_name` from the catalogue.
+
+    :class:`GraspSceneCfg`'s class body can only name one object, and the
+    spawner it builds is baked at class-definition time -- so a driver that
+    plans for one object while the scene loads another is a silent, and very
+    convincing, failure. Building the cfg through here is the only way to
+    change which object is in the scene.
+
+    Args:
+        object_name: Key into :data:`~manus.objects.OBJECTS`.
+        **kwargs: Forwarded to :class:`GraspSceneCfg` (``num_envs``,
+            ``env_spacing``, ...).
+
+    Returns:
+        The configured scene cfg; the object loads at its own resting height.
+    """
+    spec = OBJECTS[object_name]
+    cfg = GraspSceneCfg(**kwargs)
+    cfg.object.spawn = spec.make_spawn_cfg()
+    cfg.object.init_state.pos = (*DEFAULT_OBJECT_POS[:2], spec.spawn_z)
+    return cfg
+
+
 def apply_randomization(
     scene: InteractiveScene,
     draw: EpisodeDraw,

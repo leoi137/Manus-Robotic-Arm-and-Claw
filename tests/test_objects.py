@@ -16,7 +16,16 @@ from pathlib import Path
 
 import pytest
 
-from manus.objects import OBJECTS, ObjectSpec
+from manus.objects import (
+    CLOSE_TARGET_30MM_RAD,
+    JAW_WIDTH_PER_RAD,
+    MEASURED_STALL_30MM_RAD,
+    OBJECTS,
+    REFERENCE_WIDTH_M,
+    SQUEEZE_RAD,
+    ObjectSpec,
+    close_target_for_width,
+)
 from manus.randomize import (
     BASE_KEEPOUT_ABS_Y,
     BASE_KEEPOUT_X,
@@ -38,6 +47,7 @@ from manus.randomize import (
     stable_hash64,
     xyzw_to_wxyz,
 )
+from manus.specs import JOINT_LIMITS
 
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 
@@ -50,14 +60,21 @@ SAMPLE_ATTEMPTS = range(500)
 
 def test_catalogue_keys_match_spec_names():
     assert all(key == spec.name for key, spec in OBJECTS.items())
-    assert set(OBJECTS) == {"cube_3cm", "cylinder_3cm"}
+    assert set(OBJECTS) == {
+        "cube_3cm",
+        "cylinder_3cm",
+        "die_16mm",
+        "domino_20x40",
+        "puck_d40x10",
+        "pingpong_40mm",
+        "duplo_32x64",
+    }
 
 
 @pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
 def test_spec_rests_on_the_ground_plane(spec):
     # spawn_z is the body origin height at rest, i.e. half the object's height.
-    half_height = spec.half_extents[2] if spec.shape == "cuboid" else spec.height / 2.0
-    assert spec.spawn_z == pytest.approx(half_height)
+    assert spec.spawn_z == pytest.approx(0.5 * spec.extent_z)
 
 
 @pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
@@ -70,13 +87,48 @@ def test_spec_grasp_width_matches_geometry(spec):
 def test_spec_is_physically_plausible(spec):
     assert 0.0 < spec.mass_kg < 0.5
     assert 0.0 < spec.grasp_width_m < 0.05
+    # Densities: the ping-pong ball is hollow (80 kg/m^3) and the cube is a
+    # dense resin block (2200). Anything outside that spread is a typo.
+    volume = {
+        "cuboid": lambda s: 8 * math.prod(s.half_extents),
+        "cylinder": lambda s: math.pi * s.radius**2 * s.height,
+        "sphere": lambda s: 4 / 3 * math.pi * s.radius**3,
+    }[spec.shape](spec)
+    assert 50.0 < spec.mass_kg / volume < 2500.0
+
+
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_declared_symmetry_matches_the_geometry(spec):
+    assert spec.yaw_symmetry == spec.geometric_yaw_symmetry
+
+
+def test_the_catalogue_covers_every_symmetry_class():
+    """All three branches of the expert's yaw planner have an object exercising them."""
+    assert {spec.yaw_symmetry for spec in OBJECTS.values()} == {"quarter", "half", "free"}
+
+
+def test_a_rectangular_cuboid_cannot_be_declared_square():
+    with pytest.raises(ValueError, match="declared yaw_symmetry 'quarter'"):
+        ObjectSpec(
+            name="bad", shape="cuboid", half_extents=(0.01, 0.02, 0.01), mass_kg=0.1,
+            grasp_width_m=0.02, spawn_z=0.01, close_target_rad=0.0, yaw_symmetry="quarter",
+        )
+
+
+def test_a_grasp_width_off_the_local_x_axis_is_rejected():
+    """The jaws close along local x; declaring the long side would grasp the wrong way."""
+    with pytest.raises(ValueError, match="not the local-x extent"):
+        ObjectSpec(
+            name="bad", shape="cuboid", half_extents=(0.01, 0.02, 0.01), mass_kg=0.1,
+            grasp_width_m=0.04, spawn_z=0.01, close_target_rad=0.0, yaw_symmetry="half",
+        )
 
 
 def test_cuboid_without_half_extents_is_rejected():
     with pytest.raises(ValueError, match="needs half_extents"):
         ObjectSpec(
             name="bad", shape="cuboid", mass_kg=0.1, grasp_width_m=0.03,
-            spawn_z=0.015, close_target_rad=0.0,
+            spawn_z=0.015, close_target_rad=0.0, yaw_symmetry="quarter",
         )
 
 
@@ -84,16 +136,97 @@ def test_cylinder_without_radius_is_rejected():
     with pytest.raises(ValueError, match="needs radius and height"):
         ObjectSpec(
             name="bad", shape="cylinder", mass_kg=0.1, grasp_width_m=0.03,
-            spawn_z=0.03, close_target_rad=0.0, height=0.06,
+            spawn_z=0.03, close_target_rad=0.0, yaw_symmetry="free", height=0.06,
+        )
+
+
+def test_sphere_without_radius_is_rejected():
+    with pytest.raises(ValueError, match="a sphere needs radius"):
+        ObjectSpec(
+            name="bad", shape="sphere", mass_kg=0.1, grasp_width_m=0.03,
+            spawn_z=0.015, close_target_rad=0.0, yaw_symmetry="free",
         )
 
 
 def test_unknown_shape_is_rejected():
     with pytest.raises(ValueError, match="unknown shape"):
         ObjectSpec(
-            name="bad", shape="sphere", mass_kg=0.1, grasp_width_m=0.03,
-            spawn_z=0.015, close_target_rad=0.0,
+            name="bad", shape="pyramid", mass_kg=0.1, grasp_width_m=0.03,
+            spawn_z=0.015, close_target_rad=0.0, yaw_symmetry="quarter",
         )
+
+
+# --- Close targets -----------------------------------------------------------
+
+
+def test_the_formula_reproduces_the_tuned_thirty_millimetre_target():
+    """The anchor: the one target that was tuned in sim has to survive the formula."""
+    assert close_target_for_width(REFERENCE_WIDTH_M) == pytest.approx(CLOSE_TARGET_30MM_RAD)
+    assert MEASURED_STALL_30MM_RAD - CLOSE_TARGET_30MM_RAD == pytest.approx(SQUEEZE_RAD)
+
+
+def test_close_targets_are_pinned():
+    """Hard-coded: a formula change that moves a grasp has to be seen, not inferred."""
+    assert {name: round(spec.close_target_rad, 4) for name, spec in OBJECTS.items()} == {
+        "cube_3cm": 0.05,
+        "cylinder_3cm": 0.05,
+        "die_16mm": -0.1426,
+        "domino_20x40": -0.0876,
+        "puck_d40x10": 0.1876,
+        "pingpong_40mm": 0.1876,
+        "duplo_32x64": 0.0748,
+    }
+
+
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_every_close_target_comes_from_the_formula(spec):
+    assert spec.close_target_rad == pytest.approx(close_target_for_width(spec.grasp_width_m))
+
+
+def test_the_close_target_tracks_the_width_at_the_measured_rate():
+    """Every extra millimetre of object opens the jaws by 1/JAW_WIDTH_PER_RAD."""
+    step = close_target_for_width(0.031) - close_target_for_width(0.030)
+    assert step == pytest.approx(0.001 / JAW_WIDTH_PER_RAD)
+
+
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_every_close_target_is_inside_the_jaw_travel(spec):
+    lower, upper = JOINT_LIMITS["gripper"]
+    assert lower < spec.close_target_rad < upper
+
+
+def test_a_width_the_jaws_cannot_squeeze_is_refused():
+    """A target the articulation would clamp is a silently weak grasp: refuse it."""
+    with pytest.raises(ValueError, match="outside the gripper's travel"):
+        close_target_for_width(0.005)
+
+
+def test_every_spec_builds_its_isaac_spawner():
+    """The module's one Isaac API call, exercised without a running app.
+
+    ``isaaclab.sim``'s spawner configs are plain dataclasses and import on their
+    own, so the cfg each object hands the simulator can be built and read back
+    here. That is as far as the sim-free side can check a spawner — the USD prim
+    it produces still needs a live app — but it is the difference between
+    "SphereCfg takes these fields" as a claim and as a fact.
+    """
+    sim_utils = pytest.importorskip("isaaclab.sim", reason="Isaac Lab not installed")
+    expected = {
+        "cuboid": sim_utils.CuboidCfg,
+        "cylinder": sim_utils.CylinderCfg,
+        "sphere": sim_utils.SphereCfg,
+    }
+    for spec in OBJECTS.values():
+        cfg = spec.make_spawn_cfg()
+        assert isinstance(cfg, expected[spec.shape]), spec.name
+        assert cfg.mass_props.mass == spec.mass_kg
+        if spec.shape == "cuboid":
+            assert cfg.size == pytest.approx(tuple(2 * h for h in spec.half_extents))
+        else:
+            assert cfg.radius == spec.radius
+        if spec.shape == "cylinder":
+            assert cfg.height == spec.height
+            assert cfg.axis == "Z"  # the resting axis every catalogue cylinder assumes
 
 
 def test_object_and_randomize_modules_import_without_isaac():

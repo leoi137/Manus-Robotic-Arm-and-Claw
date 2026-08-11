@@ -135,7 +135,7 @@ from manus.expert import (
 )
 from manus.objects import OBJECTS
 from manus.randomize import draw_episode
-from manus.task_scene import GraspSceneCfg, apply_randomization
+from manus.task_scene import apply_randomization, grasp_scene_cfg
 
 PHYSICS_DT = 1.0 / 120.0
 """Simulation step, seconds -- the pipeline's locked physics rate."""
@@ -419,7 +419,7 @@ def main() -> int:
     sim = sim_utils.SimulationContext(
         sim_utils.SimulationCfg(dt=PHYSICS_DT, device=args_cli.device)
     )
-    scene = InteractiveScene(GraspSceneCfg(num_envs=1, env_spacing=2.0))
+    scene = InteractiveScene(grasp_scene_cfg(args_cli.object, num_envs=1, env_spacing=2.0))
     sim.reset()
     runner = AttemptRunner(sim, scene, spec, config)
 

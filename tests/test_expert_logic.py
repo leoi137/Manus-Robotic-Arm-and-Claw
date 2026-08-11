@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 
 from manus import expert as expert_mod
-from manus import kinematics, specs
+from manus import kinematics, objects, specs
 from manus.control import GRIPPER_OPEN
 from manus.expert import (
     ARM_STATES,
@@ -50,12 +50,26 @@ from manus.randomize import draw_episode
 CHAIN = KinematicChain()
 CUBE = OBJECTS["cube_3cm"]
 CYLINDER = OBJECTS["cylinder_3cm"]
+DOMINO = OBJECTS["domino_20x40"]  # the rectangular case: two branches, not four
+PUCK = OBJECTS["puck_d40x10"]  # the widest grasp and the only raised one
+BALL = OBJECTS["pingpong_40mm"]  # 2.7 g, round in every direction
+DUPLO = OBJECTS["duplo_32x64"]  # the other rectangular case, 32 mm across
 
 ARM = kinematics.NUM_ARM_JOINTS
 HOME = np.zeros(ARM)
 
 MIN_LIFT_RISE = 0.06
 """TCP rise the LIFT retraction has to deliver, metres (the plan's bar)."""
+
+MOVING_JAW_DEEPEST_Z = 0.00806
+"""Deepest the *moving* jaw reaches below the TCP over the closing sweep, metres.
+
+Measured off the meshes by :func:`test_the_closing_jaw_reaches_deeper_than_the_tips`
+below, which is also where the number comes from. It peaks at 0.14 rad, 1.8 mm
+past the static fingertips: the finger swings down as it closes and back up as
+it goes past. Only the short objects care, and only during CLOSE -- the arm is
+frozen by then, so this is a clearance to keep, not a motion to plan.
+"""
 
 
 def region_samples(n_radius: int = 5, n_azimuth: int = 9) -> list[tuple[float, float]]:
@@ -173,6 +187,25 @@ def test_the_object_lands_between_the_jaws_not_under_the_tcp():
             assert local[2] == pytest.approx(TCP_TO_PAD_CENTRE, abs=1e-3)
 
 
+@pytest.mark.parametrize("spec", [DOMINO, DUPLO], ids=["domino_20x40", "duplo_32x64"])
+def test_the_jaws_line_up_with_the_short_axis_of_a_rectangular_object(spec):
+    """The object's local x -- the axis ``grasp_width_m`` measures -- lands on the tool's x.
+
+    The convention :class:`~manus.objects.ObjectSpec` enforces, closed back
+    through the FK rather than argued from the formula: the jaws close along
+    the tool's own x (see :func:`~manus.expert.tcp_target`), so this is what
+    stops the plan asking them to span the domino's 40 mm length. Only the
+    rectangular objects can express it -- for a square or round one both axes
+    are the grasp axis.
+    """
+    for object_yaw in np.linspace(-math.pi, math.pi, 9):
+        plan = plan_grasp(spec, (0.19, 0.02, float(object_yaw)))
+        assert plan.ok, plan.reason
+        _, rotation = CHAIN.fk_tcp(plan.q_grasp)
+        local_x = np.array([math.cos(object_yaw), math.sin(object_yaw), 0.0])
+        assert abs((rotation.T @ local_x)[0]) == pytest.approx(1.0, abs=2e-3)
+
+
 def test_the_lateral_offset_clears_the_static_jaw_by_the_clearance():
     from manus.expert import JAW_CLEARANCE, JAW_FIXED_FACE_X
 
@@ -191,16 +224,55 @@ def test_grasp_height_is_the_object_height_plus_the_pad_offset():
     assert plan.tcp_pregrasp[1] == pytest.approx(plan.tcp_grasp[1])
 
 
-def test_the_fingertips_stay_off_the_table_at_the_grasp_pose():
-    """TCP_TO_PAD_CENTRE has to keep the tips clear of the ground with droop to spare."""
-    from manus.expert import JAW_TIP_Z
+def test_the_puck_is_the_only_grasp_the_table_pushes_up():
+    """Pinned: the 10 mm puck is gripped 2.3 mm above its own centre, nothing else is."""
+    from manus.expert import grasp_height
 
-    plan = plan_grasp(CUBE, (0.19, 0.0, 0.0))
-    tip_height = plan.tcp_grasp[2] - JAW_TIP_Z
-    assert tip_height > 0.010, f"fingertips only {tip_height * 1e3:.1f} mm off the floor"
-    # ... and still deep enough that most of the object is between the pads.
-    engaged = (CUBE.spawn_z + 0.5 * 2 * CUBE.half_extents[2]) - tip_height
-    assert engaged > 0.012, f"only {engaged * 1e3:.1f} mm of the object is gripped"
+    assert grasp_height(PUCK) == pytest.approx(0.0073)
+    assert grasp_height(PUCK) - PUCK.spawn_z == pytest.approx(0.0023)
+    assert [
+        spec.name for spec in OBJECTS.values() if grasp_height(spec) > spec.spawn_z
+    ] == ["puck_d40x10"]
+
+
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_only_an_object_too_short_to_centre_on_is_raised(spec):
+    """grasp_height centres the pads on the object unless the tips would hit the table."""
+    from manus.expert import JAW_TIP_Z, MIN_TIP_CLEARANCE, grasp_height
+
+    raise_by = grasp_height(spec) - spec.spawn_z
+    assert raise_by >= 0.0
+    tall_enough = spec.spawn_z + TCP_TO_PAD_CENTRE - JAW_TIP_Z >= MIN_TIP_CLEARANCE
+    assert (raise_by == 0.0) == tall_enough, f"{spec.name} raised by {raise_by * 1e3:.1f} mm"
+    # The pads must still land on the object, not above it.
+    assert grasp_height(spec) < spec.spawn_z + 0.5 * spec.extent_z
+
+
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_the_fingertips_stay_off_the_table_at_the_grasp_pose(spec):
+    """Every object's grasp pose keeps both jaws clear of the ground.
+
+    Two separate clearances, because the two fingers reach their lowest at
+    different moments. The static jaw is the one that matters on the way down
+    (the moving jaw is swung right out at :data:`GRIPPER_OPEN`), and its tip is
+    :data:`~manus.expert.JAW_TIP_Z` below the TCP. The moving jaw only comes
+    down during CLOSE, with the arm already frozen, and it reaches deeper than
+    the static one -- 8.06 mm below the TCP at 0.14 rad, measured here off the
+    meshes -- so it gets its own, smaller bar.
+    """
+    from manus.expert import JAW_TIP_Z, MIN_TIP_CLEARANCE, grasp_height
+
+    tcp_z = grasp_height(spec) + TCP_TO_PAD_CENTRE
+    tip_height = tcp_z - JAW_TIP_Z
+    assert tip_height >= MIN_TIP_CLEARANCE - 1e-9, (
+        f"{spec.name}: fingertips only {tip_height * 1e3:.1f} mm off the floor"
+    )
+    assert tcp_z - MOVING_JAW_DEEPEST_Z > 0.003, (
+        f"{spec.name}: the closing jaw comes within 3 mm of the table"
+    )
+    # ... and enough of the object is between the pads to be held by them.
+    engaged = min(spec.extent_z, spec.spawn_z + 0.5 * spec.extent_z - tip_height)
+    assert engaged >= 0.004, f"{spec.name}: only {engaged * 1e3:.1f} mm of the object is gripped"
 
 
 def test_the_waypoints_are_tool_vertical():
@@ -216,13 +288,20 @@ def test_plan_is_deterministic_for_a_placement():
     assert np.array_equal(a.q_grasp, b.q_grasp) and a.grasp_yaw == b.grasp_yaw
 
 
-def test_plan_covers_the_whole_region_for_both_objects():
-    """Every legal placement at four yaws plans -- no silent holes to fall into."""
-    for spec in (CUBE, CYLINDER):
-        for x, y in region_samples():
-            for yaw in np.radians([0.0, 37.0, 90.0, 143.0]):
-                plan = plan_grasp(spec, (x, y, float(yaw)))
-                assert plan.ok, f"{spec.name} at ({x:.3f}, {y:.3f}, {yaw:.2f}): {plan.reason}"
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_plan_covers_the_whole_region_for_every_object(spec):
+    """Every legal placement at four yaws plans -- no silent holes to fall into.
+
+    The catalogue's whole feasibility claim, and the one that a new object is
+    most likely to break: the tool has to stand a grasp-half-width off the
+    object (40 mm for the puck is a 22 mm stand-off, against the cube's 17), and
+    a rectangular object can only spend two of the four yaw branches getting
+    out of the way.
+    """
+    for x, y in region_samples():
+        for yaw in np.radians([0.0, 37.0, 90.0, 143.0]):
+            plan = plan_grasp(spec, (x, y, float(yaw)))
+            assert plan.ok, f"{spec.name} at ({x:.3f}, {y:.3f}, {yaw:.2f}): {plan.reason}"
 
 
 def test_plan_outside_the_region_reports_itself_infeasible():
@@ -316,13 +395,26 @@ def jaw_clouds(gripper: float) -> tuple[np.ndarray, np.ndarray]:
     return static, moving
 
 
+def width_probe(width: float, height: float = 0.030) -> ObjectSpec:
+    """A square block `width` metres across: sweeps the jaw geometry off-catalogue."""
+    return ObjectSpec(
+        name=f"probe_{width * 1e3:.0f}mm",
+        shape="cuboid",
+        half_extents=(0.5 * width, 0.5 * width, 0.5 * height),
+        mass_kg=0.05,
+        grasp_width_m=width,
+        spawn_z=0.5 * height,
+        close_target_rad=0.0,
+        yaw_symmetry="quarter",
+    )
+
+
 def engaged_band(spec=CUBE) -> tuple[float, float]:
     """TCP-frame z range over which the fingers overlap a resting object, metres."""
-    from manus.expert import JAW_TIP_Z
+    from manus.expert import JAW_TIP_Z, grasp_height
 
-    height = 2 * spec.half_extents[2] if spec.shape == "cuboid" else spec.height
-    top_of_object = spec.spawn_z + 0.5 * height
-    return ((spec.spawn_z + TCP_TO_PAD_CENTRE) - top_of_object, JAW_TIP_Z)
+    top_of_object = spec.spawn_z + 0.5 * spec.extent_z
+    return ((grasp_height(spec) + TCP_TO_PAD_CENTRE) - top_of_object, JAW_TIP_Z)
 
 
 def jaw_gap(gripper: float, spec=CUBE) -> float:
@@ -349,6 +441,17 @@ def jaw_gap(gripper: float, spec=CUBE) -> float:
     return min(gaps) if gaps else math.inf
 
 
+def test_the_closing_jaw_reaches_deeper_than_the_tips():
+    """Where MOVING_JAW_DEEPEST_Z comes from, and that it is past the static tip."""
+    from manus.expert import JAW_TIP_Z
+
+    depths = {angle: jaw_clouds(angle)[1][:, 2].max() for angle in np.arange(-0.17, 0.5, 0.02)}
+    deepest = max(depths.values())
+    assert deepest == pytest.approx(MOVING_JAW_DEEPEST_Z, abs=1e-4)
+    assert deepest > JAW_TIP_Z
+    assert max(depths, key=depths.get) == pytest.approx(0.14, abs=0.02)
+
+
 def test_the_fingertip_constant_matches_the_mesh():
     from manus.expert import JAW_TIP_Z
 
@@ -371,14 +474,21 @@ def test_the_static_jaw_face_constant_matches_the_mesh():
     assert band[:, 0].min() == pytest.approx(JAW_FIXED_FACE_X, abs=1e-3)
 
 
-def test_the_descent_corridor_is_clear_of_the_static_jaw():
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_the_descent_corridor_is_clear_of_the_static_jaw(spec):
     """With the planned offset, no static-jaw material overlaps the object's footprint."""
-    static, _ = jaw_clouds(GRIPPER_OPEN)
-    low, high = engaged_band()
-    band = static[(static[:, 2] >= low) & (static[:, 2] <= high) & (np.abs(static[:, 1]) < 0.015)]
-    object_far_face = expert_mod.pad_lateral_offset(CUBE) + 0.5 * CUBE.grasp_width_m
+    static, moving = jaw_clouds(GRIPPER_OPEN)
+    low, high = engaged_band(spec)
+    half_width = 0.5 * spec.grasp_width_m
+    band = static[
+        (static[:, 2] >= low) & (static[:, 2] <= high) & (np.abs(static[:, 1]) < half_width)
+    ]
+    object_far_face = expert_mod.pad_lateral_offset(spec) + half_width
     assert band[:, 0].min() - object_far_face == pytest.approx(expert_mod.JAW_CLEARANCE, abs=1e-4)
     assert object_far_face < band[:, 0].min()
+    # ... and the moving jaw is swung entirely out of the band while open, so
+    # the widest objects descend past it too.
+    assert moving[:, 2].max() < low
 
 
 def test_the_open_jaws_clear_the_object_and_the_closed_jaws_squeeze_it():
@@ -387,17 +497,39 @@ def test_the_open_jaws_clear_the_object_and_the_closed_jaws_squeeze_it():
     assert jaw_gap(0.0) < CUBE.grasp_width_m - 0.005
 
 
-MEASURED_JAW_STALL_RAD = 0.27
-"""Loosest jaw angle a held 30 mm object was measured to stall the fingers at.
+def contact_angle(spec) -> float:
+    """Jaw angle at which the pads first touch `spec`, from the meshes, radians."""
+    low, high = -0.174533, 1.2
+    for _ in range(60):
+        middle = 0.5 * (low + high)
+        low, high = (middle, high) if jaw_gap(middle, spec) < spec.grasp_width_m else (low, middle)
+    return 0.5 * (low + high)
 
-From the 200-attempt Step 8 gate (range 0.27-0.35 rad). Wider than the visual
-meshes predict, because PhysX collides convex approximations of the concave
-fingers -- which is exactly why the close target is checked against a measured
-number and not only against the mesh.
-"""
+
+def test_the_measured_stall_anchor_matches_the_meshes():
+    """The one sim measurement the whole catalogue is extrapolated from.
+
+    A held 30 mm cube stalls the fingers at 0.189 rad in sim (Step 20, with the
+    jaws on SDF colliders). The meshes say 0.195. They have to agree, because
+    :func:`~manus.objects.close_target_for_width` carries the sim number to
+    every other width along the *mesh* slope -- if they disagreed, the two
+    halves of the formula would be describing different hands.
+    """
+    assert contact_angle(CUBE) == pytest.approx(objects.MEASURED_STALL_30MM_RAD, abs=0.01)
 
 
-def test_the_close_target_squeezes_rather_than_merely_touching():
+def test_the_jaw_width_rate_matches_the_meshes():
+    """JAW_WIDTH_PER_RAD, re-measured: contact angle is linear in object width."""
+    widths = np.array([0.016, 0.020, 0.030, 0.040])
+    angles = np.array([contact_angle(width_probe(width)) for width in widths])
+    slope, intercept = np.polyfit(angles, widths, 1)
+    assert slope == pytest.approx(objects.JAW_WIDTH_PER_RAD, abs=5e-4)
+    residual = np.abs(np.polyval([slope, intercept], angles) - widths).max()
+    assert residual < 2e-4, f"contact angle is not linear in width: {residual * 1e3:.2f} mm off"
+
+
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_the_close_target_squeezes_rather_than_merely_touching(spec):
     """The close target must sit well below the angle the object stops the jaws at.
 
     A target *above* the contact angle never touches the object; a target just
@@ -405,12 +537,16 @@ def test_the_close_target_squeezes_rather_than_merely_touching():
     """
     from manus import specs
 
-    for spec in (CUBE, CYLINDER):
-        assert jaw_gap(spec.close_target_rad, spec) < spec.grasp_width_m - 0.005
-        squeeze = MEASURED_JAW_STALL_RAD - spec.close_target_rad
-        assert squeeze >= 0.15, f"{spec.name}: only {squeeze:.3f} rad of squeeze"
-        # ... and that squeeze has to be worth something in torque.
-        assert squeeze * specs.STS3215_KP > 0.5 * specs.STS3215_EFFORT_LIMIT
+    assert jaw_gap(spec.close_target_rad, spec) < spec.grasp_width_m - 0.005
+    # 20 mrad of slack, because the pads are not parallel: the contact angle
+    # depends on how far along the finger the object sits, and the formula is
+    # anchored on the cube's engagement band. The puck, gripped at the very
+    # tips, contacts 13 mrad early and so squeezes 13 mrad less than nominal.
+    squeeze = contact_angle(spec) - spec.close_target_rad
+    assert squeeze == pytest.approx(objects.SQUEEZE_RAD, abs=0.02), spec.name
+    # ... and that squeeze has to be worth something in torque: 2.2-2.5 N.m
+    # of the servo's 3.35, across the catalogue.
+    assert squeeze * specs.STS3215_KP > 0.5 * specs.STS3215_EFFORT_LIMIT
 
 
 # --- The lift retraction --------------------------------------------------------
@@ -453,23 +589,41 @@ def test_lift_from_a_folded_pose_stops_rather_than_spinning():
 # --- Grasp yaw ------------------------------------------------------------------
 
 
-def test_cube_symmetry_is_a_quarter_turn_and_a_cylinder_is_free():
+def test_symmetry_is_a_quarter_turn_a_half_turn_or_free():
     assert yaw_symmetry(CUBE) == pytest.approx(math.pi / 2)
+    assert yaw_symmetry(DOMINO) == pytest.approx(math.pi)
     assert yaw_symmetry(CYLINDER) == 0.0
+    assert yaw_symmetry(BALL) == 0.0
 
 
-def test_rectangular_cuboids_are_refused_rather_than_guessed():
-    slab = ObjectSpec(
-        name="slab",
-        shape="cuboid",
-        half_extents=(0.01, 0.02, 0.015),
-        mass_kg=0.05,
-        grasp_width_m=0.02,
-        spawn_z=0.015,
-        close_target_rad=0.2,
-    )
-    with pytest.raises(NotImplementedError):
-        yaw_symmetry(slab)
+def test_a_rectangular_object_is_offered_two_branches_not_four():
+    """The two quarter turns that would ask the jaws to span the long side are gone."""
+    candidates = grasp_yaw_candidates(DOMINO, 0.3, 1.0)
+    assert len(candidates) == 2
+    assert abs(expert_mod._wrap(candidates[0] - candidates[1])) == pytest.approx(math.pi)
+    for candidate in candidates:
+        halves = (candidate - 0.3) / math.pi
+        assert halves == pytest.approx(round(halves), abs=1e-9)
+
+
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_every_candidate_presents_the_grasp_width_to_the_jaws(spec):
+    """Each candidate lines the jaws up with the object's own grasp axis.
+
+    Written in the world frame the jaws actually close in: the grasp direction
+    is ``(cos yaw, sin yaw)`` (see :func:`~manus.expert.tcp_target`), and the
+    object's extent along it must come out as ``grasp_width_m``.
+    """
+    object_yaw = 0.4
+    for candidate in grasp_yaw_candidates(spec, object_yaw, 1.3):
+        # Extent of the (possibly rectangular) footprint along the grasp axis.
+        angle = candidate - object_yaw
+        if spec.shape == "cuboid":
+            half_x, half_y, _ = spec.half_extents
+            extent = 2 * (abs(half_x * math.cos(angle)) + abs(half_y * math.sin(angle)))
+        else:
+            extent = 2 * spec.radius
+        assert extent == pytest.approx(spec.grasp_width_m, abs=1e-9), math.degrees(angle)
 
 
 @pytest.mark.parametrize("object_yaw_deg", range(-180, 181, 15))
@@ -515,22 +669,33 @@ def test_a_cylinder_is_grasped_at_the_current_tool_yaw():
     assert candidates[0] == pytest.approx(0.4)
 
 
-def test_the_planned_wrist_roll_keeps_clear_of_its_limits():
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_the_planned_wrist_roll_keeps_clear_of_its_limits(spec):
     """wrist_roll is the joint the yaw branch spends, and the one with least travel.
 
-    Measured worst case over the region at 17 object yaws is 3.3 deg of margin
-    (at the far radius, 90 deg azimuth); this pins that it stays positive, so a
-    grasp is never planned into a joint the articulation would clamp.
+    The bars below are what this test's own 3x5 grid at 9 yaws sees (worst
+    case 7.6 deg, on the duplo). Swept finer -- 5x9 placements at 13 yaws, too
+    slow to run every time -- the worst cases are 11.8 deg for the cube, 13-17
+    for the other free and quarter-turn objects, and **1.9 deg (domino) /
+    1.0 deg (duplo)** for the rectangular ones: exactly the price of having two
+    yaw branches instead of four, since the pair is pinned 180 deg apart and
+    cannot be nudged off a stop. Still positive everywhere, so no grasp is
+    planned into a joint the articulation would clamp; a rectangular object
+    simply has no roll to spare, which is worth knowing before blaming the
+    physics for a slightly yawed grasp.
     """
     lower, upper = specs.JOINT_LIMITS["wrist_roll"]
     margin = math.inf
-    for x, y in region_samples(4, 7):
-        for object_yaw in np.linspace(-math.pi, math.pi, 13):
-            plan = plan_grasp(CUBE, (x, y, float(object_yaw)))
+    for x, y in region_samples(3, 5):
+        for object_yaw in np.linspace(-math.pi, math.pi, 9):
+            plan = plan_grasp(spec, (x, y, float(object_yaw)))
             assert plan.ok, plan.reason
             roll = plan.q_grasp[4]
             margin = min(margin, roll - lower, upper - roll)
-    assert margin > math.radians(2.0), f"wrist_roll within {math.degrees(margin):.2f} deg of a limit"
+    floor = 5.0 if spec.yaw_symmetry == "half" else 10.0
+    assert margin > math.radians(floor), (
+        f"{spec.name}: wrist_roll within {math.degrees(margin):.2f} deg of a limit"
+    )
 
 
 # --- FSM sequencing -------------------------------------------------------------
