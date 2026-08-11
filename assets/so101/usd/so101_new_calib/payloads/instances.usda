@@ -445,10 +445,14 @@ def Scope "Instances"
     )
     {
         over "wrist_roll_follower_so101_v1" (
-            apiSchemas = ["PhysicsCollisionAPI", "NewtonCollisionAPI", "PhysicsMeshCollisionAPI", "NewtonMeshCollisionAPI"]
+            apiSchemas = ["PhysicsCollisionAPI", "NewtonCollisionAPI", "PhysicsMeshCollisionAPI", "NewtonMeshCollisionAPI", "PhysxSDFMeshCollisionAPI"]
         )
         {
-            token physics:approximation = "convexHull"
+            token physics:approximation = "sdf"
+            uniform float physxSDFMeshCollision:sdfMargin = 0.01
+            uniform float physxSDFMeshCollision:sdfNarrowBandThickness = 0.01
+            uniform int physxSDFMeshCollision:sdfResolution = 256
+            uniform int physxSDFMeshCollision:sdfSubgridResolution = 6
             token purpose = "guide"
         }
     }
@@ -481,10 +485,14 @@ def Scope "Instances"
     )
     {
         over "moving_jaw_so101_v1" (
-            apiSchemas = ["PhysicsCollisionAPI", "NewtonCollisionAPI", "PhysicsMeshCollisionAPI", "NewtonMeshCollisionAPI"]
+            apiSchemas = ["PhysicsCollisionAPI", "NewtonCollisionAPI", "PhysicsMeshCollisionAPI", "NewtonMeshCollisionAPI", "PhysxSDFMeshCollisionAPI"]
         )
         {
-            token physics:approximation = "convexHull"
+            token physics:approximation = "sdf"
+            uniform float physxSDFMeshCollision:sdfMargin = 0.01
+            uniform float physxSDFMeshCollision:sdfNarrowBandThickness = 0.01
+            uniform int physxSDFMeshCollision:sdfResolution = 256
+            uniform int physxSDFMeshCollision:sdfSubgridResolution = 6
             token purpose = "guide"
         }
     }

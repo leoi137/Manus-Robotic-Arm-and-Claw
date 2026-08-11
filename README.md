@@ -19,6 +19,10 @@ POV inset in the corner. Full-quality video: [`media/demo_showcase.mp4`](media/d
 - `assets/so101/usd/` — the same model converted to USD for Isaac Lab
   (regenerate: `convert_urdf.py <urdf> <out> --fix-base --joint-target-type position`, no
   `--merge-joints` so the `gripper_frame_link` tool frame survives).
+  **After any regeneration, re-run `python scripts/fix_jaw_collision.py`**: the converter can
+  only emit convex hulls, and the two jaws' hulls sit 6.6 mm (fixed) / 1.8 mm (moving) proud of
+  their visual pad faces, so the sim clamps objects on an invisible surface until the jaws are
+  patched back to SDF collision.
 - `src/manus/specs.py` — sim-free ground truth: joint names/limits, Feetech bus map, servo specs.
 - `src/manus/robot.py` — `SO101_CFG` (Isaac Lab `ArticulationCfg`), actuator gains =
   the vendor's system-identified STS3215 model from `joints_properties.xml`
