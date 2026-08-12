@@ -401,9 +401,13 @@ class ProbeRunner:
             quaternion[0].detach().cpu().numpy().astype(float),
         )
 
-    def object_z(self) -> float:
+    def object_pos(self) -> np.ndarray:
+        """Object body-origin (x, y, z) in the robot's own frame, metres."""
         world = self.object.data.root_link_pos_w.torch[0]
-        return float(world[2] - self.scene.env_origins[0][2])
+        return (world - self.scene.env_origins[0]).detach().cpu().numpy().astype(float)
+
+    def object_z(self) -> float:
+        return float(self.object_pos()[2])
 
     def advance(self, render: bool) -> None:
         self.sim.step(render=render)
@@ -452,7 +456,7 @@ class ProbeRunner:
         measured = self.measured()
         expert = ScriptedGraspExpert(self.spec, config=ExpertConfig())
         plan = expert.reset(draw, q_current=measured)
-        monitor = GraspSuccessMonitor(self.spec.spawn_z)
+        monitor = GraspSuccessMonitor(self.spec)
         print(
             f"  plan: grasp_yaw={math.degrees(plan.grasp_yaw):+.1f} deg  "
             f"close_target={plan.close_target:.3f} rad"
@@ -477,7 +481,7 @@ class ProbeRunner:
             for _ in range(DECIMATION):
                 self.advance(render=False)
             measured = self.measured()
-            monitor.update(self.object_z(), measured[specs.JOINT_NAMES.index("gripper")])
+            monitor.update(self.object_pos(), measured)
 
             if expert.state != seen:
                 report = expert.reports[-1]

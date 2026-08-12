@@ -364,8 +364,8 @@ def configuration() -> list[tuple[str, str, str]]:
         ("JAW_CLEARANCE", f"{expert.JAW_CLEARANCE * 1e3:.1f} mm", "expert"),
         ("close_target_rad", f"{spec.close_target_rad:.3f} rad", f"objects[{spec.name}]"),
         ("gripper_open", f"{config.gripper_open:.3f} rad", "expert.ExpertConfig"),
-        ("close_ramp", f"{config.close_ramp} steps", "expert.ExpertConfig"),
-        ("hover_height", f"{config.hover_height * 1e3:.0f} mm", "expert.ExpertConfig"),
+        ("close_ramp", f"{expert.close_ramp_steps(spec, config)} steps", f"objects[{spec.name}]"),
+        ("hover_height", f"{expert.pregrasp_height(spec, config) * 1e3:.1f} mm", "expert"),
         ("converge_tol", f"{config.converge_tol * 1e3:.0f} mrad", "expert.ExpertConfig"),
         ("state_budget", f"{config.state_budget} steps", "expert.ExpertConfig"),
         ("hold_steps", f"{config.hold_steps} steps", "expert.ExpertConfig"),
@@ -595,7 +595,6 @@ def run_gate() -> int:
         dtype=torch.float32,
         device=device,
     )
-    gripper_column = specs.JOINT_NAMES.index("gripper")
 
     def advance() -> None:
         # No render: the gate is decided by the object's height, not by pixels,
@@ -620,7 +619,7 @@ def run_gate() -> int:
         measured = robot.data.joint_pos.torch[0].detach().cpu().numpy().astype(float)
         expert = ScriptedGraspExpert(spec)
         plan = expert.reset(draw, q_current=measured)
-        monitor = GraspSuccessMonitor(spec.spawn_z)
+        monitor = GraspSuccessMonitor(spec)
         for _ in range(max_control_steps):
             if expert.done:
                 break
@@ -636,10 +635,16 @@ def run_gate() -> int:
             for _ in range(decimation):
                 advance()
             measured = robot.data.joint_pos.torch[0].detach().cpu().numpy().astype(float)
-            height = float(
-                obj.data.root_link_pos_w.torch[0][2] - scene.env_origins[0][2]
+            # In the robot's own frame: the monitor checks the object against an
+            # FK of the TCP, not just against a height.
+            object_pos = (
+                (obj.data.root_link_pos_w.torch[0] - scene.env_origins[0])
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(float)
             )
-            monitor.update(height, measured[gripper_column])
+            monitor.update(object_pos, measured)
 
         radius, azimuth_deg = polar(draw.object_x, draw.object_y)
         record = {

@@ -17,8 +17,9 @@ The loop the driver runs is::
 States, in order -- :data:`STATE_SEQUENCE`:
 
 ``PREGRASP``
-    Tool vertical, TCP :data:`ExpertConfig.hover_height` above the grasp point,
-    jaws open. Reached from wherever the arm happens to be.
+    Tool vertical, jaws open, TCP at :func:`pregrasp_height` -- the fixed
+    stand-off above the grasp point, or higher if that would put the fingers
+    inside a tall object. Reached from wherever the arm happens to be.
 ``DESCEND``
     Straight down to the grasp pose: the *jaws* around the object, which is not
     the TCP on the object -- see :func:`tcp_target` and :func:`grasp_height`.
@@ -72,7 +73,7 @@ from typing import Any
 
 import numpy as np
 
-from manus import kinematics, specs
+from manus import kinematics, objects, specs
 from manus.control import GRIPPER_OPEN, clamp_targets
 from manus.kinematics import TCP_TO_PAD_CENTRE, KinematicChain, ik_solve
 from manus.objects import ObjectSpec
@@ -87,11 +88,15 @@ __all__ = [
     "ScriptedGraspExpert",
     "StateReport",
     "classify_outcome",
+    "close_ramp_steps",
     "grasp_height",
     "grasp_yaw_candidates",
+    "jaw_depth",
     "joint_vector",
     "plan_grasp",
     "plan_lift",
+    "pregrasp_height",
+    "tip_clearance",
     "yaw_symmetry",
 ]
 
@@ -159,6 +164,12 @@ class ExpertConfig:
 
     Attributes:
         hover_height: PREGRASP TCP height above the grasp point, metres.
+        hover_margin: Clearance PREGRASP keeps between the lowest jaw material
+            and the *top of the object*, metres, when that is the binding
+            constraint (:func:`pregrasp_height`). Measured against the 4-6 mm of
+            TCP error the arm actually converges to at PREGRASP -- droop the
+            integrator has not finished cancelling -- so 4 mm of nominal margin
+            can be entirely eaten by it and 8 mm leaves a real 2-4 mm.
         converge_tol: Arm convergence tolerance, radians (see :data:`CONVERGE_TOL`).
         state_budget: Per-state step ceiling; expiry advances the FSM anyway and
             is recorded in :attr:`ScriptedGraspExpert.timeouts`.
@@ -174,8 +185,10 @@ class ExpertConfig:
             floor with the tolerance and droop left over.
         pregrasp_ramp: Steps spent interpolating into the PREGRASP waypoint.
         descend_ramp: Steps spent interpolating down to the grasp pose.
-        close_ramp: Steps spent driving the jaws to the close target. **The
-            single most sensitive number here.** The jaws travel ~1.45 rad from
+        close_ramp: Steps spent driving the jaws to the close target, or None --
+            the default -- to take it from the object's mass, via
+            :attr:`~manus.objects.ObjectSpec.close_ramp_steps`. **The single
+            most sensitive number here.** The jaws travel ~1.45 rad from
             open to the close target, so 20 steps is 2.2 rad/s of jaw closing
             speed, or ~90 mm/s at the pads -- fast enough that the fingers'
             inward taper flicks a 30 mm cube out of the hand like a watermelon
@@ -184,6 +197,10 @@ class ExpertConfig:
             nothing). 60 steps is 0.7 rad/s and the same grip once seated:
             16/16 on the probe set that contained both failures, and no slips
             among the low-friction attempts a *weaker* squeeze cost instead.
+            That is the 60 g cube's number, and it is what the mass rule
+            returns for it; a 5 g die needs 150. Setting this pins one ramp on
+            whatever is being grasped, which is a tuning override rather than a
+            default -- ``scripts/demo_expert.py --close-ramp`` is why it exists.
 
         lift_ramp: Steps spent retracting to the lift pose.
         droop_gain: Integral gain folding measured joint error into the command.
@@ -199,6 +216,7 @@ class ExpertConfig:
     """
 
     hover_height: float = 0.03
+    hover_margin: float = 0.008
     converge_tol: float = CONVERGE_TOL
     state_budget: int = 240
     hold_steps: int = 45
@@ -209,25 +227,45 @@ class ExpertConfig:
     min_lift_rise: float = 0.06
     pregrasp_ramp: int = 45
     descend_ramp: int = 30
-    close_ramp: int = 60
+    close_ramp: int | None = None
     lift_ramp: int = 30
     droop_gain: float = 0.12
     droop_engage: float = 0.20
     droop_leak: float = 0.97
     droop_limit: float = 0.30
 
-    def ramp_steps(self, state: str) -> int:
-        """Ramp length of `state`, in steps (1 for states that do not ramp)."""
+    def ramp_steps(self, state: str, spec: ObjectSpec | None = None) -> int:
+        """Ramp length of `state`, in steps (1 for states that do not ramp).
+
+        CLOSE is the only state whose ramp depends on what is being grasped:
+        with :attr:`close_ramp` left at None it comes from `spec`, so pass the
+        object whenever one is in hand. Without a spec an unset
+        :attr:`close_ramp` falls back to the tuned reference ramp.
+        """
+        if state == CLOSE:
+            return close_ramp_steps(spec, self)
         return {
             PREGRASP: self.pregrasp_ramp,
             DESCEND: self.descend_ramp,
-            CLOSE: self.close_ramp,
             LIFT: self.lift_ramp,
         }.get(state, 1)
 
 
 DEFAULT_CONFIG = ExpertConfig()
 """The configuration :class:`ScriptedGraspExpert` uses unless told otherwise."""
+
+
+def close_ramp_steps(spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CONFIG) -> int:
+    """Steps CLOSE ramps over for `spec`: the config's override, else the mass rule.
+
+    The one place the two sources are reconciled, so a driver reporting the
+    ramp it used and the FSM issuing it cannot disagree.
+    """
+    if config.close_ramp is not None:
+        return config.close_ramp
+    if spec is None:
+        return objects.CLOSE_RAMP_REFERENCE_STEPS
+    return spec.close_ramp_steps
 
 
 # --- Planning -----------------------------------------------------------------
@@ -315,6 +353,26 @@ The TCP sits 6.3 mm *behind* the fingertips, so the tool can be driven to a
 height of ``object_z + TCP_TO_PAD_CENTRE`` without the fingers touching ground.
 """
 
+MOVING_JAW_DEEPEST_Z: float = 0.00806
+"""Deepest the *moving* jaw reaches below the TCP, over its whole sweep, metres.
+
+Measured off the meshes (``tests/test_expert_logic.py`` re-derives it): the
+finger swings down as it closes and back up as it goes past, peaking 1.8 mm
+below the static fingertips at 0.14 rad. Only reached with the jaws well shut,
+which is why it is a CLOSE-time clearance rather than an approach one -- see
+:func:`jaw_depth`.
+"""
+
+MOVING_JAW_CLEAR_RAD: float = 0.347
+"""Jaw angle above which the moving finger is shallower than the static tips, radians.
+
+**Measured**, same sweep as :data:`MOVING_JAW_DEEPEST_Z`. Above it the static
+fingertips are the lowest thing on the hand; by :data:`~manus.control.GRIPPER_OPEN`
+the moving finger has swung 57 mm *behind* the TCP and is not in the approach
+corridor at all.
+"""
+
+
 JAW_CLEARANCE: float = 0.002
 """Gap left between the object and the static jaw on the way down, metres.
 
@@ -339,8 +397,14 @@ object :func:`grasp_height` actually has to raise. 5 mm is the compromise it
 spends there: the tips clear the table by 5 mm against a ~2 mm droop residual at
 convergence, and the pads still cover the puck's top half. Both directions cost
 something real -- lower and a sagging finger digs into the table, higher and the
-grip creeps towards the puck's top edge -- so this is the constant to move first
-if the puck misbehaves.
+grip creeps towards the puck's top edge.
+
+It is a *default*, overridable per object through
+:attr:`~manus.objects.ObjectSpec.tip_clearance_m` (see :func:`tip_clearance`),
+which is how the 3-7 mm band is swept without a code change. Sweeping it does
+not rescue the puck -- the closing finger meets its rim tilted and descending
+whatever the height, which is why the spec is marked experimental -- but the
+band is where any future short object's grasp gets tuned.
 """
 
 YAW_MATCH_TOL: float = math.radians(2.0)
@@ -349,6 +413,25 @@ YAW_MATCH_TOL: float = math.radians(2.0)
 Wide enough to swallow ``ik_solve``'s own 1 deg yaw tolerance, far narrower
 than the pi flip it is there to catch.
 """
+
+
+def jaw_depth(gripper: float) -> float:
+    """How far below the TCP the lowest point of either jaw sits, metres.
+
+    Two-valued rather than a profile, because only the two ends of the sweep
+    are load-bearing and both are measured: with the jaws open (the whole
+    approach) the static fingertips lead, and anywhere the moving finger might
+    lead instead the answer is its deepest point over the sweep, which is
+    conservative by at most 3.7 mm. Used by :func:`pregrasp_height` to hold the
+    hand above an object rather than through it.
+
+    Args:
+        gripper: Jaw joint angle, radians.
+
+    Returns:
+        Depth of the lowest jaw material below the TCP, metres.
+    """
+    return JAW_TIP_Z if gripper >= MOVING_JAW_CLEAR_RAD else MOVING_JAW_DEEPEST_Z
 
 
 def pad_lateral_offset(spec: ObjectSpec) -> float:
@@ -361,16 +444,61 @@ def pad_lateral_offset(spec: ObjectSpec) -> float:
     return JAW_FIXED_FACE_X - 0.5 * spec.grasp_width_m - JAW_CLEARANCE
 
 
+def tip_clearance(spec: ObjectSpec) -> float:
+    """Gap to leave between the fingertips and the table for `spec`, metres.
+
+    :data:`MIN_TIP_CLEARANCE` unless the spec overrides it
+    (:attr:`~manus.objects.ObjectSpec.tip_clearance_m`), which only an object
+    short enough for the clearance to bind can feel at all.
+    """
+    return MIN_TIP_CLEARANCE if spec.tip_clearance_m is None else spec.tip_clearance_m
+
+
 def grasp_height(spec: ObjectSpec) -> float:
     """Height above the table the jaw pads centre on for `spec`, metres.
 
     The object's own mid-height, which puts the pads across the widest part of
     it -- raised, for an object short enough to need it, until the fingertips
-    clear the table by :data:`MIN_TIP_CLEARANCE`. Nothing in the catalogue but
-    the 10 mm puck is short enough to be raised at all, and it is raised 2.3 mm.
+    clear the table by :func:`tip_clearance`. Nothing in the catalogue but the
+    10 mm puck is short enough to be raised at all, and it is raised 2.3 mm.
     """
-    lowest_centre = JAW_TIP_Z - TCP_TO_PAD_CENTRE + MIN_TIP_CLEARANCE
+    lowest_centre = JAW_TIP_Z - TCP_TO_PAD_CENTRE + tip_clearance(spec)
     return max(spec.spawn_z, lowest_centre)
+
+
+def pregrasp_height(spec: ObjectSpec, config: ExpertConfig | None = None) -> float:
+    """TCP height PREGRASP hovers at, and DESCEND starts from, metres.
+
+    The higher of two bars:
+
+    * :attr:`~ExpertConfig.hover_height` above the grasp pose, the fixed
+      stand-off the descent was tuned as, and
+    * enough for the lowest jaw material to clear the *top of the object* by
+      :attr:`~ExpertConfig.hover_margin`.
+
+    The second bar exists because the first one is measured from the grasp
+    pose, which sits at the object's mid-height: on anything taller than
+    ``2 * (hover_height - jaw_depth - margin)`` the "hover" is inside the
+    object. The 60 mm cylinder is the catalogue's case -- the fixed rule put the
+    fingertips 2.3 mm *below* its top, and the tool swept it over on the way
+    into the waypoint -- and the 40 mm ball misses by 0.3 mm. Both are the same
+    arithmetic, so the fix is the arithmetic rather than a taller constant:
+    a taller fixed hover would raise every grasp to suit the worst object and
+    cost reach at the top of the region.
+
+    Args:
+        spec: Object being grasped.
+        config: Tunables; :attr:`~ExpertConfig.hover_height`,
+            :attr:`~ExpertConfig.hover_margin` and
+            :attr:`~ExpertConfig.gripper_open` are read.
+
+    Returns:
+        TCP height above the table, metres.
+    """
+    config = DEFAULT_CONFIG if config is None else config
+    stand_off = grasp_height(spec) + TCP_TO_PAD_CENTRE + config.hover_height
+    clearing = spec.top_z + jaw_depth(config.gripper_open) + config.hover_margin
+    return max(stand_off, clearing)
 
 
 def tcp_target(
@@ -588,7 +716,7 @@ def plan_grasp(
             bare ``(x, y, yaw)`` in metres/radians.
         q_current: Shape (5,) arm pose the attempt starts from, radians; used
             only to pick the grasp-yaw branch. None means the home pose.
-        config: Tunables; :attr:`~ExpertConfig.hover_height`,
+        config: Tunables; :func:`pregrasp_height`'s inputs,
             :attr:`~ExpertConfig.lift_rise` and
             :attr:`~ExpertConfig.min_lift_rise` are read.
 
@@ -607,7 +735,7 @@ def plan_grasp(
     best: GraspPlan | None = None
     for grasp_yaw in grasp_yaw_candidates(spec, object_yaw, _CHAIN.tool_yaw(start)):
         tcp_grasp = tcp_target((x, y), grasp_height(spec), grasp_yaw, spec)
-        tcp_pregrasp = tcp_grasp + np.array([0.0, 0.0, config.hover_height])
+        tcp_pregrasp = np.array([tcp_grasp[0], tcp_grasp[1], pregrasp_height(spec, config)])
         q_pregrasp, pregrasp_ok = ik_solve(tcp_pregrasp, grasp_yaw)
         q_grasp, grasp_ok = ik_solve(tcp_grasp, grasp_yaw)
         q_lift, lift_rise = plan_lift(q_grasp, config.lift_rise)
@@ -913,7 +1041,7 @@ class ScriptedGraspExpert:
 
     def _ramp(self) -> float:
         """Fraction of the current state's ramp already commanded, in [0, 1]."""
-        span = max(1, self.config.ramp_steps(self._state))
+        span = max(1, self.config.ramp_steps(self._state, self.spec))
         return min(1.0, self._state_step / span)
 
     def _exit_reason(self, arm: np.ndarray) -> str | None:
@@ -947,7 +1075,9 @@ class ScriptedGraspExpert:
     def _command(self, arm: np.ndarray, gripper: float) -> dict[str, float]:
         """Targets for the current state at the current step."""
         assert self._entry_arm is not None
-        alpha = min(1.0, (self._state_step + 1) / max(1, self.config.ramp_steps(self._state)))
+        alpha = min(
+            1.0, (self._state_step + 1) / max(1, self.config.ramp_steps(self._state, self.spec))
+        )
         config = self.config
 
         if self._state in ARM_STATES:
@@ -1025,6 +1155,7 @@ class ScriptedGraspExpert:
             "plan_reason": plan.reason,
             "lift_rise": plan.lift_rise,
             "close_target": plan.close_target,
+            "close_ramp": self.config.ramp_steps(CLOSE, self.spec),
             "state": self._state,
             "total_steps": self._total_steps,
             "timeouts": list(self._timeouts),
@@ -1051,46 +1182,168 @@ well below :data:`manus.control.GRIPPER_OPEN` (1.5), so a hand that dropped the
 object cannot satisfy the predicate while a real grasp always can.
 """
 
+IN_HAND_RADIUS_M: float = 0.060
+"""How far the object's centre may sit from the TCP and still be *in* the hand, metres.
+
+A seated object sits at the pad centre, which is
+``hypot(pad_lateral_offset, TCP_TO_PAD_CENTRE)`` from the TCP: 17.5 mm for the
+cube, 22.4 mm for the widest catalogue grasp. This bar is more than twice that,
+so it costs a real grasp nothing even with the arm drooping and the tool tilted
+through the lift -- what it rejects is an object that is *riding* the hand
+rather than being held by it, which starts at the wrist (the jaws are ~50 mm
+long) and gets further away from there.
+"""
+
+STALL_SLACK_RAD: float = 0.10
+"""How far a measured CLOSE stall may sit from the object's contact angle, radians.
+
+The discriminating number, and it works because it is smaller than
+:data:`~manus.objects.SQUEEZE_RAD` (0.139): jaws that meet the object stop
+*at* its contact angle, jaws that meet nothing run all the way to the commanded
+target a full squeeze below it, and 0.10 rad separates the two. Measured against
+the seven filmed catalogue grasps, a held object stalls between 94 mrad below
+its contact angle (the ping-pong ball, whose pads sink into a tangent point) and
+2 mrad above it (cube, domino, duplo, die), while the two empty closures land
+140 and 364 mrad below. The ball is the object with the least margin -- 6 mrad
+-- so this is the constant to loosen first if a real grasp is ever called a
+failure, and the constructor takes it per attempt for exactly that reason.
+"""
+
+STALL_TARGET_MARGIN_RAD: float = 0.02
+"""How far above its commanded target the jaws must stall to count as loaded, radians.
+
+The second half of the stall clause, and the exact one: the CLOSE target is
+commanded *past* contact, so jaws that actually arrive at it were stopped by
+nothing. 0.02 rad is 1.5 mm of jaw gap -- enough that an object seated a
+millimetre thinner than declared still reads as held. It matters because
+:data:`STALL_SLACK_RAD` alone stops discriminating on an object squeezed by
+less than the slack (the die, at :data:`~manus.objects.LIGHT_SQUEEZE_RAD`,
+would otherwise accept the empty closure that lands exactly on its target).
+"""
+
 
 class GraspSuccessMonitor:
-    """The success predicate: object lifted 5 cm, held 30 steps, jaws closed.
+    """The success predicate: object lifted 5 cm, held 30 steps, *in the hand*.
 
-    Stateful because "sustained" means *consecutive* steps: any step where the
-    object drops back below the bar, or the jaws are open, restarts the count.
-    Once :attr:`success` latches True it stays True -- a grasp that succeeded
-    and was then thrown away by a later state still succeeded at the moment the
-    predicate was met, and the episode is cut there by the driver anyway.
+    Four clauses, all of which have to hold on the same step for it to count
+    towards the sustain, because the interesting failure is the one that
+    satisfies some of them:
+
+    1. the object is :attr:`lift` above where it rested,
+    2. the jaws are closed (below :attr:`gripper_max`),
+    3. the object's centre is within :attr:`in_hand_radius` of the TCP, by FK
+       from the measured joints, and
+    4. the jaws stalled where an object of this width would stop them:
+       within :attr:`stall_slack` below its contact angle *and* clear of the
+       commanded target by :data:`STALL_TARGET_MARGIN_RAD`, and no further above
+       contact than the squeeze plus that slack.
+
+    Clauses 3 and 4 are the Step 21 addition, and they exist because height
+    alone is not evidence of a grasp: an object knocked onto the forearm, or
+    wedged against the outside of a jaw, *rises with the robot*. Two of the
+    seven filmed catalogue previews passed the height-only predicate with
+    provably empty jaws -- the puck (stalled at 0.187 rad against a 0.327
+    contact angle, i.e. exactly on the commanded target) and the cylinder (rode
+    the jaw down to the -0.1745 rad hard stop). Clause 4 rejects both from the
+    gripper trace the monitor already sees; clause 3 rejects the geometry.
+
+    Stateful because "sustained" means *consecutive* steps: any step that fails
+    any clause restarts the count. Once :attr:`success` latches True it stays
+    True -- a grasp that succeeded and was then thrown away by a later state
+    still succeeded at the moment the predicate was met, and the episode is cut
+    there by the driver anyway.
+
+    :attr:`height_only` latches the *old* predicate alongside the new one, so a
+    run can report how many of its successes were the height bar alone.
 
     Args:
-        spawn_z: Height the object rests at, metres (``ObjectSpec.spawn_z``).
-        lift: Rise required above `spawn_z`, metres.
+        spec: Object being grasped; supplies the rest height, the contact angle
+            and the squeeze.
+        lift: Rise required above the object's rest height, metres.
         sustain: Consecutive steps required.
         gripper_max: Jaw angle at or below which the gripper counts as closed.
+        in_hand_radius: TCP-to-object distance allowed, metres.
+        stall_slack: Tolerance on the stall angle, radians.
+        target_margin: Clearance the stall must keep above the commanded close
+            target, radians.
     """
 
     def __init__(
         self,
-        spawn_z: float,
+        spec: ObjectSpec,
         *,
         lift: float = SUCCESS_LIFT_M,
         sustain: int = SUCCESS_SUSTAIN_STEPS,
         gripper_max: float = GRIPPER_HELD_MAX_RAD,
+        in_hand_radius: float = IN_HAND_RADIUS_M,
+        stall_slack: float = STALL_SLACK_RAD,
+        target_margin: float = STALL_TARGET_MARGIN_RAD,
     ) -> None:
-        self.spawn_z = float(spawn_z)
+        self.spec = spec
+        self.spawn_z = float(spec.spawn_z)
         self.lift = float(lift)
         self.threshold_z = self.spawn_z + self.lift
         self.sustain = int(sustain)
         self.gripper_max = float(gripper_max)
+        self.in_hand_radius = float(in_hand_radius)
+        self.stall_slack = float(stall_slack)
+        self.target_margin = float(target_margin)
+        self.stall_band = (
+            max(
+                spec.contact_angle_rad - self.stall_slack,
+                spec.close_target_rad + self.target_margin,
+            ),
+            spec.contact_angle_rad + spec.squeeze_rad + self.stall_slack,
+        )
         self.streak = 0
         self.best_streak = 0
         self.peak_z = -np.inf
         self.success = False
+        self.height_streak = 0
+        self.height_only = False
+        self.tcp_distance: float | None = None
+        self.gripper: float | None = None
 
-    def update(self, object_z: float, gripper_pos: float) -> bool:
-        """Fold in one step's privileged state; returns :attr:`success`."""
-        height = float(object_z)
+    def update(
+        self,
+        object_pos: Sequence[float] | np.ndarray,
+        joint_pos: Mapping[str, float] | Sequence[float] | np.ndarray,
+    ) -> bool:
+        """Fold in one step's privileged state; returns :attr:`success`.
+
+        Args:
+            object_pos: Object centre ``(x, y, z)`` in the robot's own frame
+                (i.e. with the environment origin already subtracted), metres.
+            joint_pos: All six measured joint positions, in the form
+                :func:`joint_vector` accepts, radians. The TCP comes from these
+                by FK rather than from the commanded pose, so a drooping arm is
+                measured where it actually is.
+
+        Returns:
+            :attr:`success`.
+        """
+        position = np.asarray(object_pos, dtype=float).reshape(-1)
+        if position.shape != (3,):
+            raise ValueError(
+                f"object_pos must be the object centre (x, y, z), got shape {position.shape}"
+            )
+        measured = joint_vector(joint_pos)
+        gripper = float(measured[GRIPPER_INDEX])
+        tcp = _CHAIN.fk_tcp(measured[: kinematics.NUM_ARM_JOINTS])[0]
+
+        height = float(position[2])
         self.peak_z = max(self.peak_z, height)
-        if height >= self.threshold_z and float(gripper_pos) <= self.gripper_max:
+        self.tcp_distance = float(np.linalg.norm(position - tcp))
+        self.gripper = gripper
+
+        lifted = height >= self.threshold_z and gripper <= self.gripper_max
+        in_hand = self.tcp_distance <= self.in_hand_radius
+        seated = self.stall_band[0] <= gripper <= self.stall_band[1]
+
+        self.height_streak = self.height_streak + 1 if lifted else 0
+        if self.height_streak >= self.sustain:
+            self.height_only = True
+        if lifted and in_hand and seated:
             self.streak += 1
             self.best_streak = max(self.best_streak, self.streak)
             if self.streak >= self.sustain:
@@ -1107,6 +1360,11 @@ class GraspSuccessMonitor:
             "threshold_z": self.threshold_z,
             "best_streak": self.best_streak,
             "sustain": self.sustain,
+            "height_only": self.height_only,
+            "in_hand_radius": self.in_hand_radius,
+            "stall_band": [self.stall_band[0], self.stall_band[1]],
+            "tcp_distance": self.tcp_distance,
+            "gripper": self.gripper,
         }
 
 
@@ -1128,6 +1386,12 @@ def classify_outcome(
     ``ik_infeasible``
         The plan itself was never solvable (edge of region, or no lift). The
         attempt still ran, so this is an outcome rather than a skip.
+    ``not_in_hand``
+        The object was up, and stayed up, but the hand was not holding it --
+        it rode the arm, or the jaws stalled nowhere near this object's width.
+        The old height-only predicate scored these as successes; they are the
+        ones that would poison a dataset, so they get their own name rather
+        than being filed under ``slipped``.
     ``slipped``
         The object cleared the bar at some point but did not stay there --
         squeeze, friction or the lift tilt.
@@ -1153,6 +1417,8 @@ def classify_outcome(
         return "success"
     if not expert.plan.ok:
         return "ik_infeasible"
+    if monitor.height_only:
+        return "not_in_hand"
     peak = monitor.peak_z
     if peak >= monitor.threshold_z:
         return "slipped"

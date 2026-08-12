@@ -443,9 +443,19 @@ class EvalRunner:
         """Six measured joint positions (radians), in ``specs.JOINT_NAMES`` order."""
         return self.robot.data.joint_pos.torch[0].detach().cpu().numpy().astype(float)
 
+    def object_pos(self) -> Any:
+        """Object body-origin (x, y, z) in the robot's own frame, metres.
+
+        Environment origin subtracted: the frame the expert plans in, and the
+        one :class:`~manus.expert.GraspSuccessMonitor` compares against its FK
+        of the TCP.
+        """
+        world = self.object.data.root_link_pos_w.torch[0]
+        return (world - self.scene.env_origins[0]).detach().cpu().numpy().astype(float)
+
     def object_z(self) -> float:
         """Object body-origin height above the ground plane, metres."""
-        return float(self.object.data.root_link_pos_w.torch[0][2] - self.scene.env_origins[0][2])
+        return float(self.object_pos()[2])
 
     def capture(self) -> Any:
         """The wrist frame for the current state, at the recorded resolution.
@@ -510,7 +520,7 @@ class EvalRunner:
         # planned for the previous one.
         self.ensembler = None
 
-        monitor = GraspSuccessMonitor(self.spec.spawn_z)
+        monitor = GraspSuccessMonitor(self.spec)
         rest_z = self.object_z()
         jpegs: list[bytes] = []
         path_length = np.zeros(6)
@@ -549,7 +559,7 @@ class EvalRunner:
             path_length += np.abs(measured - previous)
             peak_excursion = np.maximum(peak_excursion, np.abs(measured - home))
             previous = measured.copy()
-            monitor.update(self.object_z(), measured[self.gripper_column])
+            monitor.update(self.object_pos(), measured)
             if monitor.success:
                 stop_reason = "success"
                 break
@@ -951,6 +961,9 @@ def main(args: Any) -> int:  # noqa: PLR0915 - one linear run script
             "lift_m": expert_mod.SUCCESS_LIFT_M,
             "sustain_steps": expert_mod.SUCCESS_SUSTAIN_STEPS,
             "gripper_held_max_rad": expert_mod.GRIPPER_HELD_MAX_RAD,
+            "in_hand_radius_m": expert_mod.IN_HAND_RADIUS_M,
+            "stall_slack_rad": expert_mod.STALL_SLACK_RAD,
+            "stall_target_margin_rad": expert_mod.STALL_TARGET_MARGIN_RAD,
         },
         "result_detail": result_detail,
         "motion": motion,

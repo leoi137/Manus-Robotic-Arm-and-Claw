@@ -96,6 +96,16 @@ parser.add_argument(
     help="override expert.JAW_CLEARANCE for this run (tuning aid)",
 )
 parser.add_argument(
+    "--tip-clearance",
+    type=float,
+    default=None,
+    help=(
+        "override the fingertip-to-table gap at the grasp, metres -- the knob "
+        "that moves a short object's grasp height (tuning aid; 0.003-0.007 is "
+        "the puck's feasible band)"
+    ),
+)
+parser.add_argument(
     "--converge-tol",
     type=float,
     default=None,
@@ -219,10 +229,19 @@ class AttemptRunner:
         """Six measured joint positions (radians), in ``specs.JOINT_NAMES`` order."""
         return self.robot.data.joint_pos.torch[0].detach().cpu().numpy().astype(float)
 
+    def object_pos(self) -> np.ndarray:
+        """Object body-origin (x, y, z) in the robot's own frame, metres.
+
+        Environment origin subtracted, which is the frame the expert plans in
+        and the frame :class:`~manus.expert.GraspSuccessMonitor` compares
+        against its FK of the TCP.
+        """
+        world = self.object.data.root_link_pos_w.torch[0]
+        return (world - self.scene.env_origins[0]).detach().cpu().numpy().astype(float)
+
     def object_z(self) -> float:
         """Object body-origin height above the ground plane, metres."""
-        world = self.object.data.root_link_pos_w.torch[0]
-        return float(world[2] - self.scene.env_origins[0][2])
+        return float(self.object_pos()[2])
 
     def advance(self, render: bool) -> None:
         """One physics step, refreshing only the buffers this script reads.
@@ -256,7 +275,7 @@ class AttemptRunner:
         measured = self.measured()
         expert = ScriptedGraspExpert(self.spec, config=self.config)
         plan = expert.reset(draw, q_current=measured)
-        monitor = GraspSuccessMonitor(self.spec.spawn_z)
+        monitor = GraspSuccessMonitor(self.spec)
         frames: list[np.ndarray] = []
         rest_z = self.object_z()
 
@@ -288,7 +307,7 @@ class AttemptRunner:
             for substep in range(DECIMATION):
                 self.advance(render=record and substep == DECIMATION - 1)
             measured = self.measured()
-            monitor.update(self.object_z(), measured[specs.JOINT_NAMES.index("gripper")])
+            monitor.update(self.object_pos(), measured)
 
             if args_cli.trace and expert.total_steps % args_cli.trace == 0:
                 error = [targets[name] - value for name, value in zip(specs.JOINT_NAMES, measured)]
@@ -408,6 +427,15 @@ def main() -> int:
     if args_cli.jaw_clearance is not None:
         expert_mod.JAW_CLEARANCE = args_cli.jaw_clearance
         print(f"OVERRIDE JAW_CLEARANCE = {args_cli.jaw_clearance}")
+    if args_cli.tip_clearance is not None:
+        # Per spec rather than per module: the grasp height is an object
+        # property, so the override rides with the object the whole way through
+        # the plan (and into the spec any sweep records).
+        spec = dataclasses.replace(spec, tip_clearance_m=args_cli.tip_clearance)
+        print(
+            f"OVERRIDE tip_clearance_m = {spec.tip_clearance_m} "
+            f"-> grasp_height {expert_mod.grasp_height(spec) * 1e3:.2f} mm"
+        )
     config = ExpertConfig()
     if args_cli.converge_tol is not None:
         config = dataclasses.replace(config, converge_tol=args_cli.converge_tol)

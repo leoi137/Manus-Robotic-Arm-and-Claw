@@ -17,14 +17,22 @@ from pathlib import Path
 import pytest
 
 from manus.objects import (
+    CLOSE_RAMP_MAX_STEPS,
+    CLOSE_RAMP_REFERENCE_STEPS,
     CLOSE_TARGET_30MM_RAD,
+    DEFAULT_OBJECTS,
     JAW_WIDTH_PER_RAD,
+    LIGHT_SQUEEZE_RAD,
     MEASURED_STALL_30MM_RAD,
+    MIN_SQUEEZE_RAD,
     OBJECTS,
+    REFERENCE_MASS_KG,
     REFERENCE_WIDTH_M,
     SQUEEZE_RAD,
     ObjectSpec,
+    close_ramp_for_mass,
     close_target_for_width,
+    contact_angle_for_width,
 )
 from manus.randomize import (
     BASE_KEEPOUT_ABS_Y,
@@ -170,7 +178,7 @@ def test_close_targets_are_pinned():
     assert {name: round(spec.close_target_rad, 4) for name, spec in OBJECTS.items()} == {
         "cube_3cm": 0.05,
         "cylinder_3cm": 0.05,
-        "die_16mm": -0.1426,
+        "die_16mm": -0.1036,  # LIGHT_SQUEEZE_RAD, not the full squeeze
         "domino_20x40": -0.0876,
         "puck_d40x10": 0.1876,
         "pingpong_40mm": 0.1876,
@@ -180,7 +188,116 @@ def test_close_targets_are_pinned():
 
 @pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
 def test_every_close_target_comes_from_the_formula(spec):
-    assert spec.close_target_rad == pytest.approx(close_target_for_width(spec.grasp_width_m))
+    assert spec.close_target_rad == pytest.approx(
+        close_target_for_width(spec.grasp_width_m, spec.squeeze_rad)
+    )
+
+
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_the_contact_angle_is_the_close_target_plus_the_squeeze(spec):
+    """The two halves of the CLOSE geometry are one identity, per object."""
+    assert spec.contact_angle_rad == pytest.approx(contact_angle_for_width(spec.grasp_width_m))
+    assert spec.close_target_rad == pytest.approx(spec.contact_angle_rad - spec.squeeze_rad)
+
+
+def test_the_die_is_the_one_object_squeezed_less_than_the_tuned_amount():
+    """Pinned: the light squeeze is a deliberate, single exception."""
+    lighter = [name for name, spec in OBJECTS.items() if spec.squeeze_rad < SQUEEZE_RAD - 1e-9]
+    assert lighter == ["die_16mm"]
+    assert OBJECTS["die_16mm"].squeeze_rad == pytest.approx(LIGHT_SQUEEZE_RAD)
+
+
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_every_squeeze_still_asks_the_servo_for_half_its_effort(spec):
+    """The floor a lighter squeeze must not go through, at the catalogue level."""
+    assert spec.squeeze_rad >= MIN_SQUEEZE_RAD
+
+
+def test_the_die_keeps_clear_of_the_jaws_hard_stop():
+    """Why the die's squeeze was cut: the stop is where the grip goes slack.
+
+    The full squeeze put its target 0.032 rad off the -0.1745 rad stop, closer
+    than any other object by a factor of four; the light one doubles that.
+    """
+    die = OBJECTS["die_16mm"]
+    stop = JOINT_LIMITS["gripper"][0]
+    assert die.close_target_rad - stop == pytest.approx(0.071, abs=1e-3)
+    assert contact_angle_for_width(die.grasp_width_m) - SQUEEZE_RAD - stop < 0.035
+
+
+# --- Close ramp ----------------------------------------------------------------
+
+
+def test_the_close_ramp_rule_hits_both_measured_anchors():
+    """The two numbers the rule exists to interpolate, and it must reproduce them.
+
+    60 g in 60 steps is the Step 8 gate's anchor (200/200 attempts); 5 g in 150
+    is what the die needed once 60 punted it.
+    """
+    assert close_ramp_for_mass(REFERENCE_MASS_KG) == CLOSE_RAMP_REFERENCE_STEPS
+    assert close_ramp_for_mass(0.005) == 150
+
+
+def test_the_close_ramp_is_monotone_and_bounded_in_mass():
+    masses = [0.0005, 0.001, 0.0027, 0.005, 0.01, 0.015, 0.02, 0.06, 0.08, 0.5]
+    ramps = [close_ramp_for_mass(mass) for mass in masses]
+    assert ramps == sorted(ramps, reverse=True)
+    assert all(CLOSE_RAMP_REFERENCE_STEPS <= ramp <= CLOSE_RAMP_MAX_STEPS for ramp in ramps)
+
+
+def test_a_massless_object_is_rejected_rather_than_ramped_forever():
+    with pytest.raises(ValueError, match="mass must be positive"):
+        close_ramp_for_mass(0.0)
+
+
+def test_close_ramps_are_pinned():
+    """Hard-coded, like the close targets: a rule change has to be seen."""
+    assert {name: spec.close_ramp_steps for name, spec in OBJECTS.items()} == {
+        "cube_3cm": 60,  # the gate's anchor -- must not move
+        "cylinder_3cm": 60,
+        "die_16mm": 150,
+        "domino_20x40": 104,
+        "puck_d40x10": 120,
+        "pingpong_40mm": 150,
+        "duplo_32x64": 104,
+    }
+
+
+def test_a_spec_can_override_the_mass_rule():
+    spec = ObjectSpec(
+        name="probe", shape="cuboid", half_extents=(0.015, 0.015, 0.015), mass_kg=0.06,
+        grasp_width_m=0.03, spawn_z=0.015, close_target_rad=0.05, yaw_symmetry="quarter",
+        close_ramp=33,
+    )
+    assert spec.close_ramp_steps == 33
+
+
+def test_a_nonsense_override_is_rejected():
+    common = dict(
+        shape="cuboid", half_extents=(0.015, 0.015, 0.015), mass_kg=0.06,
+        grasp_width_m=0.03, spawn_z=0.015, close_target_rad=0.05, yaw_symmetry="quarter",
+    )
+    with pytest.raises(ValueError, match="close_ramp must be at least one step"):
+        ObjectSpec(name="bad", close_ramp=0, **common)
+    with pytest.raises(ValueError, match="tip_clearance_m cannot be negative"):
+        ObjectSpec(name="bad", tip_clearance_m=-0.001, **common)
+
+
+# --- Experimental objects --------------------------------------------------------
+
+
+def test_the_default_sweep_leaves_the_experimental_objects_out_but_keeps_them_runnable():
+    """The puck fails by geometry (see manus.expert), so it must not ride into a dataset.
+
+    It stays in OBJECTS -- spawnable, plannable, runnable by name -- and only
+    the default "every object" list drops it.
+    """
+    assert set(DEFAULT_OBJECTS) < set(OBJECTS)
+    assert [name for name in OBJECTS if name not in DEFAULT_OBJECTS] == ["puck_d40x10"]
+    assert DEFAULT_OBJECTS == tuple(
+        name for name, spec in OBJECTS.items() if not spec.experimental
+    )
+    assert "cube_3cm" == DEFAULT_OBJECTS[0]
 
 
 def test_the_close_target_tracks_the_width_at_the_measured_rate():

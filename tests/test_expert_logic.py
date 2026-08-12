@@ -61,14 +61,15 @@ HOME = np.zeros(ARM)
 MIN_LIFT_RISE = 0.06
 """TCP rise the LIFT retraction has to deliver, metres (the plan's bar)."""
 
-MOVING_JAW_DEEPEST_Z = 0.00806
+MOVING_JAW_DEEPEST_Z = expert_mod.MOVING_JAW_DEEPEST_Z
 """Deepest the *moving* jaw reaches below the TCP over the closing sweep, metres.
 
-Measured off the meshes by :func:`test_the_closing_jaw_reaches_deeper_than_the_tips`
-below, which is also where the number comes from. It peaks at 0.14 rad, 1.8 mm
-past the static fingertips: the finger swings down as it closes and back up as
-it goes past. Only the short objects care, and only during CLOSE -- the arm is
-frozen by then, so this is a clearance to keep, not a motion to plan.
+The constant :mod:`manus.expert` carries, re-measured off the meshes by
+:func:`test_the_closing_jaw_reaches_deeper_than_the_tips` below. It peaks at
+0.14 rad, 1.8 mm past the static fingertips: the finger swings down as it closes
+and back up as it goes past. Only the short objects care, and only during CLOSE
+-- the arm is frozen by then, so this is a clearance to keep, not a motion to
+plan.
 """
 
 
@@ -222,6 +223,104 @@ def test_grasp_height_is_the_object_height_plus_the_pad_offset():
     assert plan.tcp_pregrasp[2] == pytest.approx(plan.tcp_grasp[2] + 0.03)
     assert plan.tcp_pregrasp[0] == pytest.approx(plan.tcp_grasp[0])
     assert plan.tcp_pregrasp[1] == pytest.approx(plan.tcp_grasp[1])
+
+
+# --- The hover ------------------------------------------------------------------
+
+
+def hover_clearance(spec, config=ExpertConfig()) -> float:
+    """Gap between the lowest jaw material at PREGRASP and the top of `spec`, metres."""
+    from manus.expert import jaw_depth, pregrasp_height
+
+    return pregrasp_height(spec, config) - jaw_depth(config.gripper_open) - spec.top_z
+
+
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_the_hover_clears_the_top_of_every_object(spec):
+    """The Step 21 fix, by FK: no jaw is inside the object at the pregrasp waypoint.
+
+    Read off the *solved* waypoint rather than the requested height, so an IK
+    solve that quietly landed low would fail this too.
+    """
+    from manus.expert import jaw_depth, pregrasp_height
+
+    config = ExpertConfig()
+    for x, y in region_samples(3, 5):
+        plan = plan_grasp(spec, (x, y, 0.4), config=config)
+        assert plan.ok, plan.reason
+        tcp_z = float(CHAIN.fk_tcp(plan.q_pregrasp)[0][2])
+        lowest = tcp_z - jaw_depth(config.gripper_open)
+        assert lowest - spec.top_z >= config.hover_margin - 1e-3, (
+            f"{spec.name}: jaws {(lowest - spec.top_z) * 1e3:.2f} mm over its top"
+        )
+        assert tcp_z == pytest.approx(pregrasp_height(spec, config), abs=1e-3)
+
+
+def test_the_hover_only_rises_for_an_object_tall_enough_to_need_it():
+    """Pinned: the cylinder is raised 10.3 mm, the ball 0.3, and nothing else moves.
+
+    The cube's hover in particular is untouched -- it is what the 200-attempt
+    gate was run at.
+    """
+    from manus.expert import grasp_height, pregrasp_height
+
+    config = ExpertConfig()
+    raised = {
+        name: round((pregrasp_height(spec, config)
+                     - (grasp_height(spec) + TCP_TO_PAD_CENTRE + config.hover_height)) * 1e3, 1)
+        for name, spec in OBJECTS.items()
+    }
+    assert raised == {
+        "cube_3cm": 0.0,
+        "cylinder_3cm": 10.3,
+        "die_16mm": 0.0,
+        "domino_20x40": 0.0,
+        "puck_d40x10": 0.0,
+        "pingpong_40mm": 0.3,
+        "duplo_32x64": 0.0,
+    }
+
+
+def test_the_old_fixed_hover_really_did_bury_the_fingers_in_the_cylinder():
+    """The failure this fix is for, reproduced from the geometry that caused it.
+
+    The preview run knocked the 60 mm cylinder over on arrival at PREGRASP; the
+    fixed 30 mm stand-off put the fingertips 2.3 mm below its top, because that
+    stand-off is measured from the grasp pose at the object's *mid*-height.
+    """
+    from manus.expert import grasp_height, jaw_depth
+
+    config = ExpertConfig()
+    old_tcp_z = grasp_height(CYLINDER) + TCP_TO_PAD_CENTRE + config.hover_height
+    old_gap = old_tcp_z - jaw_depth(config.gripper_open) - CYLINDER.top_z
+    assert old_gap == pytest.approx(-0.0023, abs=1e-4)
+    assert hover_clearance(CYLINDER) == pytest.approx(0.008, abs=1e-4)
+
+
+def test_the_descent_starts_at_the_hover_and_goes_straight_down():
+    """DESCEND's start is the raised hover, and it is directly above the grasp."""
+    from manus.expert import pregrasp_height
+
+    for spec in (CUBE, CYLINDER):
+        plan = plan_grasp(spec, (0.19, 0.02, 0.3))
+        assert plan.tcp_pregrasp[2] == pytest.approx(pregrasp_height(spec))
+        assert plan.tcp_pregrasp[:2] == pytest.approx(plan.tcp_grasp[:2])
+        # DESCEND's waypoint is the grasp pose and its entry pose is the hover:
+        # the descent is the whole gap, however tall the object made it.
+        assert np.array_equal(plan.waypoint(DESCEND), plan.q_grasp)
+        drop = CHAIN.fk_tcp(plan.q_pregrasp)[0][2] - CHAIN.fk_tcp(plan.q_grasp)[0][2]
+        assert drop == pytest.approx(pregrasp_height(spec) - plan.tcp_grasp[2], abs=1e-3)
+
+
+def test_a_taller_hover_margin_lifts_the_hover_and_a_zero_one_does_not():
+    """The margin is a real knob, not a constant baked into the formula."""
+    from manus.expert import pregrasp_height
+
+    generous = pregrasp_height(CYLINDER, ExpertConfig(hover_margin=0.02))
+    assert generous == pytest.approx(pregrasp_height(CYLINDER) + 0.012)
+    assert pregrasp_height(CUBE, ExpertConfig(hover_margin=0.0)) == pytest.approx(
+        pregrasp_height(CUBE)
+    )
 
 
 def test_the_puck_is_the_only_grasp_the_table_pushes_up():
@@ -452,6 +551,34 @@ def test_the_closing_jaw_reaches_deeper_than_the_tips():
     assert max(depths, key=depths.get) == pytest.approx(0.14, abs=0.02)
 
 
+def test_the_moving_jaw_stops_leading_where_the_constant_says_it_does():
+    """MOVING_JAW_CLEAR_RAD, re-measured: past it the static tips are the lowest point."""
+    from manus.expert import JAW_TIP_Z, MOVING_JAW_CLEAR_RAD
+
+    below = jaw_clouds(MOVING_JAW_CLEAR_RAD - 0.01)[1][:, 2].max()
+    above = jaw_clouds(MOVING_JAW_CLEAR_RAD + 0.01)[1][:, 2].max()
+    assert below > JAW_TIP_Z > above
+
+
+def test_jaw_depth_at_the_open_angle_is_the_static_fingertip():
+    """The number the hover is built on: with the jaws open, the tips are the low point.
+
+    Not an assumption -- at :data:`~manus.control.GRIPPER_OPEN` the moving
+    finger has swung tens of millimetres *behind* the TCP, so the hover only has
+    to clear the static tips.
+    """
+    from manus.expert import JAW_TIP_Z, jaw_depth
+
+    static, moving = jaw_clouds(GRIPPER_OPEN)
+    assert max(static[:, 2].max(), moving[:, 2].max()) == pytest.approx(JAW_TIP_Z, abs=5e-4)
+    assert moving[:, 2].max() < -0.05
+    assert jaw_depth(GRIPPER_OPEN) == pytest.approx(JAW_TIP_Z)
+    # Below the crossing the answer is the conservative one, never an underestimate.
+    for angle in np.arange(-0.17, expert_mod.MOVING_JAW_CLEAR_RAD, 0.02):
+        measured = max(cloud[:, 2].max() for cloud in jaw_clouds(float(angle)))
+        assert jaw_depth(float(angle)) >= measured - 1e-4
+
+
 def test_the_fingertip_constant_matches_the_mesh():
     from manus.expert import JAW_TIP_Z
 
@@ -506,6 +633,81 @@ def contact_angle(spec) -> float:
     return 0.5 * (low + high)
 
 
+def first_rim_contact(spec, clearance: float) -> tuple[float, float, float]:
+    """Where the closing jaw first meets a short object's rim, off the meshes.
+
+    Sweeps the moving jaw shut and returns, for the first angle at which its
+    material reaches the object's far face inside the rim's own height band,
+    ``(angle, contact height above the table, pad purchase on the rim)`` in
+    radians and metres.
+    """
+    tcp_z = clearance + expert_mod.JAW_TIP_Z
+    top_face, table = tcp_z - spec.extent_z, tcp_z
+    half_width = 0.5 * spec.grasp_width_m
+    far_face = expert_mod.pad_lateral_offset(spec) - half_width
+    for angle in np.arange(1.2, -0.175, -0.002):
+        _, moving = jaw_clouds(float(angle))
+        rim = moving[
+            (moving[:, 2] >= top_face)
+            & (moving[:, 2] <= table)
+            & (np.abs(moving[:, 1]) <= half_width)
+        ]
+        if len(rim) and rim[:, 0].max() >= far_face:
+            lead = rim[rim[:, 0] >= far_face - 0.0005]
+            return float(angle), tcp_z - float(np.median(lead[:, 2])), spec.extent_z - clearance
+    raise AssertionError(f"the jaw never reached {spec.name}'s rim")
+
+
+def test_the_tip_clearance_override_moves_a_short_objects_grasp():
+    """The knob the rented box sweeps the puck's 3-7 mm band with, end to end.
+
+    A spec-level override rather than a module constant, so ``demo_expert.py
+    --tip-clearance`` changes the plan and nothing else -- and so it cannot
+    reach an object it was not aimed at.
+    """
+    import dataclasses
+
+    from manus.expert import MIN_TIP_CLEARANCE, grasp_height, pregrasp_height, tip_clearance
+
+    assert tip_clearance(PUCK) == MIN_TIP_CLEARANCE
+    for clearance in (0.003, 0.005, 0.007):
+        swept = dataclasses.replace(PUCK, tip_clearance_m=clearance)
+        tcp_z = grasp_height(swept) + TCP_TO_PAD_CENTRE
+        assert tcp_z - expert_mod.JAW_TIP_Z == pytest.approx(clearance)
+        plan = plan_grasp(swept, (0.19, 0.0, 0.0))
+        assert plan.ok and plan.tcp_grasp[2] == pytest.approx(tcp_z)
+        assert plan.tcp_pregrasp[2] == pytest.approx(pregrasp_height(swept))
+    # A taller object cannot feel it: its pads centre on the object instead.
+    assert grasp_height(dataclasses.replace(CUBE, tip_clearance_m=0.007)) == CUBE.spawn_z
+
+
+def test_the_puck_cannot_be_fixed_by_grasp_height_alone():
+    """The measurement behind ``puck_d40x10.experimental``.
+
+    The preview run's puck was punted off the table by the closing jaw. The
+    reason is in the sweep, not in the hover: the moving finger arrives tilted
+    and still descending (its tip drops ~16 mm per radian around the puck's
+    0.33 rad contact angle), so it touches the top edge of the 10 mm rim first
+    and drags it inward and down. Raising or lowering the grasp does not move
+    that contact -- over the whole feasible 3-7 mm tip-clearance band it stays
+    within 1.4 mm of the puck's top face -- it only trades away the pads'
+    purchase on the rim, from 7 mm down to 3 mm. Both ends of the band are bad,
+    which is the definition of not fixable by height.
+    """
+    for clearance_mm in (3.0, 4.0, 5.0, 6.0, 7.0):
+        angle, height, purchase = first_rim_contact(PUCK, clearance_mm * 1e-3)
+        assert PUCK.top_z - height < 0.0015, (
+            f"{clearance_mm} mm: first contact {height * 1e3:.2f} mm up a 10 mm rim"
+        )
+        assert purchase == pytest.approx(PUCK.extent_z - clearance_mm * 1e-3)
+        # ... and the finger is still on its way down when it gets there.
+        before = jaw_clouds(angle + 0.02)[1][:, 2].max()
+        after = jaw_clouds(angle - 0.02)[1][:, 2].max()
+        assert after > before, f"{clearance_mm} mm: the jaw is rising at contact"
+    assert first_rim_contact(PUCK, 0.007)[2] <= 0.003  # the "pads on 3 mm of rim" end
+    assert PUCK.experimental
+
+
 def test_the_measured_stall_anchor_matches_the_meshes():
     """The one sim measurement the whole catalogue is extrapolated from.
 
@@ -542,8 +744,10 @@ def test_the_close_target_squeezes_rather_than_merely_touching(spec):
     # depends on how far along the finger the object sits, and the formula is
     # anchored on the cube's engagement band. The puck, gripped at the very
     # tips, contacts 13 mrad early and so squeezes 13 mrad less than nominal.
+    # Against the object's *own* declared squeeze, so the die's deliberately
+    # lighter one is checked as what it is rather than as a discrepancy.
     squeeze = contact_angle(spec) - spec.close_target_rad
-    assert squeeze == pytest.approx(objects.SQUEEZE_RAD, abs=0.02), spec.name
+    assert squeeze == pytest.approx(spec.squeeze_rad, abs=0.02), spec.name
     # ... and that squeeze has to be worth something in torque: 2.2-2.5 N.m
     # of the servo's 3.35, across the catalogue.
     assert squeeze * specs.STS3215_KP > 0.5 * specs.STS3215_EFFORT_LIMIT
@@ -864,6 +1068,52 @@ def test_close_ends_when_the_jaws_stall_on_the_object():
     assert close.gripper == pytest.approx(0.55, abs=1e-6)
 
 
+def close_commands(spec, config) -> list[float]:
+    """Jaw commands issued during CLOSE, against a plant that stops at contact."""
+    expert = ScriptedGraspExpert(spec, (0.20, 0.0, 0.0), config=config)
+    plant = FakeArm(jaw_stop=spec.contact_angle_rad)
+    measured = plant.q.copy()
+    commands = []
+    while not expert.done:
+        targets = expert.step(measured)
+        if expert.state == CLOSE:
+            commands.append(targets["gripper"])
+        measured = plant.apply(targets)
+    return commands
+
+
+@pytest.mark.parametrize(
+    "spec,expected", [(CUBE, 60), (OBJECTS["die_16mm"], 150)], ids=["cube_60g", "die_5g"]
+)
+def test_close_ramps_over_the_length_the_objects_mass_asks_for(spec, expected):
+    """The 5 g die's jaws come in over 150 steps, the 60 g cube's over 60.
+
+    Behavioural, not just arithmetic: the ramp is what the FSM interpolates the
+    jaw command over, and CLOSE cannot end before it has finished, so a
+    per-object ramp is visible in both the step size and the state length.
+    """
+    config = ExpertConfig()
+    assert config.ramp_steps(CLOSE, spec) == expected
+    commands = close_commands(spec, config)
+    assert len(commands) >= expected
+    stride = (spec.close_target_rad - GRIPPER_OPEN) / expected
+    assert commands[1] - commands[0] == pytest.approx(stride, abs=1e-4)
+
+
+def test_an_explicit_close_ramp_overrides_the_mass_rule():
+    """What ``demo_expert.py --close-ramp`` is for: one ramp on whatever is grasped."""
+    config = ExpertConfig(close_ramp=25)
+    assert config.ramp_steps(CLOSE, OBJECTS["die_16mm"]) == 25
+    assert config.ramp_steps(CLOSE, CUBE) == 25
+    assert ExpertConfig().ramp_steps(CLOSE, None) == objects.CLOSE_RAMP_REFERENCE_STEPS
+    assert len(close_commands(CUBE, config)) < len(close_commands(CUBE, ExpertConfig()))
+
+
+def test_the_telemetry_reports_the_ramp_that_was_used():
+    expert = ScriptedGraspExpert(OBJECTS["die_16mm"], (0.20, 0.0, 0.0))
+    assert expert.telemetry()["close_ramp"] == 150
+
+
 def test_close_cannot_stall_before_the_window_has_filled():
     """A jaw that is still travelling does not count as stalled, however slowly."""
     config = ExpertConfig(gripper_stall_window=15, close_ramp=1, state_budget=200)
@@ -1000,48 +1250,181 @@ def test_telemetry_is_json_ready():
 
 
 # --- Success predicate -------------------------------------------------------------
+#
+# The predicate takes what the driver measures -- the object's position and the
+# six joints -- so the fixtures below build both from a real plan: the arm at
+# its lift pose, and the object wherever the caller says relative to the pads.
+
+RECORDED_STALL_RAD = {
+    "cube_3cm": 0.18908,
+    "cylinder_3cm": -0.17453,  # rode the jaw to the hard stop: JAWS EMPTY
+    "die_16mm": -0.02707,
+    "domino_20x40": 0.05329,
+    "duplo_32x64": 0.21495,
+    "pingpong_40mm": 0.23276,
+    "puck_d40x10": 0.18839,  # sat on the commanded target: JAWS EMPTY
+}
+"""HOLD-phase jaw angle of each filmed preview, from ``runs/object_previews/*_demo.json``.
+
+Every one of these attempts was scored a success by the old height-only
+predicate. Two of them were not grasps at all -- the object was riding the
+robot -- which is what the stall clause is for.
+"""
+
+
+def lift_pose(spec, stall: float, placement=(0.20, 0.0, 0.0)):
+    """``(joints, object_pos)`` for `spec` held in the pads at the lift pose.
+
+    The object is placed where a seated one sits -- at the pad centre in the
+    tool's own frame -- so the in-hand clause sees a real grasp geometry and the
+    stall clause sees `stall`.
+    """
+    plan = plan_grasp(spec, placement)
+    assert plan.ok, plan.reason
+    position, rotation = CHAIN.fk_tcp(plan.q_lift)
+    seated = position + rotation @ np.array(
+        [expert_mod.pad_lateral_offset(spec), 0.0, TCP_TO_PAD_CENTRE]
+    )
+    return np.concatenate([plan.q_lift, [stall]]), seated
+
+
+def hold(monitor, joints, object_pos, steps=40):
+    """Feed one steady state into `monitor` for `steps` steps."""
+    for _ in range(steps):
+        monitor.update(object_pos, joints)
+    return monitor
+
+
+@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+def test_the_predicate_reproduces_what_the_previews_actually_showed(spec):
+    """The three recorded cases, and the four alongside them, on one truth table.
+
+    Every filmed preview passed the height-only predicate. Fed the same jaw
+    angle with the object seated in the pads, the hardened one keeps the five
+    real grasps and rejects the two that were riding the robot -- the cylinder,
+    whose jaws ran to their -0.1745 rad hard stop, and the puck, whose jaws
+    stopped exactly on the 0.1876 rad target they were commanded to.
+    """
+    stall = RECORDED_STALL_RAD[spec.name]
+    joints, seated = lift_pose(spec, stall)
+    monitor = hold(GraspSuccessMonitor(spec), joints, seated)
+    empty_handed = spec.name in {"cylinder_3cm", "puck_d40x10"}
+    assert monitor.success is not empty_handed, (
+        f"{spec.name}: stall {stall:.5f} against band {monitor.stall_band}"
+    )
+    # Either way the object was up: the old predicate said yes to all seven.
+    assert monitor.height_only
+
+
+def test_the_ball_is_the_tightest_pass_and_the_puck_the_nearest_miss():
+    """Pinned margins, because STALL_SLACK_RAD is a judgement call between them.
+
+    The ping-pong ball's pads sink into a tangent point and it stalls 94 mrad
+    below its contact angle -- 6 mrad inside the band. The puck misses by 38.
+    Anyone widening the slack should know it is 6 mrad from being unable to
+    separate the two.
+    """
+    for name, expected in (("pingpong_40mm", 0.0062), ("puck_d40x10", -0.0382)):
+        monitor = GraspSuccessMonitor(OBJECTS[name])
+        margin = RECORDED_STALL_RAD[name] - monitor.stall_band[0]
+        assert margin == pytest.approx(expected, abs=5e-4)
+
+
+def test_an_object_riding_the_arm_is_not_in_the_hand():
+    """The geometric half: high, jaws plausibly shut, but 25 cm from the pads."""
+    joints, seated = lift_pose(CUBE, RECORDED_STALL_RAD["cube_3cm"])
+    monitor = hold(GraspSuccessMonitor(CUBE), joints, seated + np.array([0.25, 0.0, 0.0]))
+    assert not monitor.success and monitor.height_only
+    assert monitor.tcp_distance > monitor.in_hand_radius
+
+
+def test_the_in_hand_bar_is_generous_to_a_real_grasp():
+    """A seated object sits ~17 mm from the TCP; the bar is 60."""
+    joints, seated = lift_pose(CUBE, RECORDED_STALL_RAD["cube_3cm"])
+    monitor = hold(GraspSuccessMonitor(CUBE), joints, seated)
+    assert monitor.tcp_distance == pytest.approx(0.0175, abs=2e-3)
+    assert monitor.success
+
+
+def test_jaws_that_reach_the_commanded_target_are_empty_however_light_the_squeeze():
+    """The die's band would degenerate without the target clause, so it is checked there.
+
+    Its squeeze is only as big as the stall slack, so "within a slack of
+    contact" alone would accept the empty closure that lands on the target.
+    """
+    die = OBJECTS["die_16mm"]
+    assert die.squeeze_rad <= expert_mod.STALL_SLACK_RAD  # the degenerate case
+    joints, seated = lift_pose(die, die.close_target_rad)
+    assert not hold(GraspSuccessMonitor(die), joints, seated).success
+    assert GraspSuccessMonitor(die).stall_band[0] == pytest.approx(
+        die.close_target_rad + expert_mod.STALL_TARGET_MARGIN_RAD
+    )
+
+
+def test_jaws_stalled_far_above_contact_are_jammed_on_something_else():
+    joints, seated = lift_pose(CUBE, 0.9)
+    monitor = hold(GraspSuccessMonitor(CUBE, gripper_max=1.2), joints, seated)
+    assert not monitor.success
 
 
 def test_success_needs_the_height_the_sustain_and_the_jaws():
-    monitor = GraspSuccessMonitor(0.015, lift=0.05, sustain=30, gripper_max=1.0)
+    joints, seated = lift_pose(CUBE, RECORDED_STALL_RAD["cube_3cm"])
+    monitor = GraspSuccessMonitor(CUBE, sustain=30)
     for _ in range(29):
-        assert not monitor.update(0.10, 0.5)
-    assert monitor.update(0.10, 0.5)
+        assert not monitor.update(seated, joints)
+    assert monitor.update(seated, joints)
     assert monitor.success and monitor.best_streak >= 30
 
 
 def test_a_dropped_object_restarts_the_count():
-    monitor = GraspSuccessMonitor(0.015, sustain=10)
-    for _ in range(9):
-        monitor.update(0.10, 0.5)
-    monitor.update(0.02, 0.5)  # dropped
-    for _ in range(9):
-        monitor.update(0.10, 0.5)
+    joints, seated = lift_pose(CUBE, RECORDED_STALL_RAD["cube_3cm"])
+    dropped = np.array([seated[0], seated[1], CUBE.spawn_z])
+    monitor = GraspSuccessMonitor(CUBE, sustain=10)
+    hold(monitor, joints, seated, steps=9)
+    monitor.update(dropped, joints)
+    hold(monitor, joints, seated, steps=9)
     assert not monitor.success and monitor.streak == 9
 
 
 def test_an_open_gripper_never_succeeds_however_high_the_object():
-    monitor = GraspSuccessMonitor(0.015, sustain=5, gripper_max=1.0)
-    for _ in range(50):
-        monitor.update(0.30, GRIPPER_OPEN)
-    assert not monitor.success and monitor.peak_z == pytest.approx(0.30)
+    joints, seated = lift_pose(CUBE, GRIPPER_OPEN)
+    monitor = hold(GraspSuccessMonitor(CUBE, sustain=5), joints, seated + np.array([0, 0, 0.1]))
+    assert not monitor.success
+    assert monitor.peak_z == pytest.approx(seated[2] + 0.1)
 
 
 def test_the_bar_is_the_spawn_height_plus_the_lift():
-    monitor = GraspSuccessMonitor(0.03, lift=0.05)
+    monitor = GraspSuccessMonitor(CYLINDER, lift=0.05)
     assert monitor.threshold_z == pytest.approx(0.08)
-    for _ in range(40):
-        monitor.update(0.0799, 0.4)
-    assert not monitor.success
+    joints, seated = lift_pose(CYLINDER, CYLINDER.contact_angle_rad)
+    just_short = np.array([seated[0], seated[1], 0.0799])
+    assert not hold(monitor, joints, just_short).success
 
 
 def test_success_latches():
-    monitor = GraspSuccessMonitor(0.015, sustain=2)
-    monitor.update(0.10, 0.4)
-    monitor.update(0.10, 0.4)
+    joints, seated = lift_pose(CUBE, RECORDED_STALL_RAD["cube_3cm"])
+    monitor = GraspSuccessMonitor(CUBE, sustain=2)
+    hold(monitor, joints, seated, steps=2)
     assert monitor.success
-    monitor.update(0.0, GRIPPER_OPEN)
+    dropped = np.array([seated[0], seated[1], 0.0])
+    monitor.update(dropped, np.concatenate([joints[:5], [GRIPPER_OPEN]]))
     assert monitor.success and monitor.to_dict()["success"] is True
+
+
+def test_the_monitor_summary_is_json_ready_and_carries_the_evidence():
+    import json
+
+    joints, seated = lift_pose(CUBE, RECORDED_STALL_RAD["cube_3cm"])
+    payload = json.loads(json.dumps(hold(GraspSuccessMonitor(CUBE), joints, seated).to_dict()))
+    assert payload["success"] is True and payload["height_only"] is True
+    assert payload["tcp_distance"] < payload["in_hand_radius"]
+    assert payload["stall_band"][0] < payload["gripper"] < payload["stall_band"][1]
+
+
+def test_a_measurement_that_is_not_a_position_is_rejected():
+    joints, _ = lift_pose(CUBE, 0.2)
+    with pytest.raises(ValueError, match="object centre"):
+        GraspSuccessMonitor(CUBE).update(0.10, joints)
 
 
 # --- Failure taxonomy ---------------------------------------------------------------
@@ -1054,45 +1437,57 @@ def finished(placement=(0.20, 0.0, 0.0), **kwargs) -> ScriptedGraspExpert:
     return expert
 
 
-def fed(monitor: GraspSuccessMonitor, heights, gripper=0.5) -> GraspSuccessMonitor:
-    """Feed a height trace into a monitor."""
+def fed(heights, stall=None, spec=CUBE) -> GraspSuccessMonitor:
+    """Feed a height trace into a monitor, with the object seated in the pads.
+
+    Only the height varies: the arm and the object's lateral position are a
+    real grasp's, so an attempt fails on the clause the trace is testing rather
+    than on an artefact of the fixture.
+    """
+    joints, seated = lift_pose(spec, RECORDED_STALL_RAD[spec.name] if stall is None else stall)
+    monitor = GraspSuccessMonitor(spec)
     for height in heights:
-        monitor.update(height, gripper)
+        monitor.update(np.array([seated[0], seated[1], height]), joints)
     return monitor
 
 
 def test_a_met_predicate_is_a_success():
-    monitor = fed(GraspSuccessMonitor(0.015), [0.10] * 40)
-    assert classify_outcome(finished(), monitor) == "success"
+    assert classify_outcome(finished(), fed([0.10] * 40)) == "success"
 
 
 def test_an_unreachable_placement_is_named_as_such():
     expert = fresh((0.60, 0.0, 0.0))
     run(expert, FakeArm(jaw_stop=0.5), max_steps=6000)
-    monitor = fed(GraspSuccessMonitor(0.015), [0.015] * 40)
     assert not expert.plan.ok
-    assert classify_outcome(expert, monitor) == "ik_infeasible"
+    assert classify_outcome(expert, fed([0.015] * 40)) == "ik_infeasible"
+
+
+def test_an_object_that_stayed_up_without_being_held_gets_its_own_name():
+    """The preview run's two false successes, as the gate report will see them.
+
+    Height met, sustain met, jaws shut on nothing: not a slip (nothing was ever
+    held to slip) and not a short lift (it went all the way up).
+    """
+    monitor = fed([0.10] * 40, stall=OBJECTS["cylinder_3cm"].close_target_rad)
+    assert not monitor.success and monitor.height_only
+    assert classify_outcome(finished(), monitor) == "not_in_hand"
 
 
 def test_over_the_bar_but_not_held_is_a_slip():
-    monitor = fed(GraspSuccessMonitor(0.015), [0.10] * 10 + [0.015] * 40)
-    assert classify_outcome(finished(), monitor) == "slipped"
+    assert classify_outcome(finished(), fed([0.10] * 10 + [0.015] * 40)) == "slipped"
 
 
 def test_lifted_but_short_of_the_bar_is_a_short_lift():
-    monitor = fed(GraspSuccessMonitor(0.015), [0.05] * 40)
-    assert classify_outcome(finished(), monitor) == "short_lift"
+    assert classify_outcome(finished(), fed([0.05] * 40)) == "short_lift"
 
 
 def test_an_untouched_object_after_a_clean_run_is_a_missed_grasp():
-    monitor = fed(GraspSuccessMonitor(0.015), [0.015] * 40)
     expert = finished()
     assert expert.timeouts == []
-    assert classify_outcome(expert, monitor) == "no_grasp"
+    assert classify_outcome(expert, fed([0.015] * 40)) == "no_grasp"
 
 
 def test_an_untouched_object_after_a_wedged_run_is_a_timeout():
     expert = fresh(state_budget=30, hold_steps=5)
     run(expert, FakeArm(frozen=True), max_steps=1000)
-    monitor = fed(GraspSuccessMonitor(0.015), [0.015] * 40)
-    assert classify_outcome(expert, monitor) == "timeout"
+    assert classify_outcome(expert, fed([0.015] * 40)) == "timeout"

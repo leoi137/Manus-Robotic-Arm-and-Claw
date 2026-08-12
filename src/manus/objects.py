@@ -12,10 +12,11 @@ catalogue on the CPU-only side of the pipeline.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from manus.specs import JOINT_LIMITS
+from manus.specs import JOINT_LIMITS, STS3215_EFFORT_LIMIT, STS3215_KP
 
 if TYPE_CHECKING:
     import isaaclab.sim as sim_utils
@@ -80,6 +81,28 @@ against a 3.35 N·m limit, so the servo squeezes below saturation with margin fo
 a jaw that has to travel a little further than the geometry predicted.
 """
 
+MIN_SQUEEZE_RAD = 0.5 * STS3215_EFFORT_LIMIT / STS3215_KP
+"""Smallest squeeze worth commanding, radians (0.094).
+
+The floor the catalogue's own test asserts: at ``kp`` 17.8 a squeeze of this
+much asks the servo for half its 3.35 N·m effort limit, and anything less is a
+grip that a lift can shake loose. It is the bound :data:`LIGHT_SQUEEZE_RAD`
+sits just above.
+"""
+
+LIGHT_SQUEEZE_RAD = 0.10
+"""Squeeze used for an object too small to absorb the full one, radians.
+
+:data:`SQUEEZE_RAD` was tuned on a 60 g, 30 mm cube, where 0.139 rad past
+contact is 10 mm of jaw travel the object simply refuses to give. On the 16 mm
+die the *same* 0.139 rad is 63% of the object's whole width and leaves the close
+target 0.032 rad off the jaw's -0.1745 rad hard stop: a die that yields even
+2 mm (the filmed grasp stalls 1.7 mm inside nominal contact) drives the jaws
+into the stop, where the servo has no position error left to squeeze with and
+the grip goes slack. 0.10 rad is a hair above :data:`MIN_SQUEEZE_RAD` -- still
+1.78 N·m, still 7 mm of over-travel -- and doubles the margin to the stop.
+"""
+
 JAW_WIDTH_PER_RAD = 0.0727
 """Jaw opening gained per radian of ``gripper`` angle, metres. **Measured.**
 
@@ -93,21 +116,36 @@ mesh-measured contact angle of every catalogue width (16-40 mm) to within
 """
 
 
-def close_target_for_width(width: float) -> float:
-    """CLOSE target for an object `width` metres across, in radians.
+def contact_angle_for_width(width: float) -> float:
+    """Jaw angle at which the pads first touch an object `width` metres across.
 
-    One measurement carried along the jaw geometry::
+    One sim measurement carried along the mesh-measured jaw slope::
 
         contact(width) = MEASURED_STALL_30MM_RAD + (width - 0.030) / JAW_WIDTH_PER_RAD
-        close_target    = contact(width) - SQUEEZE_RAD
 
-    which, since both terms shift together, is just the tuned 30 mm target
-    shifted by the width difference. Every catalogue object therefore closes
-    with the *same* :data:`SQUEEZE_RAD` past its own contact angle — the thing
-    that was actually tuned — rather than the same absolute angle.
+    This is the angle a *held* object stops the jaws at, so it is both the
+    anchor of :func:`close_target_for_width` and the reference the success
+    predicate checks a measured stall against
+    (:class:`manus.expert.GraspSuccessMonitor`): jaws that ran past it by more
+    than a tolerance closed on nothing.
+    """
+    return MEASURED_STALL_30MM_RAD + (width - REFERENCE_WIDTH_M) / JAW_WIDTH_PER_RAD
+
+
+def close_target_for_width(width: float, squeeze: float = SQUEEZE_RAD) -> float:
+    """CLOSE target for an object `width` metres across, in radians.
+
+    ``contact_angle_for_width(width) - squeeze`` — which, since both terms
+    shift together, is just the tuned 30 mm target shifted by the width
+    difference. Every catalogue object therefore closes with the *same*
+    :data:`SQUEEZE_RAD` past its own contact angle — the thing that was actually
+    tuned — rather than the same absolute angle. The one exception is an object
+    small enough that the full squeeze is a hazard rather than a grip; see
+    :data:`LIGHT_SQUEEZE_RAD`.
 
     Args:
         width: Distance the jaws must span, metres.
+        squeeze: How far past contact to command, radians.
 
     Returns:
         The ``gripper`` joint target for CLOSE, radians.
@@ -117,7 +155,7 @@ def close_target_for_width(width: float) -> float:
             articulation would clamp it and the squeeze would be silently
             weaker than commanded (or absent).
     """
-    target = CLOSE_TARGET_30MM_RAD + (width - REFERENCE_WIDTH_M) / JAW_WIDTH_PER_RAD
+    target = contact_angle_for_width(width) - squeeze
     lower, upper = JOINT_LIMITS["gripper"]
     if not lower <= target <= upper:
         raise ValueError(
@@ -125,6 +163,59 @@ def close_target_for_width(width: float) -> float:
             f"outside the gripper's travel [{lower:.3f}, {upper:.3f}]"
         )
     return target
+
+
+REFERENCE_MASS_KG = 0.06
+"""Object mass the CLOSE ramp was tuned at, kilograms: the cube."""
+
+CLOSE_RAMP_REFERENCE_STEPS = 60
+"""CLOSE ramp of a :data:`REFERENCE_MASS_KG` object, in control steps. **Tuned.**
+
+Step 7's number, and the one the 200-attempt Step 8 gate is anchored on: 60
+steps is 0.7 rad/s at the jaw, slow enough not to flick the 60 g cube out of the
+hand and firm enough not to slip. See :attr:`manus.expert.ExpertConfig.close_ramp`.
+"""
+
+CLOSE_RAMP_MAX_STEPS = 150
+"""Slowest CLOSE ramp the rule will ask for, in control steps. **Measured.**
+
+The value the 5 g die needed: at 60 steps the closing jaw punts it, at 150 it
+seats. It doubles as the clamp because 150 steps is 5 s of closing at 30 Hz --
+the slowest close anyone has verified, and past it the only certain effect is a
+longer episode.
+"""
+
+
+def close_ramp_for_mass(mass_kg: float) -> int:
+    """Steps the CLOSE ramp should take for an object of `mass_kg`.
+
+    Two measured anchors -- 60 g closes in 60 steps, 5 g needs 150 -- joined by
+    the simplest monotone curve through them::
+
+        steps = clamp(60 * sqrt(0.060 / mass), 60, 150)
+
+    Why light objects need a slower jaw: a position-servo jaw that overshoots
+    an object's surface by one control step's travel delivers an impulse
+    proportional to its speed, and the velocity that impulse imparts goes as
+    ``1 / mass``. Taken literally that model would ask for ``steps ~ 1 / mass``
+    (720 steps for the die), which is far more than the die actually needed --
+    friction and the opposing pad absorb most of it -- so the exponent is the
+    geometric middle of "no mass dependence" and the impulse model, calibrated
+    to land on the two anchors rather than derived from first principles alone.
+
+    Args:
+        mass_kg: Object mass, kilograms.
+
+    Returns:
+        Ramp length in control steps, in ``[60, 150]``.
+
+    Raises:
+        ValueError: `mass_kg` is not positive.
+    """
+    if mass_kg <= 0.0:
+        raise ValueError(f"mass must be positive, got {mass_kg}")
+    steps = CLOSE_RAMP_REFERENCE_STEPS * math.sqrt(REFERENCE_MASS_KG / mass_kg)
+    return int(round(min(max(steps, CLOSE_RAMP_REFERENCE_STEPS), CLOSE_RAMP_MAX_STEPS)))
 
 
 @dataclass(frozen=True)
@@ -151,6 +242,18 @@ class ObjectSpec:
             metres, i.e. half :attr:`extent_z`.
         close_target_rad: ``gripper`` joint target that squeezes this object,
             in radians (see :func:`close_target_for_width`).
+        close_ramp: Steps CLOSE spends ramping the jaws shut, overriding the
+            mass rule (:func:`close_ramp_for_mass`). None uses the rule, which
+            is what every catalogue object does — the field exists so a
+            re-tuning run can pin one object without touching the rule.
+        tip_clearance_m: Gap to leave between the fingertips and the table at
+            the grasp, metres, overriding :data:`manus.expert.MIN_TIP_CLEARANCE`.
+            Only bites on an object too short to centre the pads on, i.e. the
+            puck; None uses the default.
+        experimental: Whether this object is known not to grasp reliably. It
+            stays in :data:`OBJECTS` and can be run by name, but it is left out
+            of :data:`DEFAULT_OBJECTS`, so a sweep over "every object" does not
+            quietly bake its failures into a dataset.
         yaw_symmetry: Which grasp yaws line the jaws up with the object:
             ``"quarter"`` (square section — every 90°), ``"half"`` (rectangular
             section — every 180°, the only two that span the short axis) or
@@ -172,6 +275,9 @@ class ObjectSpec:
     half_extents: tuple[float, float, float] | None = None
     radius: float | None = None
     height: float | None = None
+    close_ramp: int | None = None
+    tip_clearance_m: float | None = None
+    experimental: bool = False
 
     def __post_init__(self) -> None:
         if self.shape == "cuboid":
@@ -195,6 +301,10 @@ class ObjectSpec:
                 f"{self.name}: declared yaw_symmetry {self.yaw_symmetry!r}, but the geometry "
                 f"is {self.geometric_yaw_symmetry!r}"
             )
+        if self.close_ramp is not None and self.close_ramp < 1:
+            raise ValueError(f"{self.name}: close_ramp must be at least one step")
+        if self.tip_clearance_m is not None and self.tip_clearance_m < 0.0:
+            raise ValueError(f"{self.name}: tip_clearance_m cannot be negative")
 
     @property
     def local_x_extent(self) -> float:
@@ -213,6 +323,37 @@ class ObjectSpec:
             return 2.0 * self.half_extents[2]
         assert self.radius is not None  # guaranteed by __post_init__
         return self.height if self.shape == "cylinder" else 2.0 * self.radius
+
+    @property
+    def top_z(self) -> float:
+        """Height of the object's highest point above the ground at rest, metres."""
+        return self.spawn_z + 0.5 * self.extent_z
+
+    @property
+    def contact_angle_rad(self) -> float:
+        """Jaw angle this object stops the closing pads at, radians.
+
+        :func:`contact_angle_for_width` of its own grasp width: what
+        :attr:`close_target_rad` is measured *from*, and what a measured CLOSE
+        stall is compared against to tell a grasp from an empty closure.
+        """
+        return contact_angle_for_width(self.grasp_width_m)
+
+    @property
+    def squeeze_rad(self) -> float:
+        """How far past contact this object's CLOSE target is commanded, radians.
+
+        :data:`SQUEEZE_RAD` for everything the tuned squeeze suits, and the
+        target's own value for anything given a lighter one — read back from
+        :attr:`close_target_rad` rather than declared, so an overridden target
+        and its squeeze cannot disagree.
+        """
+        return self.contact_angle_rad - self.close_target_rad
+
+    @property
+    def close_ramp_steps(self) -> int:
+        """Steps CLOSE ramps the jaws shut over: the override, else the mass rule."""
+        return self.close_ramp if self.close_ramp is not None else close_ramp_for_mass(self.mass_kg)
 
     @property
     def geometric_yaw_symmetry(self) -> YawSymmetry:
@@ -303,8 +444,14 @@ OBJECTS: dict[str, ObjectSpec] = {
         yaw_symmetry="free",
     ),
     # A 16 mm acrylic die (~1200 kg/m^3): the smallest thing in the catalogue,
-    # and the one whose close target sits deepest into the jaw joint's negative
-    # travel (-0.142 rad, 0.03 rad off the stop).
+    # and at 5 g the lightest thing with corners. Both of its deviations from
+    # the catalogue defaults are about the same fact -- a 5 g, 16 mm object has
+    # nothing to absorb the hand with. The jaws come in over
+    # close_ramp_for_mass(0.005) = 150 steps rather than the cube's 60, and they
+    # squeeze LIGHT_SQUEEZE_RAD past contact rather than the full SQUEEZE_RAD,
+    # which moves the close target from -0.143 rad (0.032 off the jaw's hard
+    # stop, where a die that yields at all lets the servo run out of squeeze) to
+    # -0.104 (0.071 off it).
     "die_16mm": ObjectSpec(
         name="die_16mm",
         shape="cuboid",
@@ -312,7 +459,7 @@ OBJECTS: dict[str, ObjectSpec] = {
         mass_kg=0.005,
         grasp_width_m=0.016,
         spawn_z=0.008,
-        close_target_rad=close_target_for_width(0.016),
+        close_target_rad=close_target_for_width(0.016, squeeze=LIGHT_SQUEEZE_RAD),
         yaw_symmetry="quarter",
     ),
     # A double-six domino lying face up: 20 x 40 x 15 mm, ~1700 kg/m^3 (urea
@@ -335,6 +482,16 @@ OBJECTS: dict[str, ObjectSpec] = {
     # that the pads cannot centre on it -- see manus.expert.grasp_height, which
     # raises the grasp to keep the fingertips off the table and so grips the
     # puck's top half.
+    #
+    # EXPERIMENTAL: the closing jaw punts it off the table. The moving finger
+    # meets a 10 mm rim tilted and still descending (16 mm of tip drop per
+    # radian at the puck's 0.33 rad contact angle), so it touches the top edge
+    # first and drags it down and in. That is a property of the jaw's sweep, not
+    # of the grasp height: over the whole feasible 3-7 mm tip-clearance band the
+    # first contact stays within 1.4 mm of the puck's top face while the pads'
+    # purchase on the rim falls from 7 mm to 3 mm (measured off the meshes in
+    # tests/test_expert_logic.py). Left in the catalogue, and tip_clearance_m is
+    # exposed so the band can be swept in sim, but out of DEFAULT_OBJECTS.
     "puck_d40x10": ObjectSpec(
         name="puck_d40x10",
         shape="cylinder",
@@ -345,6 +502,7 @@ OBJECTS: dict[str, ObjectSpec] = {
         spawn_z=0.005,
         close_target_rad=close_target_for_width(0.040),
         yaw_symmetry="free",
+        experimental=True,
     ),
     # A regulation ping-pong ball: 40 mm, 2.7 g, hollow (~80 kg/m^3). Kept at
     # its real mass deliberately -- it is the catalogue's slip-and-roll case,
@@ -375,3 +533,13 @@ OBJECTS: dict[str, ObjectSpec] = {
     ),
 }
 """Graspable objects by name. ``cube_3cm`` is the primary task object."""
+
+DEFAULT_OBJECTS: tuple[str, ...] = tuple(
+    name for name, spec in OBJECTS.items() if not spec.experimental
+)
+"""Objects a sweep over "the catalogue" should cover, in catalogue order.
+
+:data:`OBJECTS` minus the :attr:`~ObjectSpec.experimental` ones. Anything left
+out is still spawnable and still runnable by name — it is excluded from the
+*default*, not from the catalogue.
+"""

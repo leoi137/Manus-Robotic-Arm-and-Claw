@@ -268,8 +268,10 @@ def env_block(sim: Any, spec: Any, config: Any) -> dict[str, Any]:
         },
         "expert": {
             "hover_height": config.hover_height,
+            "hover_margin": config.hover_margin,
+            "pregrasp_height": expert_mod.pregrasp_height(spec, config),
             "converge_tol": config.converge_tol,
-            "close_ramp": config.close_ramp,
+            "close_ramp": expert_mod.close_ramp_steps(spec, config),
             "close_target_rad": spec.close_target_rad,
             "hold_steps": config.hold_steps,
             "lift_rise": config.lift_rise,
@@ -453,9 +455,19 @@ class EpisodeRunner:
         """Six measured joint positions (radians), in ``specs.JOINT_NAMES`` order."""
         return self.robot.data.joint_pos.torch[0].detach().cpu().numpy().astype(float)
 
+    def object_pos(self) -> Any:
+        """Object body-origin (x, y, z) in the robot's own frame, metres.
+
+        Environment origin subtracted: the frame the expert plans in, and the
+        one :class:`~manus.expert.GraspSuccessMonitor` compares against its FK
+        of the TCP.
+        """
+        world = self.object.data.root_link_pos_w.torch[0]
+        return (world - self.scene.env_origins[0]).detach().cpu().numpy().astype(float)
+
     def object_z(self) -> float:
         """Object body-origin height above the ground plane, metres."""
-        return float(self.object.data.root_link_pos_w.torch[0][2] - self.scene.env_origins[0][2])
+        return float(self.object_pos()[2])
 
     def capture(self) -> Any:
         """The wrist frame for the current state, at the recorded resolution.
@@ -550,7 +562,7 @@ class EpisodeRunner:
 
         expert = ScriptedGraspExpert(self.spec, config=self.config)
         plan = expert.reset(draw, q_current=measured)
-        monitor = GraspSuccessMonitor(self.spec.spawn_z)
+        monitor = GraspSuccessMonitor(self.spec)
         episode = recorder.EpisodeRecorder(attempt_index)
         rest_z = self.object_z()
         # Kept alongside the recorder (which does not expose its buffers) so the
@@ -580,7 +592,7 @@ class EpisodeRunner:
                 self.advance(render=substep == recorder.DECIMATION - 1)
             measured = self.measured()
             frame = self.capture()
-            monitor.update(self.object_z(), measured[self.gripper_column])
+            monitor.update(self.object_pos(), measured)
             if monitor.success:
                 # The predicate is met: the 30 sustained steps that satisfied it
                 # are the end of the demonstration (GraspSuccessMonitor's own
