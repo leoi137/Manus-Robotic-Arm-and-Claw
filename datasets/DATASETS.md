@@ -6,5 +6,6 @@ Do not edit by hand — regenerate it.
 | Dataset | Objects | Attempts | Successes | Frames | Success rate | LeRobot | Dataset id | Git | Created | Preview |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `grasp_cube_v2` | cube_3cm | 1000 | 1000 | 198070 | 100.0% | — | `f6578292089a` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_cube_v2.gif) |
+| `grasp_die_v2` | die_16mm | 1050 | 1000 | 296102 | 95.2% | — | `0d1fb55fcdce` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_die_v2.gif) |
 
 `Git` is the commit the dataset was generated at; a trailing `*` marks a dirty tree.
