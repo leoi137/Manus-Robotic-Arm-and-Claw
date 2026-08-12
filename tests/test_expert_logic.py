@@ -2664,15 +2664,21 @@ def test_the_thick_pucks_grasp_is_raised_out_of_the_levering_band():
     thin_purchase = PUCK.extent_z - (thin_height + TCP_TO_PAD_CENTRE - JAW_TIP_Z)
     assert thin_purchase == pytest.approx(0.0032, abs=2e-4)
     assert thin_purchase < 0.008
-    assert not THICK_PUCK.experimental and PUCK.experimental
+    # Both pucks are experimental today: the thin one for rim purchase, the
+    # thick one for the CLOSE-time seating-shove ejection (geometry above is
+    # sound; the failure lives in the closure dynamics, not the grasp height).
+    assert THICK_PUCK.experimental and PUCK.experimental
 
 
-def test_the_thick_puck_joins_the_default_sweep_and_the_thin_one_does_not():
+def test_the_shove_failing_objects_sit_out_of_the_default_sweep():
     from manus.objects import DEFAULT_OBJECTS
 
-    assert "puck_d40x20" in DEFAULT_OBJECTS
+    # Deliberate state (2026-08-12): both pucks and the side-grasp cylinder
+    # are excluded until the no-shove closure lands -- a default sweep must
+    # never bake datasets from objects that measurably fail at CLOSE.
+    assert "puck_d40x20" not in DEFAULT_OBJECTS
     assert "puck_d40x10" not in DEFAULT_OBJECTS
-    assert "cylinder_3cm" in DEFAULT_OBJECTS
+    assert "cylinder_3cm" not in DEFAULT_OBJECTS
 
 
 # --- The creeping CLOSE ---------------------------------------------------------------
