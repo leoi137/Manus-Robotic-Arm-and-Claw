@@ -23,6 +23,8 @@ States, in order -- :data:`STATE_SEQUENCE`:
 ``DESCEND``
     Straight down to the grasp pose: the *jaws* around the object, which is not
     the TCP on the object -- see :func:`tcp_target` and :func:`grasp_height`.
+    Also not the object's mid-height on anything too short or too tall for the
+    hand's parallel band (:data:`JAW_PARALLEL_REACH`).
 ``CLOSE``
     Arm frozen, jaws driven to ``spec.close_target_rad`` -- deliberately past
     contact, so the servo squeezes against its effort limit.
@@ -46,10 +48,12 @@ one side of it. Aiming the TCP at the object -- the obvious reading of "grasp at
 decision as well as an orientation one; see the jaw-geometry block below.
 
 **Servo-to-converge.** An arm state ends when the measured joints actually
-reach the waypoint (``max |measured - waypoint| < CONVERGE_TOL``), not when a
-step counter says so; a per-state budget only exists so a wedged attempt cannot
-hang the generator, and every expiry is recorded in
-:attr:`ScriptedGraspExpert.timeouts`.
+reach the waypoint (``max |measured - waypoint| < converge_tol(spec)``), not
+when a step counter says so; a per-state budget only exists so a wedged attempt
+cannot hang the generator, and every expiry is recorded in
+:attr:`ScriptedGraspExpert.timeouts`. The bar is object-scaled because the
+error it admits is a fixed number of millimetres at the tool and objects are
+not a fixed number of millimetres wide -- see :func:`converge_tol`.
 
 **Droop compensation.** Under the vendored PD gains (kp 17.8, no gravity
 feed-forward) a commanded pose is held low, which is a large fraction of a 30 mm
@@ -89,6 +93,7 @@ __all__ = [
     "StateReport",
     "classify_outcome",
     "close_ramp_steps",
+    "converge_tol",
     "grasp_height",
     "grasp_yaw_candidates",
     "jaw_depth",
@@ -145,12 +150,24 @@ ARM_STATES: frozenset[str] = frozenset({PREGRASP, DESCEND, LIFT})
 """States that move the arm and therefore end on joint convergence."""
 
 CONVERGE_TOL: float = 0.02
-"""Default ``max |measured - waypoint|`` (radians, arm joints) ending a move.
+"""``max |measured - waypoint|`` (radians, arm joints) ending a move on a
+:data:`~manus.objects.REFERENCE_WIDTH_M` object -- the 30 mm cube.
 
-Roughly 1.1 deg per joint, which lands the TCP within ~2 mm of the waypoint --
-comfortably inside the ~7 mm of slack a 30 mm cube leaves in 34 mm of jaw
-travel, and reachable only because the droop bias exists (raw steady-state
-droop is 2-4x this on the shoulder).
+Roughly 1.1 deg per joint, and reachable only because the droop bias exists
+(raw steady-state droop is 2-4x this on the shoulder).
+
+**It is a bar on the joints, not on the tool, and the two are not the same
+thing.** Measured on the three filmed previews (Step 21,
+``runs/object_previews/*_demo.json``): DESCEND exits on the *first* step its
+ramp completes, with the largest joint error at 13-15 of the 20 mrad allowed --
+and a TCP that is 5.3-5.9 mm from the waypoint, because a state that exits the
+instant it is allowed to exits with the arm still moving. Only 2.2-2.5 mm of
+that is vertical; the rest is lateral. CLOSE then freezes the arm exactly
+there, so whatever is left is what the jaws close around. 5.9 mm is 20% of the
+cube's grasp and it grasps anyway; it is 37% of the 16 mm die's, which lands
+the die ~5 mm off the pads' own centreline. Hence :func:`converge_tol`, which
+scales this bar by the object rather than loosening or tightening it for
+everyone.
 """
 
 
@@ -170,7 +187,10 @@ class ExpertConfig:
             TCP error the arm actually converges to at PREGRASP -- droop the
             integrator has not finished cancelling -- so 4 mm of nominal margin
             can be entirely eaten by it and 8 mm leaves a real 2-4 mm.
-        converge_tol: Arm convergence tolerance, radians (see :data:`CONVERGE_TOL`).
+        converge_tol: Arm convergence tolerance for a
+            :data:`~manus.objects.REFERENCE_WIDTH_M` object, radians; narrower
+            objects get a proportionally tighter bar (:func:`converge_tol`, and
+            see :data:`CONVERGE_TOL` for why the bar is object-dependent).
         state_budget: Per-state step ceiling; expiry advances the FSM anyway and
             is recorded in :attr:`ScriptedGraspExpert.timeouts`.
         hold_steps: Length of the terminal HOLD.
@@ -266,6 +286,43 @@ def close_ramp_steps(spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CON
     if spec is None:
         return objects.CLOSE_RAMP_REFERENCE_STEPS
     return spec.close_ramp_steps
+
+
+def converge_tol(spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CONFIG) -> float:
+    """Arm convergence tolerance for `spec`, radians.
+
+    :attr:`~ExpertConfig.converge_tol` scaled by the object's grasp width
+    against the width it was tuned at
+    (:data:`~manus.objects.REFERENCE_WIDTH_M`), and never *loosened* past it::
+
+        tol(spec) = config.converge_tol * min(1, grasp_width / 0.030)
+
+    The reason is measured, not stylistic. An arm state exits the first step
+    its ramp is done *and* the joints are inside this bar, so the bar is what
+    decides how much of the approach is still in flight when CLOSE freezes the
+    arm: on the three filmed previews the exit fired at 13-15 mrad and left the
+    TCP 5.3-5.9 mm off the waypoint (see :data:`CONVERGE_TOL`). That error is a
+    fixed property of the *arm*, so what matters is its size relative to the
+    object -- 20% of the cube's grasp width, 37% of the die's. Scaling the bar
+    holds that ratio, which in practice means a narrow object's DESCEND has to
+    keep stepping until the droop integrator has actually cancelled the error
+    instead of exiting mid-travel with one integrator update behind it.
+
+    The cube is the reference, so its tolerance is :data:`CONVERGE_TOL` exactly
+    and its behaviour is unchanged; so is every object at least as wide (the
+    cylinder, the duplo, the ball, the puck). Only the die (0.0107) and the
+    domino (0.0133) are tightened.
+
+    Args:
+        spec: Object being grasped; None means the reference width.
+        config: Tunables; :attr:`~ExpertConfig.converge_tol` is read.
+
+    Returns:
+        The tolerance, radians.
+    """
+    if spec is None:
+        return config.converge_tol
+    return config.converge_tol * min(1.0, spec.grasp_width_m / objects.REFERENCE_WIDTH_M)
 
 
 # --- Planning -----------------------------------------------------------------
@@ -407,6 +464,32 @@ whatever the height, which is why the spec is marked experimental -- but the
 band is where any future short object's grasp gets tuned.
 """
 
+JAW_PARALLEL_REACH: float = 0.020
+"""How far above the TCP the closing jaw still meets an object at its pads, metres.
+
+**Measured off the meshes** (``tests/test_expert_logic.py`` re-derives it): the
+moving finger's inner face is not parallel to the static one, it *leans in* as
+it goes up, so the higher an object stands above the TCP the earlier in the
+closing sweep the jaw catches it -- and it catches it up there, on one side,
+with the pads still clear of the body. Sweeping a 30 mm column of increasing
+height past the jaw, the lead over the pads' own contact angle is 13 mrad while
+the column's top is within 11 mm of the TCP (the 30 mm cube's case, which
+grasps), 17 mrad out to 20 mm, and then steps to 22, 26 and 45 mrad as the
+finger's upper lobe comes into play. 20 mm is that last flat shelf.
+
+Only a *tall* object can feel it, and it is the constraint the 60 mm cylinder
+was violating: standing 26 mm above its mid-height grasp, it was struck 26 mm
+above its own centre of mass, 2.0 mm before the pads reached its 30 mm body,
+and toppled (the CLOSE trace in ``runs/object_previews/cylinder_3cm_demo.json``
+and its mp4: z 30.0 -> 43.9 mm during CLOSE, peaking at 56.9). Every catalogue
+object that grasps stands 16 mm or less above its TCP -- the ball is the
+tallest, and its "top" is a tangent point rather than a wall -- so the shelf is
+above all of them and :func:`grasp_height` raises the cylinder alone.
+
+See :func:`grasp_height`; this is the CLOSE-time sibling of the approach-time
+clearance :func:`pregrasp_height` keeps with :data:`JAW_TIP_Z`.
+"""
+
 YAW_MATCH_TOL: float = math.radians(2.0)
 """How far the solved tool yaw may sit from the requested one, radians.
 
@@ -458,12 +541,25 @@ def grasp_height(spec: ObjectSpec) -> float:
     """Height above the table the jaw pads centre on for `spec`, metres.
 
     The object's own mid-height, which puts the pads across the widest part of
-    it -- raised, for an object short enough to need it, until the fingertips
-    clear the table by :func:`tip_clearance`. Nothing in the catalogue but the
-    10 mm puck is short enough to be raised at all, and it is raised 2.3 mm.
+    it -- raised, whichever of two bars binds, and both of them are raises:
+
+    * **too short**: until the fingertips clear the table by
+      :func:`tip_clearance`. Only the 10 mm puck is short enough to feel it,
+      and it is raised 2.3 mm.
+    * **too tall**: until the object's top is no further above the TCP than
+      :data:`JAW_PARALLEL_REACH`, so the closing jaw meets the object at its
+      *pads* rather than leaning into its upper body first. Only the 60 mm
+      cylinder is tall enough to feel it, and it is raised 6.0 mm (30 -> 36 mm,
+      which drops the jaw's lead over the pads from 2.0 mm to 0.7 mm -- below
+      the cube's own 1.0 mm -- and its contact from 26 mm above the cylinder's
+      centre of mass to 18 mm).
+
+    Neither bar can be met by lowering the grasp, so the two never fight: the
+    answer is the highest of the three.
     """
     lowest_centre = JAW_TIP_Z - TCP_TO_PAD_CENTRE + tip_clearance(spec)
-    return max(spec.spawn_z, lowest_centre)
+    closing_centre = spec.top_z - TCP_TO_PAD_CENTRE - JAW_PARALLEL_REACH
+    return max(spec.spawn_z, lowest_centre, closing_centre)
 
 
 def pregrasp_height(spec: ObjectSpec, config: ExpertConfig | None = None) -> float:
@@ -1053,7 +1149,7 @@ class ScriptedGraspExpert:
             return "elapsed" if self._state_step >= self.config.hold_steps else None
         if self._state in ARM_STATES:
             waypoint = self.plan.waypoint(self._state)
-            converged = float(np.abs(arm - waypoint).max()) < self.config.converge_tol
+            converged = float(np.abs(arm - waypoint).max()) < converge_tol(self.spec, self.config)
             if self._ramp() >= 1.0 and converged:
                 return "converged"
             return "timeout" if budget_spent else None
@@ -1156,6 +1252,8 @@ class ScriptedGraspExpert:
             "lift_rise": plan.lift_rise,
             "close_target": plan.close_target,
             "close_ramp": self.config.ramp_steps(CLOSE, self.spec),
+            "converge_tol": converge_tol(self.spec, self.config),
+            "grasp_height": grasp_height(self.spec),
             "state": self._state,
             "total_steps": self._total_steps,
             "timeouts": list(self._timeouts),

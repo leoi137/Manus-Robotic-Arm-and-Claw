@@ -50,6 +50,7 @@ from manus.randomize import draw_episode
 CHAIN = KinematicChain()
 CUBE = OBJECTS["cube_3cm"]
 CYLINDER = OBJECTS["cylinder_3cm"]
+DIE = OBJECTS["die_16mm"]  # the narrowest grasp, and the tightest converge_tol
 DOMINO = OBJECTS["domino_20x40"]  # the rectangular case: two branches, not four
 PUCK = OBJECTS["puck_d40x10"]  # the widest grasp and the only raised one
 BALL = OBJECTS["pingpong_40mm"]  # 2.7 g, round in every direction
@@ -256,11 +257,41 @@ def test_the_hover_clears_the_top_of_every_object(spec):
         assert tcp_z == pytest.approx(pregrasp_height(spec, config), abs=1e-3)
 
 
+def test_every_hover_height_is_pinned():
+    """The absolute PREGRASP height of every catalogue object, to 0.1 mm.
+
+    The cube's 49.0 mm is the number the 200-attempt Step 8 gate was run at and
+    may not move; the cylinder's 74.3 mm is the Step 21 hover fix and may not
+    move either -- in particular the Step 22 grasp-height change must not move
+    it, because the two bars in :func:`~manus.expert.pregrasp_height` are a max
+    and the taller one is still the object-clearing bar.
+    """
+    from manus.expert import pregrasp_height
+
+    assert {
+        name: round(pregrasp_height(spec) * 1e3, 1) for name, spec in OBJECTS.items()
+    } == {
+        "cube_3cm": 49.0,
+        "cylinder_3cm": 74.3,
+        "die_16mm": 42.0,
+        "domino_20x40": 41.5,
+        "puck_d40x10": 41.3,
+        "pingpong_40mm": 54.3,
+        "duplo_32x64": 46.0,
+    }
+
+
 def test_the_hover_only_rises_for_an_object_tall_enough_to_need_it():
-    """Pinned: the cylinder is raised 10.3 mm, the ball 0.3, and nothing else moves.
+    """Pinned: the cylinder is raised 4.3 mm, the ball 0.3, and nothing else moves.
 
     The cube's hover in particular is untouched -- it is what the 200-attempt
     gate was run at.
+
+    The cylinder's raise is *above its own stand-off*, and the stand-off moved
+    at Step 22 (its grasp height went 30 -> 36 mm, see
+    :data:`~manus.expert.JAW_PARALLEL_REACH`), so this number shrank from 10.3
+    to 4.3 while the hover itself stayed at 74.3 mm -- which is what
+    :func:`test_every_hover_height_is_pinned` is for.
     """
     from manus.expert import grasp_height, pregrasp_height
 
@@ -272,7 +303,7 @@ def test_the_hover_only_rises_for_an_object_tall_enough_to_need_it():
     }
     assert raised == {
         "cube_3cm": 0.0,
-        "cylinder_3cm": 10.3,
+        "cylinder_3cm": 4.3,
         "die_16mm": 0.0,
         "domino_20x40": 0.0,
         "puck_d40x10": 0.0,
@@ -288,10 +319,13 @@ def test_the_old_fixed_hover_really_did_bury_the_fingers_in_the_cylinder():
     fixed 30 mm stand-off put the fingertips 2.3 mm below its top, because that
     stand-off is measured from the grasp pose at the object's *mid*-height.
     """
-    from manus.expert import grasp_height, jaw_depth
+    from manus.expert import jaw_depth
 
     config = ExpertConfig()
-    old_tcp_z = grasp_height(CYLINDER) + TCP_TO_PAD_CENTRE + config.hover_height
+    # The mid-height grasp the fixed stand-off was measured from, spelled out
+    # rather than read from grasp_height(), which no longer returns it for this
+    # object (Step 22 raised it; see JAW_PARALLEL_REACH).
+    old_tcp_z = CYLINDER.spawn_z + TCP_TO_PAD_CENTRE + config.hover_height
     old_gap = old_tcp_z - jaw_depth(config.gripper_open) - CYLINDER.top_z
     assert old_gap == pytest.approx(-0.0023, abs=1e-4)
     assert hover_clearance(CYLINDER) == pytest.approx(0.008, abs=1e-4)
@@ -325,24 +359,66 @@ def test_a_taller_hover_margin_lifts_the_hover_and_a_zero_one_does_not():
 
 def test_the_puck_is_the_only_grasp_the_table_pushes_up():
     """Pinned: the 10 mm puck is gripped 2.3 mm above its own centre, nothing else is."""
-    from manus.expert import grasp_height
+    from manus.expert import JAW_TIP_Z, grasp_height, tip_clearance
 
     assert grasp_height(PUCK) == pytest.approx(0.0073)
     assert grasp_height(PUCK) - PUCK.spawn_z == pytest.approx(0.0023)
-    assert [
-        spec.name for spec in OBJECTS.values() if grasp_height(spec) > spec.spawn_z
-    ] == ["puck_d40x10"]
+    pushed_up = [
+        spec.name
+        for spec in OBJECTS.values()
+        if grasp_height(spec) > max(spec.spawn_z, JAW_TIP_Z - TCP_TO_PAD_CENTRE) - 1e-12
+        and grasp_height(spec) == pytest.approx(
+            JAW_TIP_Z - TCP_TO_PAD_CENTRE + tip_clearance(spec)
+        )
+    ]
+    assert pushed_up == ["puck_d40x10"]
+
+
+def test_every_grasp_height_is_pinned():
+    """The grasp height of every catalogue object, to 0.1 mm.
+
+    The cube's 15.0 mm is its own mid-height and is what the gate was run at.
+    The two objects that are *not* their own mid-height are the ends of the
+    catalogue: the puck, raised 2.3 mm so the fingertips clear the table, and
+    the cylinder, raised 6.0 mm so the closing jaw meets it at the pads.
+    """
+    from manus.expert import grasp_height
+
+    assert {
+        name: round(grasp_height(spec) * 1e3, 1) for name, spec in OBJECTS.items()
+    } == {
+        "cube_3cm": 15.0,
+        "cylinder_3cm": 36.0,
+        "die_16mm": 8.0,
+        "domino_20x40": 7.5,
+        "puck_d40x10": 7.3,
+        "pingpong_40mm": 20.0,
+        "duplo_32x64": 12.0,
+    }
 
 
 @pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
-def test_only_an_object_too_short_to_centre_on_is_raised(spec):
-    """grasp_height centres the pads on the object unless the tips would hit the table."""
-    from manus.expert import JAW_TIP_Z, MIN_TIP_CLEARANCE, grasp_height
+def test_only_an_object_the_hand_cannot_centre_on_is_raised(spec):
+    """grasp_height centres the pads on the object unless one of its two bars binds.
+
+    Too short and the fingertips would hit the table; too tall and the closing
+    jaw would lean into the object's upper body before the pads reached it.
+    Everything in between is grasped at its own mid-height.
+    """
+    from manus.expert import (
+        JAW_PARALLEL_REACH,
+        JAW_TIP_Z,
+        MIN_TIP_CLEARANCE,
+        grasp_height,
+    )
 
     raise_by = grasp_height(spec) - spec.spawn_z
     assert raise_by >= 0.0
     tall_enough = spec.spawn_z + TCP_TO_PAD_CENTRE - JAW_TIP_Z >= MIN_TIP_CLEARANCE
-    assert (raise_by == 0.0) == tall_enough, f"{spec.name} raised by {raise_by * 1e3:.1f} mm"
+    short_enough = spec.top_z - (spec.spawn_z + TCP_TO_PAD_CENTRE) <= JAW_PARALLEL_REACH
+    assert (raise_by == 0.0) == (tall_enough and short_enough), (
+        f"{spec.name} raised by {raise_by * 1e3:.1f} mm"
+    )
     # The pads must still land on the object, not above it.
     assert grasp_height(spec) < spec.spawn_z + 0.5 * spec.extent_z
 
@@ -658,6 +734,175 @@ def first_rim_contact(spec, clearance: float) -> tuple[float, float, float]:
     raise AssertionError(f"the jaw never reached {spec.name}'s rim")
 
 
+_CLOUD_CACHE: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+
+
+def cached_clouds(angle: float) -> tuple[np.ndarray, np.ndarray]:
+    """:func:`jaw_clouds`, memoised on a 0.1 mrad grid (the sweeps below reuse angles)."""
+    key = round(float(angle), 4)
+    if key not in _CLOUD_CACHE:
+        _CLOUD_CACHE[key] = jaw_clouds(key)
+    return _CLOUD_CACHE[key]
+
+
+def _penetration(spec, moving: np.ndarray, lateral: float) -> np.ndarray:
+    """How far each moving-jaw vertex is inside `spec`'s side wall, metres."""
+    if spec.shape == "cylinder":
+        return spec.radius - np.hypot(moving[:, 0] - lateral, moving[:, 1])
+    half = 0.5 * spec.grasp_width_m
+    return np.minimum(half - np.abs(moving[:, 0] - lateral), half - np.abs(moving[:, 1]))
+
+
+def closing_contact(spec, tcp_z: float, band: tuple[float, float]) -> tuple[float, float]:
+    """First jaw angle whose moving-jaw material enters `spec`, sweeping shut.
+
+    Args:
+        spec: Object, standing on the table at :func:`pad_lateral_offset`.
+        tcp_z: TCP height above the table, metres.
+        band: ``(low, high)`` world-height window to look for contact in --
+            the whole object, or just the slice the pads occupy.
+
+    Returns:
+        ``(angle, contact height above the table)`` in radians and metres.
+    """
+    lateral = expert_mod.pad_lateral_offset(spec)
+    for angle in np.arange(0.9, -0.175, -0.002):
+        _, moving = cached_clouds(float(angle))
+        heights = tcp_z - moving[:, 2]
+        inside = np.where(
+            (heights >= band[0]) & (heights <= band[1]),
+            _penetration(spec, moving, lateral),
+            -1.0,
+        )
+        deepest = int(inside.argmax())
+        if inside[deepest] > 0.0:
+            return float(angle), float(heights[deepest])
+    raise AssertionError(f"the closing jaw never reached {spec.name}")
+
+
+def jaw_lead(spec, tcp_z: float) -> tuple[float, float]:
+    """How early the closing jaw catches `spec`, and where, off the meshes.
+
+    Returns ``(lead, height)``: how much further the jaws would still have had
+    to close for the *pads* to reach the object, at the moment anything on the
+    moving finger first touches it (metres of jaw gap), and the height above the
+    table that first touch happens at. Zero lead is a hand that meets the object
+    with its pads; a positive lead is a one-sided push somewhere else on the
+    finger, and :func:`jaw_lead`'s whole point is that it grows with how far the
+    object stands above the TCP.
+    """
+    tips = tcp_z - expert_mod.JAW_TIP_Z
+    at_pads, _ = closing_contact(spec, tcp_z, (tips, tips + 0.004))
+    leading, height = closing_contact(spec, tcp_z, (0.0, spec.top_z))
+    return (leading - at_pads) * objects.JAW_WIDTH_PER_RAD, height
+
+
+def test_the_closing_jaw_leans_in_and_that_is_where_the_reach_constant_comes_from():
+    """JAW_PARALLEL_REACH, re-measured: the lead grows with height above the TCP.
+
+    A column of the reference width is stood at the planned lateral offset and
+    made taller and taller. While its top is inside the constant the closing jaw
+    still meets it within a fifth of a millimetre of where it meets the 30 mm
+    cube (which grasps); past the constant the finger's upper lobe takes over
+    and the lead more than doubles. That step is the whole justification for
+    :func:`~manus.expert.grasp_height` refusing to leave a tall object standing
+    above it.
+    """
+    import dataclasses
+
+    from manus.expert import JAW_PARALLEL_REACH
+
+    tcp_z = 0.020
+    leads = {}
+    for reach in (0.008, 0.011, 0.016, JAW_PARALLEL_REACH, 0.024, 0.028):
+        height = tcp_z + reach
+        column = dataclasses.replace(
+            width_probe(objects.REFERENCE_WIDTH_M, height),
+            half_extents=(0.015, 0.015, 0.5 * height),
+            spawn_z=0.5 * height,
+        )
+        leads[round(reach * 1e3)] = round(jaw_lead(column, tcp_z)[0] * 1e3, 2)
+    # Flat while the column stays inside the reach, then a step.
+    inside = [leads[8], leads[11], leads[16], leads[round(JAW_PARALLEL_REACH * 1e3)]]
+    assert max(inside) - min(inside) < 0.3, leads
+    assert leads[24] > max(inside) + 0.2, leads
+    assert leads[28] > 2 * max(inside), leads
+
+
+def test_the_cylinder_was_toppled_by_the_lean_and_the_raise_is_what_answers_it():
+    """The Step 21 cylinder failure, and the Step 22 grasp height, both measured.
+
+    At its old mid-height grasp the 60 mm cylinder stood 26 mm above the TCP --
+    6 mm past :data:`~manus.expert.JAW_PARALLEL_REACH` -- so the closing finger
+    reached it 2 mm before the pads did, 26 mm above its centre of mass. That is
+    a topple push on an object that tips at ``atan(15/30)`` = 26.6 deg, and the
+    preview shows it toppling (``runs/object_previews/cylinder_3cm_demo.json``:
+    ``not_in_hand``, the object riding the shut jaws). The raised grasp puts the
+    first contact back near the pads, with less lead than the cube's own.
+    """
+    from manus.expert import grasp_height
+
+    old_tcp = CYLINDER.spawn_z + TCP_TO_PAD_CENTRE
+    new_tcp = grasp_height(CYLINDER) + TCP_TO_PAD_CENTRE
+    assert new_tcp - old_tcp == pytest.approx(0.006, abs=5e-4)
+
+    old_lead, old_height = jaw_lead(CYLINDER, old_tcp)
+    new_lead, new_height = jaw_lead(CYLINDER, new_tcp)
+    cube_lead, cube_height = jaw_lead(CUBE, grasp_height(CUBE) + TCP_TO_PAD_CENTRE)
+
+    assert old_lead == pytest.approx(0.0020, abs=3e-4)
+    assert old_height - CYLINDER.spawn_z == pytest.approx(0.026, abs=1e-3)
+    assert new_lead < cube_lead < old_lead
+    assert new_height < old_height - 0.006
+    # ... and the cube's own numbers, which are what "acceptable" means here.
+    assert cube_lead == pytest.approx(0.0010, abs=3e-4)
+    assert cube_height - CUBE.spawn_z == pytest.approx(0.006, abs=1e-3)
+
+
+def test_the_die_is_met_by_the_pads_so_its_failure_is_not_the_cylinders():
+    """The reconciliation: the 16 mm die's approach geometry is the catalogue's best.
+
+    Round 1 read the die's ``no_grasp`` as the pads closing above it. The meshes
+    say the opposite -- the die stands 4 mm above its TCP, a quarter of
+    :data:`~manus.expert.JAW_PARALLEL_REACH`, so the closing finger reaches it
+    within 0.2 mm of where the pads do, the smallest lead of any object in the
+    catalogue. Whatever loses the die happens after contact, not on the way to
+    it.
+    """
+    from manus.expert import JAW_PARALLEL_REACH, grasp_height
+
+    die_tcp = grasp_height(DIE) + TCP_TO_PAD_CENTRE
+    assert DIE.top_z - die_tcp == pytest.approx(0.004, abs=1e-4)
+    assert DIE.top_z - die_tcp < 0.25 * JAW_PARALLEL_REACH
+    lead, height = jaw_lead(DIE, die_tcp)
+    assert lead < 0.0003, f"the die is caught {lead * 1e3:.2f} mm before its pads"
+    assert lead < jaw_lead(CUBE, grasp_height(CUBE) + TCP_TO_PAD_CENTRE)[0]
+    assert height - DIE.spawn_z == pytest.approx(0.0064, abs=1e-3)
+    # And the pads really are centred on it: the round-1 claim that survives.
+    assert grasp_height(DIE) == DIE.spawn_z
+    assert die_tcp - expert_mod.JAW_TIP_Z - expert_mod.MIN_TIP_CLEARANCE == pytest.approx(
+        0.0007, abs=1e-4
+    )
+
+
+def test_the_tip_clearance_override_cannot_lower_a_grasp_only_raise_it():
+    """Why the die cannot be given "the pads' lower band" through tip_clearance_m.
+
+    :func:`~manus.expert.grasp_height` is a max of three bars, so the clearance
+    override can only ever push a grasp *up*. Round 2 considered dropping the
+    die's clearance to 3 mm to buy 2 mm of engagement; it buys nothing, because
+    the die's own mid-height is already 0.7 mm above the 5 mm bar and 2.7 mm
+    above a 3 mm one.
+    """
+    import dataclasses
+
+    from manus.expert import grasp_height
+
+    for clearance in (0.001, 0.003, 0.005):
+        lowered = dataclasses.replace(DIE, tip_clearance_m=clearance)
+        assert grasp_height(lowered) == DIE.spawn_z
+
+
 def test_the_tip_clearance_override_moves_a_short_objects_grasp():
     """The knob the rented box sweeps the puck's 3-7 mm band with, end to end.
 
@@ -933,6 +1178,57 @@ def test_states_advance_on_convergence_not_on_the_budget():
             assert report.joint_error < config.converge_tol
 
 
+def test_the_convergence_bar_is_scaled_by_the_object_and_pinned_per_object():
+    """Pinned: the cube's bar is CONVERGE_TOL exactly, and narrow objects get less.
+
+    The cube is the width the number was tuned at, so ``min(1, w / 0.030)`` is
+    exactly 1 for it and its behaviour is bit-identical -- which matters,
+    because 0.02 rad is what the 200-attempt Step 8 gate ran under. Only the two
+    objects narrower than the reference are tightened.
+    """
+    from manus.expert import CONVERGE_TOL, converge_tol
+
+    assert converge_tol(CUBE) == CONVERGE_TOL
+    assert {
+        name: round(converge_tol(spec), 6) for name, spec in OBJECTS.items()
+    } == {
+        "cube_3cm": 0.02,
+        "cylinder_3cm": 0.02,
+        "die_16mm": round(0.02 * 16 / 30, 6),
+        "domino_20x40": round(0.02 * 20 / 30, 6),
+        "puck_d40x10": 0.02,
+        "pingpong_40mm": 0.02,
+        "duplo_32x64": 0.02,
+    }
+    # Never loosened past the tuned bar, however wide the object.
+    assert max(converge_tol(spec) for spec in OBJECTS.values()) == CONVERGE_TOL
+    # It rides the config, so --converge-tol still sweeps the whole catalogue.
+    assert converge_tol(DIE, ExpertConfig(converge_tol=0.04)) == pytest.approx(
+        2 * converge_tol(DIE)
+    )
+    assert converge_tol(None) == CONVERGE_TOL
+
+
+def test_a_narrow_object_holds_descend_until_it_is_inside_its_own_tighter_bar():
+    """The scaled bar is the one the FSM actually exits on, not just a number.
+
+    Against the same drooping plant, the die's DESCEND runs longer than the
+    cube's and lands inside the die's tolerance -- which the cube's exit would
+    not have satisfied. That extra time is the point: it is the droop
+    integrator's, and it is what shrinks the residual CLOSE then freezes.
+    """
+    from manus.expert import converge_tol
+
+    def descend(spec):
+        expert = ScriptedGraspExpert(spec, (0.20, 0.0, 0.0))
+        run(expert, FakeArm(droop=0.05))
+        return [report for report in expert.reports if report.state == DESCEND][0]
+
+    cube, die = descend(CUBE), descend(DIE)
+    assert die.joint_error < converge_tol(DIE) < cube.joint_error < converge_tol(CUBE)
+    assert die.steps > cube.steps
+
+
 def test_a_wedged_arm_times_out_of_every_arm_state_and_says_so():
     """A plant that never moves burns exactly the budget in each arm state.
 
@@ -1194,6 +1490,142 @@ def test_the_integrator_does_not_wind_up_while_the_arm_is_still_travelling():
     for _ in range(30):
         measured = plant.apply(expert.step(measured))
     assert np.allclose(expert.bias, 0.0)
+
+
+# --- What the filmed previews actually measured -------------------------------------
+#
+# runs/object_previews/<name>_demo.json is the Step 21 catalogue run: one
+# attempt per object, at one shared placement, with per-state convergence
+# reports. It records |measured - waypoint| per joint at each state's exit and
+# the droop bias in force there -- and the bias is the *signed* error a step
+# earlier (see ScriptedGraspExpert._update_bias), which is enough to reconstruct
+# the pose CLOSE froze the arm at and put it back through the FK. These tests
+# are the reconciliation of the round-1 reading of that run.
+
+PREVIEW_DIR = kinematics.SO101_URDF_PATH.parents[3] / "runs" / "object_previews"
+"""Where the Step 21 per-object previews live (repo root / runs/object_previews)."""
+
+PREVIEW_GRASP_HEIGHT_M = {"cube_3cm": 0.015, "die_16mm": 0.008, "cylinder_3cm": 0.030}
+"""Grasp height each preview was flown at, metres: every object's own mid-height.
+
+Spelled out rather than read from :func:`~manus.expert.grasp_height`, because
+the cylinder's has since been raised to 36 mm and these files record the run
+before that.
+"""
+
+
+def preview(name: str) -> dict:
+    """The one attempt in ``runs/object_previews/<name>_demo.json``."""
+    import json
+
+    path = PREVIEW_DIR / f"{name}_demo.json"
+    if not path.is_file():
+        pytest.skip(f"{path} is not checked out")
+    return json.loads(path.read_text(encoding="utf-8"))[0]
+
+
+def descend_exit_pose(record: dict) -> tuple[np.ndarray, np.ndarray]:
+    """``(waypoint, measured)`` arm poses at the preview's DESCEND exit, radians.
+
+    The waypoint is re-solved from the recorded draw and grasp yaw (and checked
+    against the recorded lift rise, which is a function of it). The measured
+    pose is the waypoint minus the recorded per-joint error, signed by the
+    direction the droop integrator was pulling -- ``bias(DESCEND) -
+    bias(PREGRASP)`` is ``droop_gain`` times the signed error on DESCEND's one
+    post-ramp step.
+    """
+    from manus.expert import plan_lift, tcp_target
+
+    spec = OBJECTS[record["telemetry"]["object"]]
+    draw, states = record["draw"], {s["state"]: s for s in record["telemetry"]["states"]}
+    yaw = record["telemetry"]["grasp_yaw"]
+    target = tcp_target(
+        (draw["object_x"], draw["object_y"]),
+        PREVIEW_GRASP_HEIGHT_M[spec.name],
+        yaw,
+        spec,
+    )
+    waypoint, converged = kinematics.ik_solve(target, yaw)
+    assert converged
+    assert plan_lift(waypoint, ExpertConfig().lift_rise)[1] == pytest.approx(
+        record["telemetry"]["lift_rise"]
+    )
+    signs = np.sign(np.array(states["DESCEND"]["bias"]) - np.array(states["PREGRASP"]["bias"]))
+    error = signs * np.array(states["DESCEND"]["joint_errors"])
+    return waypoint, waypoint - error
+
+
+@pytest.mark.parametrize("name", list(PREVIEW_GRASP_HEIGHT_M))
+def test_the_previews_descend_residual_is_lateral_not_vertical(name):
+    """The round-1 reconciliation: the 4-6 mm of DESCEND error is not a high hand.
+
+    Round 1 read the die's ``no_grasp`` as the pads sitting 4-6 mm high on a
+    16 mm object, on the strength of the TCP error the previews report at the
+    end of DESCEND. Put the recorded pose back through the FK and the error is
+    real but mostly horizontal: 5.3-5.9 mm total, of which 4.9-5.4 mm is
+    horizontal and only 2.2-2.5 mm vertical -- and that part points *down*, so
+    the hand is low at the grasp, not high. The reconstruction is not free to be
+    wrong about this: the signed
+    pose it builds reproduces the tcp_error the run recorded to a micron, which
+    32 sign combinations could not all do.
+    """
+    record = preview(name)
+    reported = {s["state"]: s for s in record["telemetry"]["states"]}["DESCEND"]["tcp_error"]
+    waypoint, measured = descend_exit_pose(record)
+    offset = CHAIN.fk_tcp(measured)[0] - CHAIN.fk_tcp(waypoint)[0]
+
+    assert float(np.linalg.norm(offset)) == pytest.approx(reported, abs=1e-6)
+    assert 0.0053 <= reported <= 0.0060, f"{name}: {reported * 1e3:.2f} mm"
+    assert -0.0026 < offset[2] < -0.0021, f"{name}: {offset[2] * 1e3:+.2f} mm vertical"
+    # Horizontal error is more than twice the vertical one on every preview.
+    assert float(np.linalg.norm(offset[:2])) > 2.0 * abs(offset[2])
+
+
+def test_the_previews_low_hand_still_clears_the_table_and_still_lost_the_die():
+    """What the measured 2.4 mm of sag costs each object, and why it is not the die's story.
+
+    It is spent out of the fingertip clearance, so it bites hardest on the
+    shortest grasp: the die keeps 3.3 mm of its nominal 5.7 mm, the cube 10.2 of
+    12.7. Both still clear the table -- and the die's engaged pad band gets
+    *longer*, not shorter, which is the opposite of the round-1 reading and the
+    reason "grasp the die lower" cannot be the fix. It already was lower.
+    """
+    from manus.expert import JAW_TIP_Z
+
+    flown = {}
+    for name in PREVIEW_GRASP_HEIGHT_M:
+        waypoint, measured = descend_exit_pose(preview(name))
+        tcp_z = float(CHAIN.fk_tcp(measured)[0][2])
+        flown[name] = tcp_z - JAW_TIP_Z
+        assert tcp_z - JAW_TIP_Z > 0.0, f"{name}: the fingertips reached the table"
+    assert flown["die_16mm"] == pytest.approx(0.0033, abs=3e-4)
+    assert flown["cube_3cm"] == pytest.approx(0.0102, abs=3e-4)
+    # The die was flown 2.4 mm below its plan and still came out no_grasp.
+    assert preview("die_16mm")["outcome"] == "no_grasp"
+    assert flown["die_16mm"] < 0.008 - JAW_TIP_Z + TCP_TO_PAD_CENTRE
+
+
+def test_the_previews_residual_is_a_bigger_share_of_a_narrow_grasp():
+    """Why the convergence bar is scaled by the object: the same error, three objects.
+
+    The residual is a property of the arm and the ramp, not of what is being
+    grasped -- all three previews land within 0.6 mm of each other -- so what
+    changes across the catalogue is only what fraction of the object it is.
+    """
+    from manus.expert import converge_tol
+
+    share = {}
+    for name in PREVIEW_GRASP_HEIGHT_M:
+        record = preview(name)
+        reported = {s["state"]: s for s in record["telemetry"]["states"]}["DESCEND"]["tcp_error"]
+        share[name] = reported / OBJECTS[name].grasp_width_m
+    assert share["cube_3cm"] == pytest.approx(0.20, abs=0.01)
+    assert share["cylinder_3cm"] == pytest.approx(0.18, abs=0.01)
+    assert share["die_16mm"] == pytest.approx(0.37, abs=0.01)
+    # ... which is what the scaled tolerance is holding roughly constant.
+    assert converge_tol(OBJECTS["die_16mm"]) / converge_tol(OBJECTS["cube_3cm"]) == pytest.approx(
+        OBJECTS["die_16mm"].grasp_width_m / OBJECTS["cube_3cm"].grasp_width_m
+    )
 
 
 # --- Measurement plumbing ---------------------------------------------------------
@@ -1491,3 +1923,31 @@ def test_an_untouched_object_after_a_wedged_run_is_a_timeout():
     expert = fresh(state_budget=30, hold_steps=5)
     run(expert, FakeArm(frozen=True), max_steps=1000)
     assert classify_outcome(expert, fed([0.015] * 40)) == "timeout"
+
+
+# --- The driver's output names ---------------------------------------------------
+
+
+def test_the_demo_driver_names_its_artefacts_after_the_object():
+    """``demo_expert.py`` cannot overwrite one object's preview with another's.
+
+    A source check rather than an import, because the script parses its
+    arguments and starts Isaac Sim at module scope, so there is nothing to
+    import on the CPU-only side. What it pins is the thing that actually broke:
+    with a fixed ``demo.json`` and an ``expert_demo_0000.mp4``, filming the
+    seven-object catalogue into one ``--out-dir`` left one summary and one video
+    -- the last object's. Both basenames now carry ``--object``, and ``--label``
+    still overrides the video outright, which is what the committed
+    ``runs/object_previews/<name>.mp4`` names were made with.
+    """
+    source = (PREVIEW_DIR.parent.parent / "scripts" / "demo_expert.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'f"{args_cli.object}_{attempt:04d}"' in source
+    assert 'f"{args_cli.object}_demo.json"' in source
+    assert 'f"{args_cli.object}_tuning.json"' in source
+    assert 'f"{args_cli.object}_{slot}"' in source
+    assert 'f"{args_cli.label or name}.mp4"' in source
+    # ... and nothing writes the old fixed names any more.
+    assert '"demo.json"' not in source
+    assert '"tuning.json"' not in source

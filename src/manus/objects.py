@@ -179,10 +179,24 @@ hand and firm enough not to slip. See :attr:`manus.expert.ExpertConfig.close_ram
 CLOSE_RAMP_MAX_STEPS = 150
 """Slowest CLOSE ramp the rule will ask for, in control steps. **Measured.**
 
-The value the 5 g die needed: at 60 steps the closing jaw punts it, at 150 it
-seats. It doubles as the clamp because 150 steps is 5 s of closing at 30 Hz --
-the slowest close anyone has verified, and past it the only certain effect is a
-longer episode.
+What 150 buys is measured and stands: at 60 steps the closing jaw punts the 5 g
+die out of the hand at first touch, at 150 the die does not move at all through
+contact (Step 21 preview, ``runs/object_previews/die_16mm.mp4``: its centre
+holds 8.0-8.3 mm from the jaws' first graze at 0.08 rad right through their
+nominal 16 mm contact at -0.004).
+
+What 150 does *not* buy has been retracted. The old "at 150 it seats" reading
+came from an attempt the height-only predicate scored as a success; under the
+Step 21 predicate the same attempt is a ``no_grasp``, because the die is
+squeezed back *out* 1.4 mm into the squeeze -- 8.0 -> 19.0 mm in six control
+steps, ~80 mm/s, an order of magnitude faster than the 7 mm/s the pads are
+closing at -- and the jaws then run to their commanded target on an empty hand.
+That is a squeeze failure, not an approach failure, so the ramp is not the knob
+that fixes it and a longer one is not indicated: the die survives the part of
+CLOSE the ramp governs.
+
+150 remains the clamp because 5 s of closing at 30 Hz is the slowest close
+anyone has verified, and past it the only certain effect is a longer episode.
 """
 
 
@@ -432,6 +446,15 @@ OBJECTS: dict[str, ObjectSpec] = {
     ),
     # d = 3 cm, h = 6 cm, standing on one flat end (~1900 kg/m^3). Grasped
     # across the diameter, so the jaw span matches the cube's.
+    #
+    # The catalogue's topple case, and the only object the closing-jaw bar in
+    # manus.expert.grasp_height raises: standing 60 mm tall it reached 26 mm
+    # above a mid-height grasp, into the part of the sweep where the moving
+    # finger's face leans inward (manus.expert.JAW_PARALLEL_REACH), so the jaw
+    # met its upper body 26 mm above its centre of mass and 2.0 mm before the
+    # pads reached its 30 mm body, and pushed it over. It is grasped at 36 mm
+    # instead, which is still inside the object and keeps the pads over its
+    # upper 26 mm with the centre of mass hanging below them.
     "cylinder_3cm": ObjectSpec(
         name="cylinder_3cm",
         shape="cylinder",
@@ -444,6 +467,12 @@ OBJECTS: dict[str, ObjectSpec] = {
         yaw_symmetry="free",
     ),
     # A 16 mm acrylic die (~1200 kg/m^3): the smallest thing in the catalogue,
+    # and the object the arm's own convergence residual is worst for -- 5.9 mm
+    # of TCP error left over at the end of DESCEND is 37% of its grasp width
+    # against the cube's 20%, which is why manus.expert.converge_tol scales the
+    # bar by the object and the die gets 0.0107 rad rather than 0.02. See
+    # CLOSE_RAMP_MAX_STEPS for the part of its Step 21 failure the ramp does
+    # *not* explain.
     # and at 5 g the lightest thing with corners. Both of its deviations from
     # the catalogue defaults are about the same fact -- a 5 g, 16 mm object has
     # nothing to absorb the hand with. The jaws come in over

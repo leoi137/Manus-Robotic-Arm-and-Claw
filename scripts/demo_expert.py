@@ -13,6 +13,12 @@ Three modes, all headless and all GPU-serialised (one Isaac process at a time):
     # Step 7's tuning grid: 5 placements x 4 object yaws, one boot
     ~/isaaclab-env/bin/python scripts/demo_expert.py --headless --tuning
 
+Both artefacts are named after the object -- ``<out-dir>/<object>_<attempt>.mp4``
+and ``<out-dir>/<object>_demo.json`` (``<object>_tuning.json`` for ``--tuning``)
+-- so filming the whole catalogue into one ``--out-dir`` leaves one video and one
+summary per object rather than one of each, overwritten six times. ``--label``
+still overrides the video basename outright.
+
 Rendering is off unless ``--video`` is passed: success is measured from the
 object's height, not from pixels, and skipping the render is a ~4x throughput
 win. The wrist camera is in the scene either way, it is simply never asked for
@@ -65,7 +71,14 @@ parser.add_argument(
     metavar=("X", "Y", "YAW"),
     help="force one placement (metres, metres, radians) instead of the draw's",
 )
-parser.add_argument("--label", default=None, help="basename for the recorded video")
+parser.add_argument(
+    "--label",
+    default=None,
+    help=(
+        "basename for the recorded video; the default is <object>_<attempt>, so "
+        "filming a catalogue into one --out-dir cannot overwrite across objects"
+    ),
+)
 parser.add_argument(
     "--trace",
     type=int,
@@ -269,8 +282,22 @@ class AttemptRunner:
 
     # -- one attempt -------------------------------------------------------------
 
-    def run(self, draw, *, record: bool = False, verbose: bool = True, name: str = "attempt") -> dict:
-        """Run one attempt end to end and return its outcome dictionary."""
+    def run(
+        self,
+        draw,
+        *,
+        record: bool = False,
+        verbose: bool = True,
+        name: str = "attempt",
+        video_name: str | None = None,
+    ) -> dict:
+        """Run one attempt end to end and return its outcome dictionary.
+
+        `name` is the attempt's identity (the draw namespace and index, which is
+        what the summary records); `video_name` is the basename the mp4 is
+        written under, which defaults to `name` and is object-qualified by the
+        caller so a catalogue filmed into one ``--out-dir`` cannot collide.
+        """
         self.reset_episode(draw)
         measured = self.measured()
         expert = ScriptedGraspExpert(self.spec, config=self.config)
@@ -371,11 +398,15 @@ class AttemptRunner:
                 + (f"  timeouts {expert.timeouts}" if expert.timeouts else "")
             )
         if record and frames:
-            result["video"] = self.write_video(frames, name)
+            result["video"] = self.write_video(frames, video_name or name)
         return result
 
     def write_video(self, frames: list[np.ndarray], name: str) -> str:
-        """Write the captured wrist frames to an mp4 and return its path."""
+        """Write the captured wrist frames to an mp4 and return its path.
+
+        ``--label`` still wins outright, which is what pins the one-file-per-
+        object preview names; `name` is the object-qualified default.
+        """
         import imageio.v3 as iio
 
         out_dir = Path(args_cli.out_dir)
@@ -451,7 +482,11 @@ def main() -> int:
     sim.reset()
     runner = AttemptRunner(sim, scene, spec, config)
 
-    jobs: list[tuple[str, object]] = []
+    # (attempt identity, video basename, draw). The video basename carries the
+    # object so that filming several objects into one --out-dir writes several
+    # files rather than overwriting one; the attempt identity stays the draw's,
+    # because that is what the summary has to record to be replayable.
+    jobs: list[tuple[str, str, object]] = []
     if args_cli.tuning:
         for radius, azimuth in TUNING_PLACEMENTS:
             x, y = polar_to_xy(radius, azimuth)
@@ -459,8 +494,10 @@ def main() -> int:
                 # One draw per grid slot, so lighting/friction/colour vary the
                 # way they will in the gate while the placement stays fixed.
                 base = draw_episode("expert_tuning", len(jobs))
+                slot = f"r{radius:.3f}_az{azimuth:+.0f}_yaw{yaw_deg:+.1f}"
                 jobs.append((
-                    f"r{radius:.3f}_az{azimuth:+.0f}_yaw{yaw_deg:+.1f}",
+                    slot,
+                    f"{args_cli.object}_{slot}",
                     dataclasses.replace(
                         base, object_x=x, object_y=y, object_yaw=math.radians(yaw_deg)
                     ),
@@ -476,12 +513,18 @@ def main() -> int:
             if args_cli.pose is not None:
                 x, y, yaw = args_cli.pose
                 draw = dataclasses.replace(draw, object_x=x, object_y=y, object_yaw=yaw)
-            jobs.append((f"{args_cli.namespace}_{attempt:04d}", draw))
+            jobs.append((
+                f"{args_cli.namespace}_{attempt:04d}",
+                f"{args_cli.object}_{attempt:04d}",
+                draw,
+            ))
 
     results = []
-    for name, draw in jobs:
+    for name, video_name, draw in jobs:
         print(f"\n[{name}]")
-        result = runner.run(draw, record=args_cli.video, verbose=True, name=name)
+        result = runner.run(
+            draw, record=args_cli.video, verbose=True, name=name, video_name=video_name
+        )
         result["attempt"] = name
         results.append(result)
 
@@ -505,7 +548,11 @@ def main() -> int:
 
     out_dir = Path(args_cli.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    summary = out_dir / ("tuning.json" if args_cli.tuning else "demo.json")
+    # Object-qualified for the same reason the videos are: a catalogue sweep
+    # writes one summary per object instead of clobbering a single demo.json.
+    summary = out_dir / (
+        f"{args_cli.object}_tuning.json" if args_cli.tuning else f"{args_cli.object}_demo.json"
+    )
     summary.write_text(json.dumps(results, indent=2) + "\n")
     print(f"wrote {summary}")
     return 0 if successes == len(results) else 1
