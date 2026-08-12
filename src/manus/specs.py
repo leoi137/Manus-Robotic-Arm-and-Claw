@@ -74,3 +74,25 @@ LINK_CHAIN: tuple[str, ...] = (
 
 GRIPPER_FRAME_LINK = "gripper_frame_link"  # fixed tool frame on gripper_link
 MOVING_JAW_LINK = "moving_jaw_so101_v1_link"  # child of the "gripper" joint
+
+# --- Wrist camera mount ------------------------------------------------------
+# The POV camera's rigid mount on the gripper link, taken verbatim from the
+# MuJoCo Menagerie `robotstudio_so101` model (Apache-2.0) that derives from the
+# same vendor MJCF as our URDF. Kept *here*, sim-free, rather than only in
+# manus.scene: where the camera ends up in the world is a function of the arm
+# pose, so it is a kinematic fact about a plan (does the camera see the object?
+# is it above the table? which way is up in the image?) and has to be checkable
+# without an Isaac app. :func:`manus.kinematics.wrist_camera_pose` is what reads
+# them; ``manus.scene.SoArmSceneCfg`` spawns the sensor from the same numbers.
+WRIST_CAM_PARENT_LINK = "gripper_link"
+WRIST_CAM_POS: tuple[float, float, float] = (0.0, 0.055, -0.045)  # metres, parent frame
+WRIST_CAM_QUAT_XYZW: tuple[float, float, float, float] = (-0.2811575, 0.0, 0.0, 0.9596617)
+WRIST_CAM_WIDTH = 640  # pixels, the real UVC module's native mode
+WRIST_CAM_HEIGHT = 480  # pixels
+WRIST_CAM_APERTURE = 20.955  # USD horizontal aperture, tenths of a world unit
+WRIST_CAM_FOCAL = 13.10  # USD focal length, same scale: the two give a 77.3 deg hFOV
+WRIST_CAM_CONVENTION = "opengl"
+"""Camera-frame convention of :data:`WRIST_CAM_QUAT_XYZW`: -Z is the view
+direction and +Y is the image's up axis (Isaac Lab's ``"opengl"``, which is also
+MuJoCo's and USD's). The quaternion is a -0.57 rad turn about the gripper link's
++X, which aims the optical axis just past the fingertips."""

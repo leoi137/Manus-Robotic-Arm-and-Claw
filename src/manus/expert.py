@@ -45,13 +45,18 @@ different plan rather than the same plan rotated:
 ``PREGRASP``
     Tool **flat**, approach axis horizontal and pointing radially outward, jaws
     open and level; standing :attr:`ExpertConfig.side_retract` back from the
-    grasp along that axis, at the grasp's own height. The hand never passes over
-    the object.
+    grasp along that axis, at the grasp's own height -- the *cup* height, two
+    thirds of the way up the object (:func:`grasp_height`). The hand never
+    passes over the object.
 ``ADVANCE``
     Straight out along the approach axis onto the grasp pose, so the object ends
     up between the pads -- the same ``(lateral, 0, TCP_TO_PAD_CENTRE)`` in the
     tool's own frame as a top-down grasp, which in the world is now *tangential*
     and *radial* rather than lateral and vertical (:func:`side_tcp_target`).
+    Then it **waits**: a side move may not exit until it has held the waypoint
+    for :data:`SIDE_SETTLE_STEPS` past its ramp, because what a side approach's
+    leftover droop is spent out of is the hand's own table clearance
+    (:func:`side_table_clearance`, :data:`SIDE_CONVERGE_TOL`).
 ``CLOSE``
     Arm frozen, jaws driven to ``spec.close_target_rad`` -- deliberately past
     contact, so the servo squeezes against its effort limit.
@@ -116,7 +121,11 @@ from manus.objects import ObjectSpec
 from manus.randomize import EpisodeDraw
 
 __all__ = [
+    "CLOSE_CREEP_LEAD_RAD",
+    "CLOSE_CREEP_RATE_RAD",
     "CONVERGE_TOL",
+    "SIDE_CONVERGE_TOL",
+    "SIDE_SETTLE_STEPS",
     "SIDE_STATE_SEQUENCE",
     "STATE_SEQUENCE",
     "ExpertConfig",
@@ -125,7 +134,9 @@ __all__ = [
     "ScriptedGraspExpert",
     "StateReport",
     "classify_outcome",
+    "close_command",
     "close_ramp_steps",
+    "close_steps",
     "converge_tol",
     "grasp_height",
     "grasp_yaw_candidates",
@@ -135,7 +146,10 @@ __all__ = [
     "plan_grasp",
     "plan_lift",
     "pregrasp_height",
+    "settle_steps",
     "side_body_behind_tcp",
+    "state_budget",
+    "side_table_clearance",
     "side_tcp_target",
     "state_sequence",
     "tip_clearance",
@@ -224,6 +238,52 @@ scales this bar by the object rather than loosening or tightening it for
 everyone.
 """
 
+SIDE_CONVERGE_TOL: float = 0.0074
+"""``max |measured - waypoint|`` (radians) ending a **side** move. **Derived.**
+
+A side grasp does not spend its convergence residual on the same thing a
+top-down one does. Coming down onto an object, a millimetre of TCP error is a
+millimetre off the pads' centreline; coming *along the table*, the vertical part
+of it comes straight out of :func:`side_table_clearance` -- and when that budget
+is gone the hand is standing on the table, which is what the filmed cylinder did
+(7.4 mm of droop against 5.8 mm of clearance). So the bar is set from the
+clearance rather than from the object's width:
+
+    tol = (clearance / 2) / max_region |d z_tcp / d q|
+
+Both halves are measured. The *worst-case* vertical TCP error a per-joint bar of
+``tol`` admits is ``tol * sum_i |d z_tcp / d q_i|``, which over
+:data:`~manus.kinematics.SIDE_GRASP_REGION` peaks at **0.826 m/rad** at the outer
+edge -- and that worst case is the realistic one here, because gravity droops
+all three pitch joints the same way (the filmed ADVANCE exit: 16.9/14.8/11.1
+mrad, all the same sign, 10.7 mm of z). Half the 12.2 mm clearance at the cup
+grasp is 6.1 mm, so the bar is 7.4 mrad -- and half a budget is the right share
+because the other half is what the hand keeps: at exactly this bar the lowest
+material still clears the table by 6.1 mm, more than :data:`MIN_TIP_CLEARANCE`.
+
+It is a third of :data:`CONVERGE_TOL`, and it is reachable only because ADVANCE
+now dwells for :data:`SIDE_SETTLE_STEPS` after its ramp instead of exiting the
+first step it is allowed to (see :attr:`ExpertConfig.side_settle_steps`); the
+old bar was met *while the arm was still moving*.
+"""
+
+SIDE_SETTLE_STEPS: int = 30
+"""Steps a side approach holds its waypoint after the ramp, before it may exit.
+
+One second at 30 Hz, and it is the fix for the half of the cylinder's failure
+the convergence bar does not reach. The droop integrator
+(:meth:`ScriptedGraspExpert._update_bias`) only runs once the ramp is done, and
+folds :attr:`~ExpertConfig.droop_gain` = 12% of the standing error into the
+command each step -- so it needs *steps*, and the filmed ADVANCE gave it none:
+it exited on the first step its ramp completed, with 6 mrad of bias integrated
+and 7.4 mm of sag still in the arm. Thirty steps of 12% takes 20 mrad of droop
+to 0.4 mrad, which is deep inside :data:`SIDE_CONVERGE_TOL`; the state budget is
+240, so the dwell costs a third of it at worst.
+
+Zero for the top-down family, deliberately: DESCEND's exit rule, and therefore
+every dataset already generated with it, is unchanged (:func:`settle_steps`).
+"""
+
 
 @dataclass(frozen=True)
 class ExpertConfig:
@@ -256,6 +316,16 @@ class ExpertConfig:
             :data:`~manus.objects.REFERENCE_WIDTH_M` object, radians; narrower
             objects get a proportionally tighter bar (:func:`converge_tol`, and
             see :data:`CONVERGE_TOL` for why the bar is object-dependent).
+            Top-down only -- a side grasp's bar comes out of its table
+            clearance instead, see :attr:`side_converge_tol`.
+        side_converge_tol: Arm convergence tolerance for a **side** move,
+            radians (:data:`SIDE_CONVERGE_TOL`). Not width-scaled: what a side
+            approach's residual is spent out of is the hand's table clearance,
+            which is a property of the grasp height, not of the object's width.
+        side_settle_steps: Steps a side approach holds its waypoint after the
+            ramp before it is allowed to exit, so the droop integrator can
+            actually cancel the sag it is measuring (:data:`SIDE_SETTLE_STEPS`).
+            Top-down states never dwell.
         state_budget: Per-state step ceiling; expiry advances the FSM anyway and
             is recorded in :attr:`ScriptedGraspExpert.timeouts`.
         hold_steps: Length of the terminal HOLD.
@@ -304,6 +374,8 @@ class ExpertConfig:
     hover_margin: float = 0.008
     side_retract: float = 0.040
     converge_tol: float = CONVERGE_TOL
+    side_converge_tol: float = SIDE_CONVERGE_TOL
+    side_settle_steps: int = SIDE_SETTLE_STEPS
     state_budget: int = 240
     hold_steps: int = 45
     gripper_open: float = GRIPPER_OPEN
@@ -358,8 +430,195 @@ def close_ramp_steps(spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CON
     return spec.close_ramp_steps
 
 
+def settle_steps(
+    state: str, spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CONFIG
+) -> int:
+    """Steps `state` must hold its waypoint after the ramp before it may exit.
+
+    :attr:`~ExpertConfig.side_settle_steps` for the two states of a **side**
+    grasp that have to arrive accurately -- PREGRASP and ADVANCE -- and zero for
+    everything else, which leaves the top-down FSM's exit rule (and so every
+    dataset generated with it) bit-for-bit what it was. See
+    :data:`SIDE_SETTLE_STEPS` for what the dwell is for.
+    """
+    if spec is not None and is_side_grasp(spec) and state in (PREGRASP, ADVANCE):
+        return config.side_settle_steps
+    return 0
+
+
+CLOSE_CREEP_LEAD_RAD: float = 0.080
+"""How far above its contact angle a creeping CLOSE drops to the creep rate, radians.
+
+5.8 mm of jaw gap, and every millimetre of it is spoken for. The creep is only
+worth anything if the jaw is *already* creeping the first time it can touch the
+object, so the hand-over has to clear three things at once (measured; the first
+take of the creep used 0.030 rad, cleared none of them by enough, and the fast
+leg's last step landed on the cylinder):
+
+* **the mesh's own lead over the width formula**, 0.021 rad for the side-grasped
+  cylinder and 0.023 for the puck. :func:`~manus.objects.contact_angle_for_width`
+  is anchored on the cube's engagement band, and an object gripped elsewhere on
+  the pads meets them a little early.
+* **the clearance the object is shoved across**, ``JAW_CLEARANCE /
+  JAW_WIDTH_PER_RAD`` = 0.028 rad, because contact starts at the *near* face and
+  the whole point is to be creeping through the shove.
+* **one step of the fast ramp**, 0.017-0.024 rad, or the jaw steps straight over
+  the hand-over and into the object at ramp speed.
+
+That is 0.073 rad worst case; 0.080 leaves a step in hand. What it costs is
+CLOSE's length -- :func:`close_steps` comes out at 198 steps for the cylinder
+and 218 for the puck, against a tuned ramp of 60 and 85 -- which is why
+:func:`state_budget` has to know about the creep.
+"""
+
+CLOSE_CREEP_RATE_RAD: float = 0.0015
+"""Jaw speed through the contact band on a creeping CLOSE, radians per step.
+
+0.11 mm of gap per control step, 16x slower than the tuned ramp's 1.76 mm. The
+number is set by the object, not by the jaw: what has to be avoided is shoving
+the object across :data:`JAW_CLEARANCE` faster than it can get out of the way,
+and "get out of the way" has a natural period -- for the 60 mm cylinder,
+``2*pi*sqrt(I_edge / m g r)`` = 0.63 s, or 19 control steps. At the tuned ramp
+the 2 mm gap is crossed in 1.1 steps, which is an impact; at this rate it takes
+18, which is a push. See :func:`close_command` for what that is worth in energy.
+"""
+
+
+def close_command(
+    entry: float,
+    target: float,
+    step: int,
+    spec: ObjectSpec | None = None,
+    config: ExpertConfig = DEFAULT_CONFIG,
+) -> float:
+    """Jaw target at `step` of CLOSE: the ramp, with an optional creep at the end.
+
+    The default is the tuned linear ramp over
+    :meth:`~ExpertConfig.ramp_steps` -- what every top-down catalogue object
+    closes with, unchanged.
+
+    An object with :attr:`~manus.objects.ObjectSpec.close_creep` set gets a
+    **two-rate** close instead: the same linear ramp down to
+    :data:`CLOSE_CREEP_LEAD_RAD` above its own contact angle, then
+    :data:`CLOSE_CREEP_RATE_RAD` per step through the contact band. What it is
+    aimed at is measured; **what it buys is partial**, and the takes that say so
+    are named at the end of this docstring:
+
+    The jaws are a position servo, and the object is *not* against the static
+    pad when they arrive -- it stands :data:`JAW_CLEARANCE` clear of it, by
+    design, so the descent (or the advance) can pass the static finger. So the
+    closing jaw has to shove the object across that gap with the static pad
+    still 2 mm away, and while it does, the commanded jaw runs on into the
+    object: the position error, and with it the force, grows with every
+    millimetre of blocked travel. By virtual work through the jaw's own rate
+    (:data:`~manus.objects.JAW_WIDTH_PER_RAD`), a blocked gap of ``g`` stands
+    the pads on ``kp * g / rate^2`` newtons, so crossing the whole clearance
+    stores ``0.5 * kp * gap^2 / rate^2`` = **6.7 mJ** of spring in the servo --
+    which is then dumped into the object at capture.
+
+    6.7 mJ is 2.4x what it takes to topple the 60 mm cylinder about its base
+    edge (2.8 mJ), and it is 0.67 m/s on a 30 g puck. That is what the filmed
+    takes show: the cylinder falls onto the closing finger within two control
+    steps of first contact, and the puck leaves the hand at ~0.9 m/s and rides
+    it 50 mm up. Creeping does not reduce the *distance* the object is shoved;
+    it reduces the error the servo builds while shoving it, because the object
+    now has time to move at the jaw's own speed. At the creep rate the standing
+    error is one step's travel, 0.11 mm of gap, and the stored spring is
+    0.02 mJ -- 340x less.
+
+    **What it actually bought, in sim** (``runs/fix_takes`` on the rented box,
+    one attempt each, the same draw as the filmed previews):
+
+    * the 40 mm puck went from riding the hand with an empty jaw to *briefly
+      held*: 6 consecutive steps of the full success predicate, against 0
+      before. Still short of the 30 the predicate wants, and still
+      ``not_in_hand``.
+    * the cylinder's failure changed shape rather than going away. It no longer
+      topples at the first touch; it leans and slides out of the pads over
+      ~20 mm instead. That is the part the energy model does not cover: a
+      one-sided push at a 40 mm contact height needs 0.29 N to tip a 30 mm
+      cylinder and 0.64 N to slide it, so the tip is what happens *at any
+      speed*, and a cylinder tilted even 3 deg is wider than the gap and gets
+      levered out as the jaws keep closing. The creep buys time, not stability.
+
+    So the creep stays because it is the right shape for the mechanism it was
+    measured against and it is scoped to the two objects that need it -- but
+    the thing that would actually seat these two is a closure with **no shove
+    at all** (the object against the static pad before the jaws move), which is
+    a plan change, not a ramp change.
+
+    Args:
+        entry: Jaw angle CLOSE was entered at, radians.
+        target: The object's close target, radians.
+        step: Steps completed in CLOSE (1 on the first command).
+        spec: Object being grasped; supplies the contact angle and whether to
+            creep at all. None means the plain ramp.
+        config: Tunables; the CLOSE ramp length is read from it.
+
+    Returns:
+        The ``gripper`` joint target for this step, radians.
+    """
+    span = max(1, config.ramp_steps(CLOSE, spec))
+    if spec is None or not spec.close_creep:
+        return entry + min(1.0, step / span) * (target - entry)
+    hand_over = spec.contact_angle_rad + CLOSE_CREEP_LEAD_RAD
+    if hand_over <= target:  # nothing to creep through
+        return entry + min(1.0, step / span) * (target - entry)
+    fast_steps = max(1, math.ceil(span * (entry - hand_over) / (entry - target)))
+    if step <= fast_steps:
+        return entry + (step / fast_steps) * (hand_over - entry)
+    crept = hand_over - CLOSE_CREEP_RATE_RAD * (step - fast_steps)
+    return max(target, crept)
+
+
+def close_steps(spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CONFIG) -> int:
+    """Steps :func:`close_command` needs to reach the close target for `spec`.
+
+    The ramp length for an ordinary object; the fast leg plus the creep for one
+    that creeps (:data:`CLOSE_CREEP_RATE_RAD`). This is what CLOSE's own budget
+    has to cover, so it is worth reading rather than assuming.
+    """
+    span = max(1, config.ramp_steps(CLOSE, spec))
+    if spec is None or not spec.close_creep:
+        return span
+    entry = config.gripper_open
+    hand_over = spec.contact_angle_rad + CLOSE_CREEP_LEAD_RAD
+    if hand_over <= spec.close_target_rad:
+        return span
+    fast_steps = max(1, math.ceil(span * (entry - hand_over) / (entry - spec.close_target_rad)))
+    return fast_steps + math.ceil((hand_over - spec.close_target_rad) / CLOSE_CREEP_RATE_RAD)
+
+
+def state_budget(
+    state: str, spec: ObjectSpec | None = None, config: ExpertConfig = DEFAULT_CONFIG
+) -> int:
+    """Step ceiling for `state`: :attr:`~ExpertConfig.state_budget`, or the creep.
+
+    The budget exists so a wedged attempt cannot hang the generator, so it has
+    to be longer than the state's own commanded length -- and a creeping CLOSE
+    (:func:`close_steps`) is longer than the tuned ramp the 240 was written for:
+    the puck's is 218 steps, and a jaw stalled on the object still needs its
+    stall window on top. Only a creeping object's CLOSE is extended; every other
+    state of every other object answers the configured number unchanged, so a
+    test or a sweep that pins the budget down still gets exactly what it asked
+    for.
+    """
+    if state == CLOSE and spec is not None and spec.close_creep:
+        return max(
+            config.state_budget,
+            close_steps(spec, config) + 2 * config.gripper_stall_window,
+        )
+    return config.state_budget
+
+
 def converge_tol(spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CONFIG) -> float:
     """Arm convergence tolerance for `spec`, radians.
+
+    A **side** grasp answers :attr:`~ExpertConfig.side_converge_tol` flat: its
+    residual is spent out of the hand's table clearance rather than off the
+    pads' centreline, so the bar is derived from the clearance and does not
+    scale with the object's width (:data:`SIDE_CONVERGE_TOL`). Everything below
+    is the top-down rule.
 
     :attr:`~ExpertConfig.converge_tol` scaled by the object's grasp width
     against the width it was tuned at
@@ -392,6 +651,8 @@ def converge_tol(spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CONFIG)
     """
     if spec is None:
         return config.converge_tol
+    if is_side_grasp(spec):
+        return config.side_converge_tol
     return config.converge_tol * min(1.0, spec.grasp_width_m / objects.REFERENCE_WIDTH_M)
 
 
@@ -560,35 +821,71 @@ See :func:`grasp_height`; this is the CLOSE-time sibling of the approach-time
 clearance :func:`pregrasp_height` keeps with :data:`JAW_TIP_Z`.
 """
 
-SIDE_JAW_DEPTH: float = 0.0242
+SIDE_JAW_DEPTH: float = 0.0278
 """How far below the tool axis the hand's lowest material hangs at a level side
 grasp, metres. **Measured off the meshes** (``tests/test_expert_logic.py``
 re-derives it): the top-down :func:`jaw_depth`'s counterpart, and the thing that
 sets how low a side grasp can be taken.
 
-With the tool horizontal and the jaws level, "down" is the tool frame's +Y (at
-:data:`SIDE_GRASP_ROLL`, where +Y points world *down*), so what decides the
-table clearance is the hand's *half-width*, not its fingertips. And the fingers
-are not the widest part of it: across the whole closing sweep the fingers
-themselves stay inside +/-11.7 mm of the tool axis, while the wrist_roll
-follower's housing -- 50 to 100 mm back along the approach, i.e. between the
-object and the base -- reaches 27.8 mm on one side and 24.2 mm on the other.
+With the tool horizontal and the jaws level, "down" is the tool frame's -Y (at
+:data:`SIDE_GRASP_ROLL`, where +Y points world *up*), so what decides the table
+clearance is the hand's *half-width*, not its fingertips. And the fingers are
+not the widest part of it: across the whole closing sweep the fingers themselves
+stay inside +/-11.7 mm of the tool axis (:data:`SIDE_PAD_HALF_REACH`), while the
+wrist_roll follower's housing -- 50 to 100 mm back along the approach, i.e.
+between the object and the base -- reaches 27.8 mm on one side and 24.2 mm on
+the other. (The gripper servo body is the next widest at 20.5 mm and never
+decides it.)
 
-That asymmetry is why :data:`SIDE_GRASP_ROLL` is pi rather than 0. The two are
-the same level grasp with the fingers swapped, but they put opposite sides of
-the housing down, and 3.6 mm is the difference between a 30 mm cup grasp
-clearing the table by 5.8 mm and clearing it by 2.2 mm. (The gripper servo body
-is the next widest at 20.5 mm and never decides it.)"""
+This is the **27.8 mm side**, because :data:`SIDE_GRASP_ROLL` is now chosen by
+the camera rather than by the table: the roll that puts the shallower 24.2 mm
+side down is the roll that buries the wrist camera under the table. The 3.6 mm
+that costs is bought back three times over by :func:`grasp_height`, which takes
+a side grasp at the cup height rather than at the object's mid-height."""
 
-SIDE_GRASP_ROLL: float = math.pi
+SIDE_JAW_DEPTH_SHALLOW: float = 0.0242
+"""The hand's *other* half-width about the tool axis, metres. **Measured.**
+
+Kept because it is the number the roll choice was originally made on, and
+because it is what the discarded branch would have been worth: 3.6 mm more table
+clearance at the same grasp height, in exchange for an upside-down wrist camera
+25 mm below the table (see :data:`SIDE_GRASP_ROLL`)."""
+
+SIDE_PAD_HALF_REACH: float = 0.0117
+"""Half-height of the hand's finger envelope about the tool axis, metres.
+**Measured off the meshes**: everything forward of 50 mm behind the TCP stays
+inside this of the tool axis over the whole closing sweep.
+
+Turned on its side this is a *vertical* extent, and it is what stops
+:func:`grasp_height` taking a side grasp arbitrarily high up a standing object:
+the pads have to stay on the body, so the grasp cannot go closer than this to
+the top of it."""
+
+SIDE_GRASP_ROLL: float = 0.0
 """Tool roll a side grasp is planned at, radians -- see
 :func:`manus.kinematics.tool_roll_of`.
 
-Level, so the jaws close horizontally across the object the way a hand closes
-on a cup. Both level rolls (0 and pi) are the same physical grasp with the
-fingers swapped and both are inside wrist_roll's travel at every pan, so the
-choice is free -- and it is spent on table clearance: see
-:data:`SIDE_JAW_DEPTH`. At pi the tool's +Y points world **down**."""
+Level, so the jaws close horizontally across the object the way a hand closes on
+a cup. Both level rolls (0 and pi) are the same physical grasp with the fingers
+swapped, and both are inside wrist_roll's travel at every pan, so the choice is
+free of the arm -- but it is **not** free of the camera, which is bolted to the
+gripper link 55 mm off the tool axis and rides the roll with everything else:
+
+* at ``0`` the camera stands 55 mm **above** the tool axis (95 mm above the
+  table at the cup grasp), looks 33 deg **down** at the object, and its image up
+  axis has world-z ``+0.842`` -- upright,
+* at ``pi`` the same camera hangs 55 mm **below** the tool axis, which at any
+  side grasp height the arm can reach puts it *underneath the table*: at the
+  filmed 30 mm grasp it sat 25 mm below the ground plane, looking 33 deg **up**,
+  image up axis world-z ``-0.842``. The recorded POV was the underside of the
+  ground plane with the object showing through it (measured, and visible in
+  ``runs/object_previews/cylinder_3cm_0000.mp4``).
+
+So the roll is spent on the camera. What it costs is table clearance -- pi puts
+the hand's shallower side down (:data:`SIDE_JAW_DEPTH_SHALLOW`), 0 puts the
+deeper one down, a 3.6 mm difference -- and :func:`grasp_height` pays it by
+taking the grasp at the cup height instead of the object's mid-height, which is
+worth 10 mm on the catalogue's cylinder. At 0 the tool's +Y points world **up**."""
 
 SIDE_AZIMUTH_PASSES: int = 3
 """Fixed-point passes closing a side plan's approach azimuth (:func:`plan_grasp`).
@@ -691,25 +988,76 @@ def side_body_behind_tcp(spec: ObjectSpec) -> float:
     return 0.5 * spec.grasp_width_m - TCP_TO_PAD_CENTRE
 
 
+SIDE_GRASP_HEIGHT_FRACTION: float = 2.0 / 3.0
+"""Fraction of a standing object's height a side grasp aims for.
+
+The cup grasp, and it is above the middle for three reasons that all point the
+same way -- the same reasons a hand takes a cup of water above its waist:
+
+* **the table.** The hand hangs :data:`SIDE_JAW_DEPTH` below the tool axis, so
+  every millimetre of grasp height is a millimetre of table clearance, and the
+  clearance is what the whole side approach is spent out of (:data:`CONVERGE_TOL`
+  and the droop the arm carries into ADVANCE both cash out here).
+* **the lift.** Gripped above its centre of mass the object hangs from the pads
+  and the retraction's ~30 deg of tilt swings it; gripped below, the same tilt
+  levers it out.
+* **the closing jaw.** A horizontal push lands a topple moment about the
+  object's base contact; taken high the object is already held on both sides
+  before that matters, and the pads' own band (:data:`SIDE_PAD_HALF_REACH`) is
+  what has to stay on the body.
+
+Two thirds is the highest simple fraction that keeps the whole pad band on a
+60 mm cylinder with room to spare, and it lands the catalogue's side grasp at
+40 mm: 12.2 mm of table clearance where the old mid-height grasp had 5.8 mm and
+lost the hand into the table on 7.4 mm of droop."""
+
+
+def side_table_clearance(spec: ObjectSpec) -> float:
+    """Gap between the hand's lowest material and the table at `spec`'s side grasp.
+
+    ``grasp_height - SIDE_JAW_DEPTH``, metres: the budget every vertical error in
+    a side approach is spent out of -- the droop the arm has not yet cancelled,
+    and the convergence bar that decides how much of it is allowed to survive
+    into CLOSE (:data:`SIDE_CONVERGE_TOL`).
+    """
+    return grasp_height(spec) - SIDE_JAW_DEPTH
+
+
 def grasp_height(spec: ObjectSpec) -> float:
     """Height above the table the jaw pads centre on for `spec`, metres.
 
-    **Side grasps** take the object at its own mid-height -- the pads centre on
-    the tool axis, which is horizontal, so there is no
+    **Side grasps** are taken at the *cup height*,
+    :data:`SIDE_GRASP_HEIGHT_FRACTION` of the way up the standing object -- the
+    pads centre on the tool axis, which is horizontal, so there is no
     :data:`~manus.kinematics.TCP_TO_PAD_CENTRE` in the vertical any more and the
-    TCP simply sits at this height. One bar can raise it: the hand's own housing
-    hangs :data:`SIDE_JAW_DEPTH` below the tool axis and has to clear the table
-    by :func:`tip_clearance`, so nothing can be side-grasped below 29.2 mm. The
-    60 mm cylinder's 30 mm mid-height clears it by 0.8 mm, which is the whole
-    reason the catalogue's side object is the tall one.
+    TCP simply sits at this height. Two bars bracket it:
+
+    * **the table**, which raises: the hand's own housing hangs
+      :data:`SIDE_JAW_DEPTH` below the tool axis and has to clear the table by
+      :func:`tip_clearance`, so nothing can be side-grasped below 32.8 mm.
+    * **the object's top**, which lowers: the fingers reach
+      :data:`SIDE_PAD_HALF_REACH` above the tool axis, so a grasp closer than
+      that to the top of the object hangs half the pad band off it.
+
+    The 60 mm cylinder's cup height is 40 mm, which clears the first by 7.2 mm
+    and the second by 8.3 mm. Its old mid-height grasp cleared the table by
+    0.8 mm of *plan* and by nothing at all in the sim: 7.4 mm of un-cancelled
+    droop at ADVANCE put the housing on the table with the TCP 22.6 mm up
+    instead of 30, and the fingertip then swept the cylinder's base inward
+    through CLOSE (``runs/object_previews/cylinder_3cm_0000.mp4``, and the
+    ADVANCE report in its ``_demo.json``).
 
     **Top-down grasps** take the object at its own mid-height, which puts the
     pads across the widest part of it -- raised, whichever of two bars binds,
     and both of them are raises:
 
     * **too short**: until the fingertips clear the table by
-      :func:`tip_clearance`. Only the 10 mm puck is short enough to feel it,
-      and it is raised 2.3 mm.
+      :func:`tip_clearance`. The 10 mm puck is the only object short enough to
+      feel the 5 mm default, and it is raised 2.3 mm -- but the clearance is
+      per-object, so this is also the bar an object can be *given* to move its
+      grasp deliberately: the 20 mm puck asks for 11.76 mm of it, which raises
+      it 4.1 mm off its own centre and out of the band where the closing
+      finger's deepest sweep reaches under its centre of mass.
     * **too tall**: until the object's top is no further above the TCP than
       :data:`JAW_PARALLEL_REACH`, so the closing jaw meets the object at its
       *pads* rather than leaning into its upper body first. Only the 60 mm
@@ -722,7 +1070,9 @@ def grasp_height(spec: ObjectSpec) -> float:
     answer is the highest of the three.
     """
     if is_side_grasp(spec):
-        return max(spec.spawn_z, SIDE_JAW_DEPTH + tip_clearance(spec))
+        floor = SIDE_JAW_DEPTH + tip_clearance(spec)
+        ceiling = spec.top_z - SIDE_PAD_HALF_REACH
+        return max(floor, min(SIDE_GRASP_HEIGHT_FRACTION * spec.top_z, ceiling))
     lowest_centre = JAW_TIP_Z - TCP_TO_PAD_CENTRE + tip_clearance(spec)
     closing_centre = spec.top_z - TCP_TO_PAD_CENTRE - JAW_PARALLEL_REACH
     return max(spec.spawn_z, lowest_centre, closing_centre)
@@ -1451,23 +1801,39 @@ class ScriptedGraspExpert:
         span = max(1, self.config.ramp_steps(self._state, self.spec))
         return min(1.0, self._state_step / span)
 
+    def _may_exit(self) -> bool:
+        """Whether the current state has finished commanding *and* settling.
+
+        The dwell is zero everywhere except a side grasp's approach states, and
+        the commanded length is the state's ramp everywhere except a creeping
+        CLOSE (:func:`close_steps`) -- so for a top-down catalogue object this
+        is exactly ``self._ramp() >= 1.0``, the condition the FSM has always
+        used. CLOSE has to wait out its whole creep before a stall may end it,
+        or the squeeze the object is held with would be whatever the creep had
+        reached rather than the commanded target.
+        """
+        if self._state == CLOSE:
+            return self._state_step >= close_steps(self.spec, self.config)
+        span = max(1, self.config.ramp_steps(self._state, self.spec))
+        return self._state_step >= span + settle_steps(self._state, self.spec, self.config)
+
     def _exit_reason(self, arm: np.ndarray) -> str | None:
         """Why the current state should end now, or None to stay in it."""
         if self._state == DONE:
             return None
-        budget_spent = self._state_step >= self.config.state_budget
+        budget_spent = self._state_step >= state_budget(self._state, self.spec, self.config)
         if self._state == HOLD:
             return "elapsed" if self._state_step >= self.config.hold_steps else None
         if self._state in ARM_STATES:
             waypoint = self.plan.waypoint(self._state)
             converged = float(np.abs(arm - waypoint).max()) < converge_tol(self.spec, self.config)
-            if self._ramp() >= 1.0 and converged:
+            if self._may_exit() and converged:
                 return "converged"
             return "timeout" if budget_spent else None
         # CLOSE: the jaws stop moving once they are squeezing the object (or
         # each other) -- a position proxy for effort saturation, since the
         # implicit actuator's applied torque is not part of the contract here.
-        if self._ramp() >= 1.0 and self._gripper_stalled():
+        if self._may_exit() and self._gripper_stalled():
             return "stalled"
         return "timeout" if budget_spent else None
 
@@ -1504,8 +1870,12 @@ class ScriptedGraspExpert:
         elif self._state in APPROACH_STATES:
             gripper_command = config.gripper_open
         elif self._state == CLOSE:
-            gripper_command = self._entry_gripper + alpha * (
-                self.plan.close_target - self._entry_gripper
+            gripper_command = close_command(
+                self._entry_gripper,
+                self.plan.close_target,
+                self._state_step + 1,
+                self.spec,
+                config,
             )
         else:  # LIFT, HOLD, DONE -- keep squeezing
             gripper_command = self.plan.close_target
@@ -1565,7 +1935,9 @@ class ScriptedGraspExpert:
             "lift_rise": plan.lift_rise,
             "close_target": plan.close_target,
             "approach_ramp": self.config.ramp_steps(approach_state(self.spec), self.spec),
+            "approach_settle": settle_steps(approach_state(self.spec), self.spec, self.config),
             "close_ramp": self.config.ramp_steps(CLOSE, self.spec),
+            "close_steps": close_steps(self.spec, self.config),
             "converge_tol": converge_tol(self.spec, self.config),
             "grasp_height": grasp_height(self.spec),
             "state": self._state,

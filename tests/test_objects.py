@@ -298,7 +298,11 @@ def test_the_default_sweep_leaves_the_experimental_objects_out_but_keeps_them_ru
     the default "every object" list drops it.
     """
     assert set(DEFAULT_OBJECTS) < set(OBJECTS)
-    assert [name for name in OBJECTS if name not in DEFAULT_OBJECTS] == ["puck_d40x10"]
+    assert [name for name in OBJECTS if name not in DEFAULT_OBJECTS] == [
+        "cylinder_3cm",  # CLOSE-time seating-shove failure; side approach itself is proven
+        "puck_d40x10",  # pads can only reach a ~3 mm sliver of rim
+        "puck_d40x20",  # CLOSE-time seating-shove failure (same mechanism as the cylinder)
+    ]
     assert DEFAULT_OBJECTS == tuple(
         name for name, spec in OBJECTS.items() if not spec.experimental
     )

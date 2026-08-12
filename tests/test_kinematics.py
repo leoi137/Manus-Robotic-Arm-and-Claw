@@ -660,11 +660,24 @@ SIDE_REGION = kinematics.SIDE_GRASP_REGION
 HORIZONTAL = kinematics.TOOL_HORIZONTAL
 VERTICAL = kinematics.TOOL_VERTICAL
 
-SIDE_TCP_Z = 0.030
-"""TCP height the side grasps below are solved at: the cylinder's own mid-height."""
+SIDE_TCP_Z = 0.040
+"""TCP height the side grasps below are solved at: the cylinder's cup height.
+
+:func:`manus.expert.grasp_height` takes a side grasp two thirds of the way up
+the object, and the region's radial edges are re-derived at that height rather
+than at the object's waist -- standing the hand higher unfolds the shoulder,
+which is worth a few millimetres of reach at both ends."""
 
 SIDE_RETRACT = 0.040
 """Radial stand-off the side pregrasp sits at, metres (ExpertConfig.side_retract)."""
+
+SIDE_ROLL = 0.0
+"""Tool roll the side grasps below are solved at (manus.expert.SIDE_GRASP_ROLL).
+
+Level, and the branch that keeps the wrist camera above the table. The radial
+edges come out the same either way -- the roll turns the hand about the approach
+axis, which is a lateral question, not a reach one -- so this is here to be the
+roll the planner actually uses rather than because the numbers depend on it."""
 
 
 def _horizontal_configs(count: int = 200, seed: int = 3) -> list[np.ndarray]:
@@ -1024,7 +1037,7 @@ def _side_margin_deg(radius: float, azimuth_deg: float = 0.0) -> float | None:
         target = np.array(
             [pan_x + reach * np.cos(azimuth), pan_y + reach * np.sin(azimuth), SIDE_TCP_Z]
         )
-        q, converged = kinematics.ik_solve(target, np.pi, family=HORIZONTAL)
+        q, converged = kinematics.ik_solve(target, SIDE_ROLL, family=HORIZONTAL)
         if not converged:
             return None
         worst = min(worst, float(np.min(np.minimum(q - ARM_LOWER, ARM_UPPER - q))))
@@ -1032,21 +1045,26 @@ def _side_margin_deg(radius: float, azimuth_deg: float = 0.0) -> float | None:
 
 
 def test_the_side_regions_inner_edge_is_the_wrist_flex_stop():
-    """Where 0.358 m comes from: a hand's length of reach the arm has to fold back.
+    """Where 0.352 m comes from: a hand's length of reach the arm has to fold back.
 
     Just inside the region the binding joint is wrist_flex, hard against its
     -95 deg stop, and the plan dies a couple of centimetres further in. The
     committed inner radius keeps >= 10 deg on every joint -- the same order as
     GRASP_REGION's own inner edge (11.8 deg, measured below).
+
+    The edge moved in 6 mm when the side grasp was raised to the cup height
+    (:data:`SIDE_TCP_Z`), which is the only thing that moved it: at the old
+    30 mm the same sweep put the stop at 0.332 m and the 10 deg line at 0.358.
     """
-    assert _side_margin_deg(0.328) is None, "the region reaches further in than measured"
-    assert _side_margin_deg(0.332) == pytest.approx(0.0, abs=0.1), "the stop moved"
+    assert _side_margin_deg(0.322) is None, "the region reaches further in than measured"
+    assert _side_margin_deg(0.326) == pytest.approx(0.0, abs=0.1), "the stop moved"
     assert _side_margin_deg(SIDE_REGION.radius[0]) > 10.0
+    assert _side_margin_deg(SIDE_REGION.radius[0] - 0.002) < 10.0, "the edge is not tight"
     # ... and it is wrist_flex that runs out, not something else.
     pan_x, _ = SIDE_REGION.pan_axis_xy
-    reach = 0.334 - kinematics.TCP_TO_PAD_CENTRE - SIDE_RETRACT
+    reach = 0.328 - kinematics.TCP_TO_PAD_CENTRE - SIDE_RETRACT
     q, converged = kinematics.ik_solve(
-        np.array([pan_x + reach, 0.0, SIDE_TCP_Z]), np.pi, family=HORIZONTAL
+        np.array([pan_x + reach, 0.0, SIDE_TCP_Z]), SIDE_ROLL, family=HORIZONTAL
     )
     assert converged
     tightest = int(np.argmin(np.minimum(q - ARM_LOWER, ARM_UPPER - q)))
@@ -1055,16 +1073,16 @@ def test_the_side_regions_inner_edge_is_the_wrist_flex_stop():
 
 
 def test_the_side_regions_outer_edge_keeps_reach_in_hand_not_joint_angle():
-    """Where 0.420 m comes from, and why it is not a joint-margin bound.
+    """Where 0.422 m comes from, and why it is not a joint-margin bound.
 
     Near full extension the joint margins stay comfortable right up to the
-    cliff, so they are the wrong measure: the plan still has 9 deg on every
+    cliff, so they are the wrong measure: the plan still has 10 deg on every
     joint two millimetres before it stops solving at all. The committed outer
     radius keeps 10 mm of *radius* in hand instead.
     """
-    assert _side_margin_deg(0.428) > 9.0, "the margin measure is not saturating after all"
-    assert _side_margin_deg(0.432) is None
-    assert SIDE_REGION.radius[1] <= 0.430 - 0.010
+    assert _side_margin_deg(0.432) > 9.0, "the margin measure is not saturating after all"
+    assert _side_margin_deg(0.434) is None
+    assert SIDE_REGION.radius[1] <= 0.434 - 0.010
 
 
 def test_the_top_regions_edges_carry_the_margin_the_side_regions_inner_edge_copies():

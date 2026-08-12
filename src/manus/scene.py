@@ -24,18 +24,20 @@ from manus.robot import SO101_CFG
 # a flat sibling of the articulation root.
 _GRIPPER_LINK_PATH = "{ENV_REGEX_NS}/Robot/Geometry/" + "/".join(specs.LINK_CHAIN)
 
-WRIST_CAM_WIDTH = 640
+WRIST_CAM_WIDTH = specs.WRIST_CAM_WIDTH
 """Wrist camera image width in pixels (the real UVC module's native mode)."""
 
-WRIST_CAM_HEIGHT = 480
+WRIST_CAM_HEIGHT = specs.WRIST_CAM_HEIGHT
 """Wrist camera image height in pixels."""
 
 # Horizontal aperture and focal length share USD's tenth-of-a-world-unit scale,
 # so only their ratio matters: hFOV = 2*atan(aperture / (2*focal)). Solving for
 # the module's 77.3 deg hFOV at the stock 20.955 aperture gives
 # focal = 20.955 / (2 * tan(77.3 deg / 2)) = 13.10, which reads back as 77.31 deg.
-_WRIST_CAM_APERTURE = 20.955
-_WRIST_CAM_FOCAL = 13.10
+# Both live in manus.specs with the rest of the mount, so what the camera sees
+# at a planned pose can be worked out without an Isaac app.
+_WRIST_CAM_APERTURE = specs.WRIST_CAM_APERTURE
+_WRIST_CAM_FOCAL = specs.WRIST_CAM_FOCAL
 
 
 @configclass
@@ -64,6 +66,10 @@ class SoArmSceneCfg(InteractiveSceneCfg):
     # (0, -0.5396, -0.8419) in gripper-link coordinates -- the jaws close along
     # the link's -Z and their tips sit at z = -0.101 m, so the camera looks
     # just past the fingertips into the grasp region ~67 mm away.
+    #
+    # The mount itself lives in :mod:`manus.specs` so the same numbers are
+    # readable without an Isaac app -- :func:`manus.kinematics.wrist_camera_pose`
+    # is what a plan's POV is checked with.
     wrist_cam: CameraCfg = CameraCfg(
         prim_path=f"{_GRIPPER_LINK_PATH}/wrist_cam",
         update_period=0.0,  # seconds; 0 = re-render whenever .data is read
@@ -71,9 +77,9 @@ class SoArmSceneCfg(InteractiveSceneCfg):
         height=WRIST_CAM_HEIGHT,
         data_types=["rgb"],
         offset=CameraCfg.OffsetCfg(
-            pos=(0.0, 0.055, -0.045),  # metres, gripper_link frame
-            rot=(-0.2811575, 0.0, 0.0, 0.9596617),  # (x, y, z, w)
-            convention="opengl",
+            pos=specs.WRIST_CAM_POS,  # metres, gripper_link frame
+            rot=specs.WRIST_CAM_QUAT_XYZW,  # (x, y, z, w)
+            convention=specs.WRIST_CAM_CONVENTION,
         ),
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=_WRIST_CAM_FOCAL,

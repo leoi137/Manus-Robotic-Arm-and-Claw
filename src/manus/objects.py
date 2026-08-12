@@ -267,6 +267,12 @@ class ObjectSpec:
             the grasp, metres, overriding :data:`manus.expert.MIN_TIP_CLEARANCE`.
             Only bites on an object too short to centre the pads on, i.e. the
             puck; None uses the default.
+        close_creep: Whether CLOSE creeps through this object's contact band
+            instead of ramping straight through it
+            (:func:`manus.expert.close_command`). Off by default, and off for
+            every object the tuned ramp already grasps -- it is for the two the
+            *shove* destabilises: an object the closing jaw can topple (the
+            standing cylinder) or squirt out of the hand (the 40 mm puck).
         experimental: Whether this object is known not to grasp reliably. It
             stays in :data:`OBJECTS` and can be run by name, but it is left out
             of :data:`DEFAULT_OBJECTS`, so a sweep over "every object" does not
@@ -301,6 +307,7 @@ class ObjectSpec:
     height: float | None = None
     close_ramp: int | None = None
     tip_clearance_m: float | None = None
+    close_creep: bool = False
     experimental: bool = False
     grasp_mode: GraspMode = "top"
 
@@ -483,9 +490,25 @@ OBJECTS: dict[str, ObjectSpec] = {
     # nothing about the object is "above the TCP" any more -- only its own
     # radius, 11 mm of it, is, well inside the parallel band.
     #
-    # Its height is what makes it the side case rather than the puck: at a
-    # 30 mm grasp the hand's own housing clears the table by 5.8 mm
-    # (manus.expert.SIDE_JAW_DEPTH), which nothing shorter would allow.
+    # STILL NOT GRASPED, as of the Step 24 takes -- read this before sweeping it
+    # into a dataset. What Step 24 fixed is the *approach* and the *camera*: the
+    # hand now arrives 0.97 mm from its waypoint instead of 7.9 mm, keeps 11 mm
+    # of table clearance where it used to stand on the table, and the wrist
+    # camera is above the table looking down at the object instead of buried
+    # under the ground plane (runs/object_previews/cylinder_3cm_fixed*.png).
+    # CLOSE still loses it: a one-sided push at a 40 mm contact height tips a
+    # 30 mm cylinder before it slides (0.29 N against 0.64 N), and a cylinder
+    # tilted even 3 deg is wider than the closing gap, so the jaws lever it out.
+    # See manus.expert.close_command.
+    #
+    # Its height is what makes it the side case rather than the puck: the hand's
+    # own housing hangs 27.8 mm below the tool axis (manus.expert.SIDE_JAW_DEPTH),
+    # so a side grasp is only defined on something tall enough to be taken well
+    # above that. This one is taken at its *cup* height, 40 mm -- two thirds of
+    # the way up, above its centre of mass, 12.2 mm of table clearance -- which
+    # is what the first filmed attempt showed was needed: taken at its 30 mm
+    # mid-height the housing had 5.8 mm of clearance and 7.4 mm of un-cancelled
+    # gravity droop put it on the table.
     "cylinder_3cm": ObjectSpec(
         name="cylinder_3cm",
         shape="cylinder",
@@ -497,6 +520,8 @@ OBJECTS: dict[str, ObjectSpec] = {
         close_target_rad=close_target_for_width(0.03),
         yaw_symmetry="free",
         grasp_mode="side",
+        close_creep=True,
+        experimental=True,  # fails at CLOSE: seating-shove energy dump (see fix-crew notes)
     ),
     # A 16 mm acrylic die (~1200 kg/m^3): the smallest thing in the catalogue,
     # and the object the arm's own convergence residual is worst for -- 5.9 mm
@@ -572,12 +597,43 @@ OBJECTS: dict[str, ObjectSpec] = {
     #
     # A 20 mm rim is tall enough for grasp_height to centre the pads on it
     # (the fingertips end up 7.7 mm off the table, past MIN_TIP_CLEARANCE with
-    # 2.7 mm to spare), so the grasp is its own mid-height and the pads cover
-    # 12.3 mm of the rim. The 10 mm puck cannot be centred at all: raised until
-    # the tips clear, its pads reach only the top 5.0 mm, and the closing finger
-    # -- still descending 16 mm per radian when it arrives -- meets the top edge
-    # first and drags the whole thing down and in. At 20 mm the same finger
-    # arrives on the rim's flat, below its top edge.
+    # 2.7 mm to spare), so the pads cover 12.3 mm of the rim. The 10 mm puck
+    # cannot be centred at all: raised until the tips clear, its pads reach only
+    # the top 5.0 mm, and the closing finger -- still descending 16 mm per
+    # radian when it arrives -- meets the top edge first and drags the whole
+    # thing down and in.
+    #
+    # STILL NOT GRASPED, as of the Step 24 takes -- read this before sweeping it
+    # into a dataset. Four filmed attempts on the rented box (runs/fix_takes)
+    # all end ``not_in_hand``: the puck leaves the pads during CLOSE and rides
+    # the hand up. The two changes below are measured improvements to that, not
+    # a fix -- the best of them holds the full success predicate for 6
+    # consecutive steps against the 30 it needs, where the Step 23 preview held
+    # 0 (``runs/object_previews/puck_d40x20_fixed.mp4``).
+    #
+    # THE GRASP IS RAISED 4.1 mm OFF ITS OWN CENTRE, and tip_clearance_m is how,
+    # because the bar is this object's alone. Centred, the Step 23 preview was
+    # the same ``not_in_hand``: the puck climbed the closing finger and rode it
+    # 50 mm up with the arm frozen (``runs/object_previews/puck_d40x20_0000.mp4``,
+    # CLOSE steps 76-86; the jaws then ran to their commanded 0.188 rad on an
+    # empty hand). What lets it climb is where the hand pinches a 40 mm wall: at
+    # the 0.327 rad contact angle the moving finger's face is 18.7 deg off the
+    # static pad, so the two meet in a *ridge* 3 mm above the TCP rather than
+    # over a face, and the moving finger's own deepest sweep (8.06 mm below the
+    # TCP, i.e. 4.1 mm below the puck's centre of mass at the centred grasp)
+    # reaches under that centre and levers the rim up.
+    #
+    # 11.76 mm of tip clearance is the height at which that deepest sweep lands
+    # exactly *at* the 10 mm centre of mass -- grasp 14.1 mm, TCP 18.1 mm --
+    # and it is bounded on the other side by the pads: at that height they still
+    # hold 8.2 mm of rim, past the 8 mm bar the 20 mm respec was chosen for.
+    # Nothing else in the catalogue can feel this knob (see
+    # manus.expert.tip_clearance). Filmed against the centred grasp it is worth
+    # 6 held steps to 4, which is the whole of its evidence.
+    #
+    # close_creep is the other half: see manus.expert.close_command for the
+    # 6.7 mJ the servo stores while shoving this puck across JAW_CLEARANCE, and
+    # for what creeping through that shove did and did not buy.
     "puck_d40x20": ObjectSpec(
         name="puck_d40x20",
         shape="cylinder",
@@ -588,6 +644,9 @@ OBJECTS: dict[str, ObjectSpec] = {
         spawn_z=0.010,
         close_target_rad=close_target_for_width(0.040),
         yaw_symmetry="free",
+        tip_clearance_m=0.01176,
+        close_creep=True,
+        experimental=True,  # fails at CLOSE: seating-shove energy dump (see fix-crew notes)
     ),
     # A regulation ping-pong ball: 40 mm, 2.7 g, hollow (~80 kg/m^3). Kept at
     # its real mass deliberately -- it is the catalogue's slip-and-roll case,

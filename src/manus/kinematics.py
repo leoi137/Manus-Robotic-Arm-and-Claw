@@ -460,6 +460,27 @@ class KinematicChain:
         """
         return tool_roll_of(self.fk_tcp(q)[1])
 
+    def wrist_camera_pose(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Pose of the wrist POV camera at `q`: ``(position, rotation)``.
+
+        The mount (:data:`manus.specs.WRIST_CAM_POS` /
+        :data:`~manus.specs.WRIST_CAM_QUAT_XYZW`) carried through the FK of its
+        parent link, so where the camera actually ends up in the world is a
+        property of a *plan* and can be checked without an Isaac app.
+
+        The rotation is in the camera's own convention
+        (:data:`manus.specs.WRIST_CAM_CONVENTION`, i.e. OpenGL's), so its
+        columns are the image's **right**, the image's **up**, and *minus* the
+        view direction. Three things a POV waypoint has to get right read
+        straight off it: ``position[2] > 0`` (the camera is above the table
+        rather than buried under it), ``-rotation[2, 2] < 0`` (it looks down at
+        the work rather than up at the sky) and the sign of ``rotation[2, 1]``
+        (which way up the image is).
+        """
+        position, rotation = self.fk(q)[specs.WRIST_CAM_PARENT_LINK]
+        mount = rotation_from_quat_xyzw(np.array(specs.WRIST_CAM_QUAT_XYZW))
+        return position + rotation @ np.array(specs.WRIST_CAM_POS), rotation @ mount
+
     def approach_azimuth(self, q: np.ndarray) -> float:
         """World azimuth of the tool's approach axis (+Z), radians.
 
@@ -559,27 +580,42 @@ SIDE_GRASP_REGION = GraspRegion(
     # azimuth (tests/test_kinematics.py re-derives them):
     #
     #   inner  the hand is TCP_TO_WRIST_HORIZONTAL long, so reaching closer in
-    #          means folding the forearm further back, and at r = 0.332 m the
-    #          pregrasp sits exactly on wrist_flex's -95 deg stop. 0.358 is the
+    #          means folding the forearm further back, and at r = 0.326 m the
+    #          pregrasp sits exactly on wrist_flex's -95 deg stop. 0.352 is the
     #          first millimetre with >= 10 deg of travel left on every joint at
     #          both waypoints -- the same order of margin GRASP_REGION's own
     #          edges carry (11.8 deg inner, 11.6 deg outer, measured).
-    #   outer  the arm runs out of reach at 0.430 m, and it runs out *fast*:
+    #   outer  the arm runs out of reach at 0.434 m, and it runs out *fast*:
     #          near full extension the joint-margin measure is useless (still
-    #          9.6 deg at 0.428, infeasible at 0.430), so this edge is a reach
+    #          11 deg at 0.432, infeasible at 0.434), so this edge is a reach
     #          margin instead -- 10 mm of radius in hand before the plan stops
     #          solving at all.
+    #
+    # Both edges moved out ~6 mm and ~2 mm when the side grasp was **raised**
+    # to the cup height (manus.expert.grasp_height: 30 -> 40 mm of TCP height,
+    # which is what buys the hand its table clearance): standing the hand higher
+    # unfolds the shoulder a little, which is worth reach at both ends. The band
+    # is re-derived at the height it is actually used at rather than kept at the
+    # old one, since a placement sampler that draws outside it draws attempts
+    # the planner cannot serve.
     #
     # The band does not overlap GRASP_REGION at all, and that is the point: a
     # side grasp stands the whole hand out along the table instead of hanging
     # it down, which is worth ~160 mm of reach.
-    radius=(0.358, 0.420),
+    radius=(0.352, 0.422),
     # The same cap as GRASP_REGION, and for the same reason -- shoulder_pan's
     # +/-110 deg minus what the tool's lateral stand-off costs. The stand-off is
     # the same 17 mm but the radius is twice as big, so it costs half as much
-    # (2.4 deg); the measured edge dies between 108.6 and 110 deg. Sharing the
-    # number leaves 3.4 deg rather than the top-down region's ~2, and keeps one
+    # (2.4 deg); the measured edge dies between 108 and 110 deg. Sharing the
+    # number leaves 3.6 deg rather than the top-down region's ~2, and keeps one
     # azimuth convention across both modes.
+    #
+    # The stand-off points to whichever side of the object the *static* jaw is
+    # on, so flipping manus.expert.SIDE_GRASP_ROLL mirrors which end of the
+    # sector is the tight one -- 3.6 deg of pan left at +105 deg and 6.4 at
+    # -105 at the level roll the pipeline plans at, the mirror image of the
+    # other branch's 3.7/6.3 (measured, tests/test_kinematics.py). The cap is
+    # symmetric because the region is, and it is the tighter end that sets it.
     azimuth_max_deg=105.0,
     # Carried over unchanged and never reached: the innermost point of this
     # annulus that is inside the keep-out's x band sits at |y| = 0.34 m, three
