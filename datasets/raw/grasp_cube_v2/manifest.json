@@ -1,0 +1,331 @@
+{
+  "manifest_version": 1,
+  "dataset_name": "grasp_cube_v2",
+  "dataset_id": "f6578292089a557e49084f8e15475dce2ca7e185fda34dda90eebf99464d05a9",
+  "counts": {
+    "attempts": 1000,
+    "successes": 1000,
+    "failures": 0,
+    "frames": 198070
+  },
+  "success_rate": 1.0,
+  "val_split_modulus": 20,
+  "val_episode_indices": [
+    0,
+    20,
+    40,
+    60,
+    80,
+    100,
+    120,
+    140,
+    160,
+    180,
+    200,
+    220,
+    240,
+    260,
+    280,
+    300,
+    320,
+    340,
+    360,
+    380,
+    400,
+    420,
+    440,
+    460,
+    480,
+    500,
+    520,
+    540,
+    560,
+    580,
+    600,
+    620,
+    640,
+    660,
+    680,
+    700,
+    720,
+    740,
+    760,
+    780,
+    800,
+    820,
+    840,
+    860,
+    880,
+    900,
+    920,
+    940,
+    960,
+    980
+  ],
+  "temporal": {
+    "control_hz": 30,
+    "physics_dt": 0.008333333333333333,
+    "decimation": 4,
+    "contract": "action[t] is the joint target written before the step whose resulting state is joint_pos[t+1]"
+  },
+  "env": {
+    "objects": [
+      "cube_3cm"
+    ],
+    "python": "3.12.3",
+    "numpy": "2.3.1",
+    "torch": "2.10.0+cu128",
+    "torch_cuda": "12.8",
+    "isaacsim": "6.0.1",
+    "isaaclab": "6.1.17",
+    "gpu": "NVIDIA GeForce RTX 5080",
+    "driver": "590.48.01",
+    "device": "cuda:0",
+    "physics_dt": 0.008333333333333333,
+    "control_hz": 30,
+    "decimation": 4,
+    "renders_per_control_step": 1,
+    "solver": {
+      "simulation": {
+        "device": "cuda:0",
+        "dt": 0.008333333333333333,
+        "gravity": [
+          0.0,
+          0.0,
+          -9.81
+        ],
+        "physics_prim_path": "/physicsScene",
+        "use_fabric": true,
+        "render_interval": 1,
+        "enable_scene_query_support": false,
+        "use_newton_actuators": false,
+        "create_stage_in_memory": false,
+        "logging_level": "WARNING",
+        "save_logs_to_file": true,
+        "log_dir": null,
+        "visualizer_cfgs": []
+      },
+      "physics": {
+        "class_type": "isaaclab_physx.physics.physx_manager:PhysxManager",
+        "solver_type": 1,
+        "solve_articulation_contact_last": false,
+        "min_position_iteration_count": 1,
+        "max_position_iteration_count": 255,
+        "min_velocity_iteration_count": 0,
+        "max_velocity_iteration_count": 255,
+        "enable_scene_query_support": false,
+        "enable_ccd": false,
+        "enable_stabilization": false,
+        "enable_external_forces_every_iteration": false,
+        "enable_enhanced_determinism": false,
+        "bounce_threshold_velocity": 0.5,
+        "friction_offset_threshold": 0.04,
+        "friction_correlation_distance": 0.025,
+        "gpu_max_rigid_contact_count": 8388608,
+        "gpu_max_rigid_patch_count": 163840,
+        "gpu_found_lost_pairs_capacity": 2097152,
+        "gpu_found_lost_aggregate_pairs_capacity": 33554432,
+        "gpu_total_aggregate_pairs_capacity": 2097152,
+        "gpu_collision_stack_size": 67108864,
+        "gpu_heap_capacity": 67108864,
+        "gpu_temp_buffer_capacity": 16777216,
+        "gpu_max_num_partitions": 8,
+        "gpu_max_soft_body_contacts": 1048576,
+        "gpu_max_particle_contacts": 1048576
+      },
+      "object_rigid_body": {
+        "rigid_body_enabled": null,
+        "kinematic_enabled": null,
+        "disable_gravity": false,
+        "linear_damping": null,
+        "angular_damping": null,
+        "max_linear_velocity": null,
+        "max_angular_velocity": null,
+        "max_depenetration_velocity": 1.0,
+        "max_contact_impulse": null,
+        "enable_gyroscopic_forces": null,
+        "retain_accelerations": null,
+        "solver_position_iteration_count": 16,
+        "solver_velocity_iteration_count": 1,
+        "sleep_threshold": null,
+        "stabilization_threshold": null,
+        "_usd_applied_schema": "PhysxRigidBodyAPI",
+        "_usd_namespace": "physxRigidBody"
+      }
+    },
+    "actuator": {
+      "kp": 17.8,
+      "damping": 0.6,
+      "effort_limit": 3.35,
+      "velocity_limit": 5.5
+    },
+    "camera": {
+      "native_hw": [
+        480,
+        640
+      ],
+      "recorded_hw": [
+        240,
+        320
+      ],
+      "resample": "PIL LANCZOS",
+      "jpeg_quality": 92
+    },
+    "expert": {
+      "hover_height": 0.03,
+      "hover_margin": 0.008,
+      "pregrasp_height": 0.049,
+      "converge_tol": 0.02,
+      "close_ramp": 60,
+      "close_target_rad": 0.04999999999999999,
+      "hold_steps": 45,
+      "lift_rise": 0.09,
+      "droop_gain": 0.12,
+      "tcp_to_pad_centre": 0.004,
+      "jaw_clearance": 0.002
+    },
+    "success_predicate": {
+      "lift_m": 0.05,
+      "sustain_steps": 30,
+      "gripper_held_max_rad": 1.0,
+      "statement": "object centre >= spawn_z + 0.05 m for 30 consecutive control steps with the jaws at or below 1.0 rad"
+    }
+  },
+  "git": {
+    "sha": "91a7499cfa10da2ad3d380099543791b33353549",
+    "dirty": true
+  },
+  "created": "2026-08-12T08:34:15Z",
+  "droop": {
+    "definition": "action[t] - joint_pos[t+1], radians (commanded minus measured)",
+    "episodes": 1000,
+    "steps": 197070,
+    "joints": [
+      "shoulder_pan",
+      "shoulder_lift",
+      "elbow_flex",
+      "wrist_flex",
+      "wrist_roll",
+      "gripper"
+    ],
+    "mean_abs_rad": [
+      0.003967968115701969,
+      0.023164682750103728,
+      0.019886058429321753,
+      0.005228410833506012,
+      0.003926676917864089,
+      0.05472648590356554
+    ],
+    "mean_signed_rad": [
+      -0.0002740794113396733,
+      -0.023032187193690663,
+      -0.019709996521330098,
+      0.0009972315388433693,
+      -0.0015433239687189556,
+      -0.04635468774096664
+    ],
+    "max_abs_rad": [
+      0.051512569189071655,
+      0.050069143529981375,
+      0.04052937030792236,
+      0.04494810104370117,
+      0.05956491827964783,
+      0.19725802168250084
+    ],
+    "worst_joint": "gripper"
+  },
+  "generation": {
+    "last_chunk": {
+      "attempts": 224,
+      "frames": 44366,
+      "wall_clock_s": 2324.041457414627,
+      "seconds_per_attempt": 10.37518507774387,
+      "render": {
+        "native_hw": [
+          480,
+          640
+        ],
+        "rendered_steps": 45710,
+        "plain_steps": 138474,
+        "rendered_step_s": 0.006198784668757302,
+        "plain_step_s": 0.006127471739350471,
+        "capture_s": 0.022783300202247152,
+        "captures": 44590,
+        "probe": null
+      },
+      "finished": "2026-08-12T08:34:15Z"
+    },
+    "totals": {
+      "boots": 5,
+      "attempts": 986,
+      "wall_clock_s": 10923.771624565125
+    }
+  },
+  "verify_result": {
+    "verifier_version": 1,
+    "stage": "raw",
+    "passed": true,
+    "checked_at": "2026-08-12T08:39:14Z",
+    "numpy": {
+      "running": "2.3.1",
+      "recorded": "2.3.1"
+    },
+    "checks": [
+      {
+        "name": "ledger_has_successes",
+        "passed": true,
+        "detail": "1000 success rows"
+      },
+      {
+        "name": "episode_loads",
+        "passed": true,
+        "detail": "1000 episodes"
+      },
+      {
+        "name": "array_lengths_agree",
+        "passed": true,
+        "detail": "1000 episodes"
+      },
+      {
+        "name": "arrays_finite",
+        "passed": true,
+        "detail": "1000 episodes"
+      },
+      {
+        "name": "timestamps_monotone",
+        "passed": true,
+        "detail": "1000 episodes"
+      },
+      {
+        "name": "timestep_matches_control_hz",
+        "passed": true,
+        "detail": "1000 episodes"
+      },
+      {
+        "name": "frame_count_in_range",
+        "passed": true,
+        "detail": "1000 episodes"
+      },
+      {
+        "name": "no_stalled_frames",
+        "passed": true,
+        "detail": "1000 episodes"
+      },
+      {
+        "name": "frame_statistics_informative",
+        "passed": true,
+        "detail": "1000 episodes"
+      },
+      {
+        "name": "dataset_id_recomputes",
+        "passed": true,
+        "detail": "f6578292089a from disk vs f6578292089a in the manifest"
+      },
+      {
+        "name": "manifest_counts_match",
+        "passed": true,
+        "detail": "{'attempts': 1000, 'successes': 1000, 'failures': 0, 'frames': 198070} from disk vs {'attempts': 1000, 'successes': 1000, 'failures': 0, 'frames': 198070} in the manifest"
+      }
+    ]
+  }
+}
