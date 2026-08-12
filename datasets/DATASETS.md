@@ -8,5 +8,6 @@ Do not edit by hand — regenerate it.
 | `grasp_cube_v2` | cube_3cm | 1000 | 1000 | 198070 | 100.0% | — | `f6578292089a` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_cube_v2.gif) |
 | `grasp_die_v2` | die_16mm | 1050 | 1000 | 296102 | 95.2% | — | `0d1fb55fcdce` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_die_v2.gif) |
 | `grasp_domino_v2` | domino_20x40 | 1000 | 1000 | 244437 | 100.0% | — | `30771db8b374` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_domino_v2.gif) |
+| `grasp_duplo_v2` | duplo_32x64 | 1001 | 1000 | 241636 | 99.9% | — | `4ca437e0808a` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_duplo_v2.gif) |
 
 `Git` is the commit the dataset was generated at; a trailing `*` marks a dirty tree.
