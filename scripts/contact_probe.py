@@ -10,6 +10,17 @@ turns that claim into a measurement: it drives one scripted grasp to HOLD and
 prints, per jaw, every contact PhysX generated -- position in the TCP frame,
 normal, force, and separation -- next to where the *visual* pad face is.
 
+**Step 25 addition -- ``--scan``.** The two sample points above are both taken
+*after* the jaws have stopped, which cannot answer the other question the
+colliders raise: where does contact *begin*. A puck take showed the object
+starting to move at a 58 mm jaw gap when the meshes put the pads on its 40 mm
+body, ~17 mm early, which is either a collider that is effectively bigger than
+the mesh it was cooked from or a contact that carries no force. So ``--scan``
+samples every control step of the named states (SEAT and CLOSE by default) and
+separates three onsets that the earlier reading could not: the first contact
+PhysX *reports*, the first one that carries *force*, and the first step the
+object actually *moves*. See :func:`first_contacts`.
+
 Run it once before applying ``scripts/fix_jaw_collision.py`` and once after.
 The number to watch is ``contact x`` in the TCP frame for the fixed jaw:
 
@@ -115,6 +126,31 @@ parser.add_argument(
     default=5,
     help="how many control steps of HOLD to sample contacts over",
 )
+parser.add_argument(
+    "--scan",
+    default="SEAT,CLOSE",
+    help=(
+        "comma-separated states to sample contacts on *every* control step of, "
+        "or '' to skip. This is what answers 'where does PhysX put first "
+        "contact': the close-exit sample only ever sees the end of the story"
+    ),
+)
+parser.add_argument(
+    "--contact-force-n",
+    type=float,
+    default=1e-3,
+    help=(
+        "force above which a reported contact counts as a *loaded* one. PhysX "
+        "reports pairs inside the contact offset with zero force and positive "
+        "separation; only the loaded ones move the object"
+    ),
+)
+parser.add_argument(
+    "--disturbance-mm",
+    type=float,
+    default=0.2,
+    help="object displacement that counts as the jaws having disturbed it",
+)
 parser.add_argument("--no-video", action="store_true", help="skip the HOLD wrist frame")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -146,7 +182,12 @@ from manus.expert import (
     ScriptedGraspExpert,
     classify_outcome,
 )
-from manus.objects import OBJECTS
+from manus.objects import (
+    JAW_WIDTH_PER_RAD,
+    MEASURED_STALL_30MM_RAD,
+    OBJECTS,
+    REFERENCE_WIDTH_M,
+)
 from manus.randomize import draw_episode
 from manus.robot import SO101_CFG
 from manus.task_scene import DEFAULT_OBJECT_POS, GraspSceneCfg, apply_randomization
@@ -244,6 +285,23 @@ class ProbeSceneCfg(GraspSceneCfg):
     )
 
 
+SCAN_STATES: tuple[str, ...] = tuple(
+    part.strip().upper() for part in args_cli.scan.split(",") if part.strip()
+)
+"""States sampled on every control step; see ``--scan``."""
+
+
+def jaw_gap(angle: float) -> float:
+    """Opening between the pads at `angle`, metres -- the catalogue's own fit.
+
+    The exact inverse of :func:`~manus.objects.contact_angle_for_width`, so that
+    "the meshes say first contact at ``grasp_width``" is true by construction and
+    a measured first-contact gap can be compared against the object's width
+    directly, in millimetres, with no second fit in the way.
+    """
+    return REFERENCE_WIDTH_M + (angle - MEASURED_STALL_30MM_RAD) * JAW_WIDTH_PER_RAD
+
+
 @dataclass
 class Contact:
     """One PhysX contact, already moved into the TCP frame."""
@@ -290,14 +348,29 @@ class ContactProbe:
             )
         self.body_index = names.index(body)
         self.body_names = names
+        self.error: str | None = None
 
     def read(self, tcp_pos: torch.Tensor, tcp_quat: torch.Tensor) -> list[Contact]:
         """Every contact this jaw currently has with the filtered object.
+
+        Never raises: a scan calls this several hundred times, and a contact
+        buffer that has moved in some future Isaac Lab is not a reason to lose
+        the grasp the run is also measuring. The first failure is reported once,
+        in :attr:`error`, and every call after it returns nothing.
 
         Args:
             tcp_pos: TCP world position, shape (1, 3).
             tcp_quat: TCP world orientation (x, y, z, w), shape (1, 4).
         """
+        try:
+            return self._read(tcp_pos, tcp_quat)
+        except Exception as failure:  # pragma: no cover - diagnostic path
+            if self.error is None:
+                self.error = f"{type(failure).__name__}: {failure}"
+                print(f"  WARNING: {self.jaw} jaw contact read failed: {self.error}")
+            return []
+
+    def _read(self, tcp_pos: torch.Tensor, tcp_quat: torch.Tensor) -> list[Contact]:
         view = self.sensor.contact_view
         forces, points, normals, separations, counts, starts = view.get_contact_data(dt=self.dt)
         forces = _numpy(forces).reshape(-1)
@@ -374,10 +447,20 @@ class ProbeRunner:
             dtype=torch.float32,
             device=self.device,
         )
-        self.probes = [
-            ContactProbe(scene["fixed_jaw_contact"], "fixed", FIXED_JAW_BODY, self.dt),
-            ContactProbe(scene["moving_jaw_contact"], "moving", MOVING_JAW_BODY, self.dt),
-        ]
+        # Tolerant, because this script measures two things and only one of them
+        # needs the sensors: a contact plumbing failure must not also cost the
+        # grasp attempt it is riding on, which is a take on a shared GPU.
+        self.probes: list[ContactProbe] = []
+        self.probe_errors: dict[str, str] = {}
+        for jaw, key, body in (
+            ("fixed", "fixed_jaw_contact", FIXED_JAW_BODY),
+            ("moving", "moving_jaw_contact", MOVING_JAW_BODY),
+        ):
+            try:
+                self.probes.append(ContactProbe(scene[key], jaw, body, self.dt))
+            except Exception as failure:
+                self.probe_errors[jaw] = f"{type(failure).__name__}: {failure}"
+                print(f"  WARNING: {jaw} jaw contact sensor unavailable: {failure}")
 
     # -- plumbing ---------------------------------------------------------------
 
@@ -408,6 +491,16 @@ class ProbeRunner:
 
     def object_z(self) -> float:
         return float(self.object_pos()[2])
+
+    def object_tilt_deg(self) -> float:
+        """Angle between the object's own +z and world +z, degrees.
+
+        What the cylinder's failure *is*: a one-sided push tips it before it
+        slides, and a cylinder tilted even 3 deg is wider than the closing gap
+        and gets levered out. Read off the body quaternion (w, x, y, z).
+        """
+        w, x, y, z = (float(v) for v in self.object.data.root_link_quat_w.torch[0])
+        return math.degrees(math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * (x * x + y * y)))))
 
     def advance(self, render: bool) -> None:
         self.sim.step(render=render)
@@ -449,6 +542,54 @@ class ProbeRunner:
             "aggregates": aggregates,
         }
 
+    def scan_row(self, state: str, step: int) -> dict:
+        """One compact per-step row: the jaw angle, both jaws' contacts, the object.
+
+        Deliberately small -- a scan runs for every control step of CLOSE, which
+        on a creeping object is 200+ of them, and the interesting quantity is
+        per-jaw *aggregate* (how many contacts, how hard, how close) rather than
+        every contact's position. The first row that shows contact keeps its
+        contacts in full; see :func:`first_contacts`.
+        """
+        tcp_pos, tcp_quat = self.tcp_frame()
+        gripper = float(self.measured()[specs.JOINT_NAMES.index("gripper")])
+        row: dict = {
+            "state": state,
+            "step": step,
+            "gripper_rad": gripper,
+            "jaw_gap_mm": 1e3 * jaw_gap(gripper),
+            "object_pos_m": [float(v) for v in self.object_pos()],
+            "jaws": {},
+        }
+        for probe in self.probes:
+            contacts = probe.read(tcp_pos, tcp_quat)
+            loaded = [c for c in contacts if c.force > args_cli.contact_force_n]
+            row["jaws"][probe.jaw] = {
+                "contacts": len(contacts),
+                "loaded": len(loaded),
+                "force_n": sum(c.force for c in contacts),
+                "min_separation_mm": (
+                    min(1e3 * c.separation for c in contacts) if contacts else None
+                ),
+                "max_separation_mm": (
+                    max(1e3 * c.separation for c in contacts) if contacts else None
+                ),
+                "x_mm": (
+                    [min(1e3 * c.position[0] for c in contacts),
+                     max(1e3 * c.position[0] for c in contacts)]
+                    if contacts
+                    else None
+                ),
+                "z_mm": (
+                    [min(1e3 * c.position[2] for c in contacts),
+                     max(1e3 * c.position[2] for c in contacts)]
+                    if contacts
+                    else None
+                ),
+                "detail": [c.to_dict() for c in contacts] if contacts else [],
+            }
+        return row
+
     # -- one probe run -----------------------------------------------------------
 
     def run(self, draw) -> dict:
@@ -464,12 +605,16 @@ class ProbeRunner:
         )
 
         samples: list[dict] = []
+        scan: list[dict] = []
+        motion: dict[str, dict] = {}
         seen = expert.state
         hold_seen = 0
         frame = None
+        rest = self.object_pos()
         for _ in range(MAX_CONTROL_STEPS):
             if expert.done:
                 break
+            state, state_step = expert.state, expert.state_step
             targets = expert.step(measured)
             command = torch.tensor(
                 [[targets[name] for name in specs.JOINT_NAMES]],
@@ -481,7 +626,30 @@ class ProbeRunner:
             for _ in range(DECIMATION):
                 self.advance(render=False)
             measured = self.measured()
-            monitor.update(self.object_pos(), measured)
+            position = self.object_pos()
+            monitor.update(position, measured)
+            if state in SCAN_STATES:
+                scan.append(self.scan_row(state, state_step))
+
+            record = motion.setdefault(
+                state,
+                {
+                    "start": [float(v) for v in position],
+                    "start_tilt_deg": self.object_tilt_deg(),
+                    "max_dxy_mm": 0.0,
+                    "max_rise_mm": 0.0,
+                    "max_tilt_deg": 0.0,
+                },
+            )
+            delta = position - np.asarray(record["start"], dtype=float)
+            record["max_dxy_mm"] = max(
+                record["max_dxy_mm"], 1e3 * float(np.hypot(delta[0], delta[1]))
+            )
+            record["max_rise_mm"] = max(record["max_rise_mm"], 1e3 * float(delta[2]))
+            record["max_tilt_deg"] = max(
+                record["max_tilt_deg"],
+                abs(self.object_tilt_deg() - record["start_tilt_deg"]),
+            )
 
             if expert.state != seen:
                 report = expert.reports[-1]
@@ -509,14 +677,219 @@ class ProbeRunner:
                     )
 
         outcome = classify_outcome(expert, monitor)
+        print(
+            f"\n  {outcome.upper()}  held {monitor.best_streak}/{monitor.sustain}  "
+            f"peak z {monitor.peak_z * 1e3:.1f} mm (bar {monitor.threshold_z * 1e3:.1f})  "
+            f"stall {monitor.gripper:.3f} rad in band "
+            f"[{monitor.stall_band[0]:.3f}, {monitor.stall_band[1]:.3f}]  "
+            f"steps {expert.total_steps}"
+            + (f"  timeouts {expert.timeouts}" if expert.timeouts else "")
+        )
+        for state, record in motion.items():
+            print(
+                f"    {state:<9} object dxy {record['max_dxy_mm']:6.2f} mm  "
+                f"rise {record['max_rise_mm']:7.2f} mm  "
+                f"tilt {record['max_tilt_deg']:6.2f} deg"
+            )
         return {
             "label": args_cli.label,
+            "object": self.spec.name,
             "outcome": outcome,
             "success": bool(monitor.success),
+            "rest_z": float(rest[2]),
             "draw": draw.to_dict(),
+            "monitor": monitor.to_dict(),
+            "object_motion": motion,
+            "telemetry": expert.telemetry(),
             "samples": samples,
+            "scan": scan,
             "frame": frame,
         }
+
+
+def first_contacts(scan: list[dict], spec) -> dict:
+    """Where the jaws first touch, per jaw, against what the meshes predict.
+
+    Three onsets, and the gap between them is the whole question this run was
+    booted to answer:
+
+    ``reported``
+        the first step PhysX hands back *any* contact for the pair. PhysX
+        generates contact pairs for everything inside the shapes' contact
+        offset, and those come back with a **positive separation and no force**
+        -- geometry, not physics. A reported contact well before the meshes
+        touch is expected and means nothing on its own.
+    ``loaded``
+        the first step a contact carries force above ``--contact-force-n``.
+        *This* is the one that can move the object, and this is the one to
+        compare against the mesh: the pads reach the object's width at
+        ``contact_angle_for_width(width)``, so a loaded contact at a jaw gap
+        materially wider than the object's own width is the collider being
+        effectively bigger than the mesh it was cooked from.
+    ``disturbed``
+        the first step the object has moved ``--disturbance-mm`` from where it
+        stood when the scan began. If this leads *loaded*, whatever moved the
+        object was not the jaw touching it.
+    """
+    out: dict = {
+        "object_width_mm": 1e3 * spec.grasp_width_m,
+        "mesh_contact_angle_rad": spec.contact_angle_rad,
+        "mesh_contact_gap_mm": 1e3 * jaw_gap(spec.contact_angle_rad),
+        "force_threshold_n": args_cli.contact_force_n,
+        "jaws": {},
+    }
+    if not scan:
+        return out
+    origin = np.asarray(scan[0]["object_pos_m"], dtype=float)
+    for jaw in ("fixed", "moving"):
+        entry: dict = {}
+        for key, test in (
+            ("reported", lambda row: row["jaws"][jaw]["contacts"] > 0),
+            ("loaded", lambda row: row["jaws"][jaw]["loaded"] > 0),
+        ):
+            hit = next((row for row in scan if test(row)), None)
+            entry[key] = (
+                None
+                if hit is None
+                else {
+                    "state": hit["state"],
+                    "step": hit["step"],
+                    "gripper_rad": hit["gripper_rad"],
+                    "jaw_gap_mm": hit["jaw_gap_mm"],
+                    "lead_over_mesh_mm": hit["jaw_gap_mm"]
+                    - 1e3 * jaw_gap(spec.contact_angle_rad),
+                    "separation_mm": [
+                        hit["jaws"][jaw]["min_separation_mm"],
+                        hit["jaws"][jaw]["max_separation_mm"],
+                    ],
+                    "force_n": hit["jaws"][jaw]["force_n"],
+                    "x_mm": hit["jaws"][jaw]["x_mm"],
+                    "z_mm": hit["jaws"][jaw]["z_mm"],
+                    "contacts": hit["jaws"][jaw]["detail"],
+                }
+            )
+        out["jaws"][jaw] = entry
+    moved = next(
+        (
+            row
+            for row in scan
+            if 1e3 * float(np.linalg.norm(np.asarray(row["object_pos_m"]) - origin))
+            > args_cli.disturbance_mm
+        ),
+        None,
+    )
+    out["disturbed"] = (
+        None
+        if moved is None
+        else {
+            "state": moved["state"],
+            "step": moved["step"],
+            "gripper_rad": moved["gripper_rad"],
+            "jaw_gap_mm": moved["jaw_gap_mm"],
+            "lead_over_mesh_mm": moved["jaw_gap_mm"] - 1e3 * jaw_gap(spec.contact_angle_rad),
+        }
+    )
+    return out
+
+
+CONTACT_REPORT_SCHEMA = "PhysxContactReportAPI"
+"""Applied schema a prim needs before a :class:`ContactSensor` will accept it."""
+
+
+def ensure_contact_reporting(scene, paths: dict[str, str]) -> dict:
+    """Apply the contact-report API to the prims the sensors actually watch.
+
+    **This is why the shipped ``activate_contact_sensors=True`` is not enough on
+    this robot.** Isaac Lab's spawner does call
+    :func:`isaaclab.sim.schemas.activate_contact_sensors`, and that helper walks
+    the tree looking for rigid bodies -- but it stops descending the moment it
+    finds one, on the documented assumption that "nested rigid bodies are not
+    allowed by SDK". This asset *is* nested: the URDF->USD converter puts every
+    link inside its parent, so the eight rigid bodies form a chain from
+    ``base_link`` down to the two jaws (verified by opening the USD directly).
+    The helper therefore applies the API to ``base_link``, stops, and reports
+    success, and the sensor at ``gripper_link`` then fails initialisation with
+    "could not find any bodies with contact reporter API" -- from inside a
+    physics callback, during ``sim.reset()``, where it cannot be caught usefully.
+
+    So the API is applied here instead, by path, after the scene has spawned and
+    before the sensors initialise. Every prim is checked rather than assumed,
+    and what was found is returned so the run's json records it.
+    """
+    from pxr import Sdf, Usd, UsdPhysics
+
+    # The scene's own stage and its own env paths, not a global lookup helper:
+    # ``isaacsim.core.utils.stage`` does not exist in this Isaac Sim (6.0.1),
+    # and reaching for it cost a boot. :class:`InteractiveScene` carries both
+    # (``interactive_scene.py`` builds ``env_prim_paths`` at construction and
+    # holds ``stage``), so there is nothing to look up.
+    stage = scene.stage
+    root = str(scene.env_prim_paths[0])
+
+    found: dict[str, str] = {}
+    for name, template in paths.items():
+        path = template.replace("{ENV_REGEX_NS}", root)
+        prim: Usd.Prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid():
+            found[name] = f"MISSING {path}"
+            continue
+        if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            found[name] = f"NOT A RIGID BODY {path}"
+            continue
+        if CONTACT_REPORT_SCHEMA not in prim.GetAppliedSchemas():
+            prim.AddAppliedSchema(CONTACT_REPORT_SCHEMA)
+        attribute = prim.GetAttribute("physxContactReport:threshold")
+        if not attribute:
+            attribute = prim.CreateAttribute(
+                "physxContactReport:threshold", Sdf.ValueTypeNames.Float, False
+            )
+        attribute.Set(0.0)
+        found[name] = f"reporting {path}"
+    for name, state in found.items():
+        print(f"  contact reporting: {name:<10} {state}")
+    return found
+
+
+def collider_parameters(stage) -> dict:
+    """The collision attributes actually authored on the two jaws and the object.
+
+    Read off the live stage rather than off ``scripts/fix_jaw_collision.py``'s
+    intent, because the question a probe exists to settle is what PhysX is
+    using. ``contactOffset`` is the one that decides how early a *reported*
+    contact appears; the SDF attributes decide where the surface is.
+
+    Best effort: a missing attribute means "PhysX default", and any failure to
+    traverse the stage is reported rather than raised -- the contact numbers are
+    the run's real payload and are not worth losing to a USD schema change.
+    """
+    try:
+        from pxr import Usd
+
+        wanted = (
+            "physxCollision:contactOffset",
+            "physxCollision:restOffset",
+            "physics:approximation",
+            "physxSDFMeshCollision:sdfResolution",
+            "physxSDFMeshCollision:sdfSubgridResolution",
+            "physxSDFMeshCollision:sdfNarrowBandThickness",
+            "physxSDFMeshCollision:sdfMargin",
+        )
+        found: dict[str, dict] = {}
+        for prim in Usd.PrimRange(stage.GetPrimAtPath("/World")):
+            if not prim.HasAPI("PhysicsCollisionAPI") and not prim.GetAttribute(
+                "physics:collisionEnabled"
+            ):
+                continue
+            values = {
+                name: prim.GetAttribute(name).Get()
+                for name in wanted
+                if prim.HasAttribute(name)
+            }
+            if values:
+                found[str(prim.GetPath())] = values
+        return found or {"note": "no collision attributes authored; PhysX defaults apply"}
+    except Exception as error:  # pragma: no cover - diagnostic only
+        return {"error": f"{type(error).__name__}: {error}"}
 
 
 def report(samples: list[dict]) -> None:
@@ -565,6 +938,44 @@ def report(samples: list[dict]) -> None:
                 )
 
 
+def report_first_contacts(onsets: dict, colliders: dict, spec) -> None:
+    """Print the onset table: reported vs loaded vs disturbed, against the mesh."""
+    print(
+        f"\n  First contact, per jaw. {spec.name} is {onsets['object_width_mm']:.1f} mm "
+        f"across, so the meshes put the pads on it at "
+        f"{onsets['mesh_contact_angle_rad']:.3f} rad "
+        f"= {onsets['mesh_contact_gap_mm']:.1f} mm of jaw gap."
+    )
+    for jaw, entry in onsets.get("jaws", {}).items():
+        for kind in ("reported", "loaded"):
+            hit = entry.get(kind)
+            if hit is None:
+                print(f"    {jaw:<6} {kind:<8} never")
+                continue
+            separation = hit["separation_mm"]
+            print(
+                f"    {jaw:<6} {kind:<8} {hit['state']} step {hit['step']:3d}  "
+                f"grip {hit['gripper_rad']:.3f} rad  gap {hit['jaw_gap_mm']:6.2f} mm  "
+                f"({hit['lead_over_mesh_mm']:+.2f} mm vs mesh)  "
+                f"F {hit['force_n']:.4f} N  "
+                f"sep [{separation[0]:+.3f}, {separation[1]:+.3f}] mm  "
+                f"x {hit['x_mm']}  z {hit['z_mm']}"
+            )
+    moved = onsets.get("disturbed")
+    print(
+        "    object  disturbed never"
+        if moved is None
+        else (
+            f"    object  disturbed {moved['state']} step {moved['step']:3d}  "
+            f"grip {moved['gripper_rad']:.3f} rad  gap {moved['jaw_gap_mm']:6.2f} mm  "
+            f"({moved['lead_over_mesh_mm']:+.2f} mm vs mesh)"
+        )
+    )
+    print("\n  Collider parameters actually authored on the stage:")
+    for path, values in colliders.items():
+        print(f"    {path}: {values}")
+
+
 def main() -> int:
     spec = OBJECTS[args_cli.object]
     sim = sim_utils.SimulationContext(
@@ -573,13 +984,25 @@ def main() -> int:
     # Mirror task_scene.grasp_scene_cfg: the class body bakes cube_3cm, so the
     # requested object must be swapped in before the scene spawns.
     probe_cfg = ProbeSceneCfg(num_envs=1, env_spacing=2.0)
-    probe_cfg.object.spawn = spec.make_spawn_cfg()
+    # ``.replace`` rather than a bare spawn cfg: the class body's whole reason
+    # for existing is the contact-report flag, and building a fresh spawner here
+    # would drop it and leave the filtered pair unresolvable.
+    probe_cfg.object.spawn = spec.make_spawn_cfg().replace(activate_contact_sensors=True)
     probe_cfg.object.init_state.pos = (*probe_cfg.object.init_state.pos[:2], spec.spawn_z)
     scene = InteractiveScene(probe_cfg)
+    chain = "{ENV_REGEX_NS}/Robot/Geometry/" + "/".join(specs.LINK_CHAIN)
+    reporting = ensure_contact_reporting(
+        scene,
+        {
+            "fixed jaw": chain,
+            "moving jaw": f"{chain}/{MOVING_JAW_BODY}",
+            "object": "{ENV_REGEX_NS}/Object",
+        },
+    )
     sim.reset()
     runner = ProbeRunner(sim, scene, spec)
-    print(f"  fixed-jaw sensor bodies : {runner.probes[0].body_names}")
-    print(f"  moving-jaw sensor bodies: {runner.probes[1].body_names}")
+    for probe in runner.probes:
+        print(f"  {probe.jaw}-jaw sensor bodies: {probe.body_names}")
 
     draw = draw_episode(args_cli.namespace, args_cli.attempt, spec)
     if args_cli.pose is not None:
@@ -588,7 +1011,19 @@ def main() -> int:
 
     print(f"\n[{args_cli.label}] attempt {args_cli.attempt} of {args_cli.namespace!r}")
     result = runner.run(draw)
+    result["probe_errors"] = runner.probe_errors
+    result["contact_reporting"] = reporting
     report(result["samples"])
+    result["colliders"] = collider_parameters(scene.stage)
+    result["first_contacts"] = first_contacts(result["scan"], spec)
+    report_first_contacts(result["first_contacts"], result["colliders"], spec)
+    # Per-contact detail is kept only where it is evidence -- the onset rows,
+    # which first_contacts() has already copied. A creeping CLOSE scans 200+
+    # steps at up to --max-contacts each; carrying all of that would make the
+    # json tens of megabytes of duplicated positions.
+    for row in result["scan"]:
+        for jaw in row["jaws"].values():
+            jaw.pop("detail", None)
     print(f"\n  outcome: {result['outcome'].upper()}  success={result['success']}")
 
     out_dir = Path(args_cli.out_dir)
@@ -607,8 +1042,24 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # The traceback goes to a *file* before the app is closed, and that is not
+    # belt-and-braces: ``simulation_app.close()`` tears the process down hard
+    # enough that an exception unwinding through this ``finally`` never gets to
+    # print itself, and the run exits 0 with no output at all. Two boots of a
+    # shared GPU were spent learning that.
+    code = 1
     try:
         code = main()
+    except BaseException:  # noqa: BLE001 - re-raised after it has been recorded
+        import traceback
+
+        out_dir = Path(args_cli.out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{args_cli.label}_error.txt"
+        path.write_text(traceback.format_exc())
+        traceback.print_exc()
+        print(f"  FAILED: wrote {path}", flush=True)
+        code = 2
     finally:
         simulation_app.close()
     sys.exit(code)

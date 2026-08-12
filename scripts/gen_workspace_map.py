@@ -477,7 +477,10 @@ def write_report(done: dict[int, dict]) -> None:
         "droop bias [mrad] | exits |",
         "| --- | --- | --- | --- | --- | --- |",
     ]
-    for state in ("PREGRASP", "DESCEND", "CLOSE", "LIFT", "HOLD"):
+    # Every state any object can walk, in FSM order: the two approaches and the
+    # optional SEAT included, so a gate over a side-grasped or seating object
+    # does not silently drop the rows that decide whether it worked.
+    for state in ("PREGRASP", "DESCEND", "ADVANCE", "SEAT", "CLOSE", "LIFT", "HOLD"):
         steps = [
             report["steps"]
             for record in records

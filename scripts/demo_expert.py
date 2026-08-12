@@ -125,6 +125,21 @@ parser.add_argument(
     help="override the arm convergence tolerance in radians (tuning aid)",
 )
 parser.add_argument(
+    "--seat-gap",
+    type=float,
+    default=None,
+    help=(
+        "override the gap the SEAT state aims the static pad at, metres -- 0 is "
+        "kiss contact, and passing the jaw clearance itself disables the seat's "
+        "stroke entirely (tuning aid; only bites on a seat_close object)"
+    ),
+)
+parser.add_argument(
+    "--no-seat",
+    action="store_true",
+    help="run a seat_close object without its SEAT state, for an A/B against it",
+)
+parser.add_argument(
     "--close-ramp",
     type=int,
     default=None,
@@ -283,6 +298,18 @@ class AttemptRunner:
         """Object body-origin height above the ground plane, metres."""
         return float(self.object_pos()[2])
 
+    def object_tilt_deg(self) -> float:
+        """Angle between the object's own +z and world +z, degrees.
+
+        The measurement the cylinder's failure is *about* -- a one-sided push
+        tips it before it slides, and a cylinder tilted even 3 deg is wider than
+        the closing gap and gets levered out -- and the puck's too, since
+        climbing the moving finger shows up here first. Read off the body
+        quaternion rather than inferred from the height.
+        """
+        w, x, y, z = (float(v) for v in self.object.data.root_link_quat_w.torch[0])
+        return math.degrees(math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * (x * x + y * y)))))
+
     def advance(self, render: bool) -> None:
         """One physics step, refreshing only the buffers this script reads.
 
@@ -349,6 +376,10 @@ class AttemptRunner:
             )
 
         seen = expert.state
+        # Per-state object motion, which is what a seating failure is argued
+        # from: how far the object moved *while a state was running*, measured
+        # from where it stood when that state began.
+        motion: dict[str, dict[str, float | list[float]]] = {}
         for _ in range(MAX_CONTROL_STEPS):
             if expert.done:
                 break
@@ -363,7 +394,29 @@ class AttemptRunner:
             for substep in range(DECIMATION):
                 self.advance(render=record and substep == DECIMATION - 1)
             measured = self.measured()
-            monitor.update(self.object_pos(), measured)
+            position = self.object_pos()
+            monitor.update(position, measured)
+
+            record = motion.setdefault(
+                expert.state,
+                {
+                    "start": [float(v) for v in position],
+                    "start_tilt_deg": self.object_tilt_deg(),
+                    "max_dxy_mm": 0.0,
+                    "max_rise_mm": 0.0,
+                    "max_tilt_deg": 0.0,
+                },
+            )
+            delta = position - np.asarray(record["start"], dtype=float)
+            record["max_dxy_mm"] = max(
+                float(record["max_dxy_mm"]), 1e3 * float(math.hypot(delta[0], delta[1]))
+            )
+            record["max_rise_mm"] = max(float(record["max_rise_mm"]), 1e3 * float(delta[2]))
+            record["max_tilt_deg"] = max(
+                float(record["max_tilt_deg"]),
+                abs(self.object_tilt_deg() - float(record["start_tilt_deg"])),
+            )
+            record["end"] = [float(v) for v in position]
 
             if args_cli.trace and expert.total_steps % args_cli.trace == 0:
                 error = [targets[name] - value for name, value in zip(specs.JOINT_NAMES, measured)]
@@ -418,8 +471,20 @@ class AttemptRunner:
             "rest_z": rest_z,
             "monitor": monitor.to_dict(),
             "telemetry": expert.telemetry(),
+            "object_motion": motion,
         }
         if verbose:
+            print("    object motion, per state (from where it stood when the state began):")
+            for state, record in motion.items():
+                print(
+                    f"      {state:<9} dxy {float(record['max_dxy_mm']):6.2f} mm  "
+                    f"rise {float(record['max_rise_mm']):7.2f} mm  "
+                    f"tilt {float(record['max_tilt_deg']):6.2f} deg"
+                )
+            seat_exit = expert.telemetry().get("seat_exit")
+            if seat_exit is not None:
+                excess = expert.telemetry()["seat_excess"] or 0.0
+                print(f"    seat: exit {seat_exit}, tracking excess {excess * 1e3:.2f} mrad")
             print(
                 f"  -> {outcome.upper()}  peak z {monitor.peak_z * 1e3:.1f} mm "
                 f"(bar {monitor.threshold_z * 1e3:.1f})  held {monitor.best_streak}/"
@@ -503,6 +568,19 @@ def main() -> int:
     if args_cli.close_ramp is not None:
         config = dataclasses.replace(config, close_ramp=args_cli.close_ramp)
         print(f"OVERRIDE close_ramp = {config.close_ramp}")
+    if args_cli.no_seat:
+        # Per spec, like every other object property: the FSM reads seat_close
+        # off the spec, so clearing it is exactly "the run this object had
+        # before the seat existed" and nothing else changes.
+        spec = dataclasses.replace(spec, seat_close=False)
+        print("OVERRIDE seat_close = False (no SEAT state)")
+    if args_cli.seat_gap is not None:
+        config = dataclasses.replace(config, seat_gap=args_cli.seat_gap)
+        print(
+            f"OVERRIDE seat_gap = {config.seat_gap} -> stroke "
+            f"{expert_mod.seat_stroke(config) * 1e3:.2f} mm over "
+            f"{expert_mod.seat_ramp_steps(config)} steps"
+        )
 
     sim = sim_utils.SimulationContext(
         sim_utils.SimulationCfg(dt=PHYSICS_DT, device=args_cli.device)

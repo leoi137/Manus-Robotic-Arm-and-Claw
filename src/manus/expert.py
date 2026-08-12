@@ -25,6 +25,15 @@ States, in order -- :data:`STATE_SEQUENCE`:
     the TCP on the object -- see :func:`tcp_target` and :func:`grasp_height`.
     Also not the object's mid-height on anything too short or too tall for the
     hand's parallel band (:data:`JAW_PARALLEL_REACH`).
+``SEAT``
+    **Only for an object that asks for it** (:func:`seats`), between the
+    approach and CLOSE, and it is the one state that exists to stop the jaws
+    doing something rather than to move the arm somewhere new. The approach
+    deliberately leaves the object :data:`JAW_CLEARANCE` clear of the static
+    pad so the hand can get past it; SEAT closes that 2 mm with the *arm*, at
+    :data:`SEAT_CREEP_RATE_M`, jaws still wide, so the moving jaw finds the
+    object already against its stop. See :data:`SEAT_GAP_M` for why the arm can
+    be trusted to touch an object the jaw cannot.
 ``CLOSE``
     Arm frozen, jaws driven to ``spec.close_target_rad`` -- deliberately past
     contact, so the servo squeezes against its effort limit.
@@ -70,10 +79,14 @@ different plan rather than the same plan rotated:
     Everything still for :data:`ExpertConfig.hold_steps`, which is what the
     success predicate's "sustained" is measured over.
 
-CLOSE, LIFT and HOLD are shared verbatim: the jaws do not know which way the
-hand is pointing, and the lift is a pitch retraction either way -- it tips a
+SEAT, CLOSE, LIFT and HOLD are shared verbatim: the jaws do not know which way
+the hand is pointing, and the lift is a pitch retraction either way -- it tips a
 side-held cylinder as it raises it, which the squeeze holds against just as it
-holds against the ~30 deg the top-down lift already tilts through.
+holds against the ~30 deg the top-down lift already tilts through. SEAT is
+shared because it is defined in the *tool* frame too -- it always moves along
+the tool's own -x, which is a horizontal slide across the object's face in
+either mode (straight sideways when the tool is vertical, tangential when it is
+flat), never along the approach.
 
 Three behaviours are worth knowing before reading the code:
 
@@ -124,6 +137,16 @@ __all__ = [
     "CLOSE_CREEP_LEAD_RAD",
     "CLOSE_CREEP_RATE_RAD",
     "CONVERGE_TOL",
+    "FREEZE_STATES",
+    "JAWS_OPEN_STATES",
+    "SEAT",
+    "SEAT_CONTACT_REF_STEP",
+    "SEAT_CONTACT_STEPS",
+    "SEAT_CONTACT_TOL",
+    "SEAT_CONVERGE_TOL",
+    "SEAT_CREEP_RATE_M",
+    "SEAT_GAP_M",
+    "SEAT_SETTLE_STEPS",
     "SIDE_CONVERGE_TOL",
     "SIDE_SETTLE_STEPS",
     "SIDE_STATE_SEQUENCE",
@@ -146,6 +169,9 @@ __all__ = [
     "plan_grasp",
     "plan_lift",
     "pregrasp_height",
+    "seat_ramp_steps",
+    "seat_stroke",
+    "seats",
     "settle_steps",
     "side_body_behind_tcp",
     "state_budget",
@@ -190,6 +216,7 @@ ARM_UPPER: np.ndarray = np.array(
 PREGRASP = "PREGRASP"
 DESCEND = "DESCEND"
 ADVANCE = "ADVANCE"
+SEAT = "SEAT"
 CLOSE = "CLOSE"
 LIFT = "LIFT"
 HOLD = "HOLD"
@@ -198,8 +225,9 @@ DONE = "DONE"
 STATE_SEQUENCE: tuple[str, ...] = (PREGRASP, DESCEND, CLOSE, LIFT, HOLD, DONE)
 """Every state of a **top-down** grasp, in the order the FSM walks them.
 
-``DONE`` is terminal. See :data:`SIDE_STATE_SEQUENCE` for the side grasp's, and
-:func:`state_sequence` for the accessor that picks between them."""
+``DONE`` is terminal. See :data:`SIDE_STATE_SEQUENCE` for the side grasp's,
+:data:`SEAT` for the optional extra state an object can ask for, and
+:func:`state_sequence` for the accessor that assembles the right one."""
 
 SIDE_STATE_SEQUENCE: tuple[str, ...] = (PREGRASP, ADVANCE, CLOSE, LIFT, HOLD, DONE)
 """Every state of a **side** grasp: :data:`STATE_SEQUENCE` with DESCEND replaced.
@@ -211,11 +239,26 @@ flat hand *outward along the table* onto a standing object; DESCEND lowers it
 onto one lying under it. A policy reading the two as one state would be reading
 two different action distributions as one."""
 
-ARM_STATES: frozenset[str] = frozenset({PREGRASP, DESCEND, ADVANCE, LIFT})
+ARM_STATES: frozenset[str] = frozenset({PREGRASP, DESCEND, ADVANCE, SEAT, LIFT})
 """States that move the arm and therefore end on joint convergence."""
 
 APPROACH_STATES: frozenset[str] = frozenset({DESCEND, ADVANCE})
-"""The per-mode move onto the grasp pose: what CLOSE freezes the arm after."""
+"""The per-mode move onto the grasp pose. Where CLOSE freezes the arm unless the
+object asks for a :data:`SEAT` (:data:`FREEZE_STATES`)."""
+
+JAWS_OPEN_STATES: frozenset[str] = APPROACH_STATES | {SEAT}
+"""States that hold the jaws at :attr:`~ExpertConfig.gripper_open`.
+
+SEAT is one of them and that is the whole point of it: the *arm* closes the last
+two millimetres onto the static pad with the jaws still wide, so the object is
+already against its stop before the moving jaw is asked to travel at all."""
+
+FREEZE_STATES: frozenset[str] = APPROACH_STATES | {SEAT, LIFT}
+"""States whose last arm command is latched and held by the state after them.
+
+CLOSE holds whatever the arm last commanded, and with a SEAT in the sequence
+that has to be the *seated* pose rather than the approach's -- otherwise the
+2 mm the seat just closed would be handed straight back."""
 
 CONVERGE_TOL: float = 0.02
 """``max |measured - waypoint|`` (radians, arm joints) ending a move on a
@@ -284,6 +327,187 @@ Zero for the top-down family, deliberately: DESCEND's exit rule, and therefore
 every dataset already generated with it, is unchanged (:func:`settle_steps`).
 """
 
+# --- SEAT: closing the last two millimetres with the arm ----------------------
+# The measured mechanism this exists for is written up in close_command(): the
+# object is *not* against the static pad when the jaws start moving -- it stands
+# JAW_CLEARANCE (2 mm) clear of it by design, so the approach can pass the static
+# finger -- and the moving jaw has to shove it across that gap. While it shoves,
+# the commanded jaw runs on into the object and the position servo stores
+# 0.5 * kp * gap^2 / JAW_WIDTH_PER_RAD^2 = 6.7 mJ, which is dumped at capture.
+#
+# Creeping through the shove (CLOSE_CREEP_RATE_RAD) reduced the *energy* by 340x
+# and still lost both objects, because the energy was never the whole story: a
+# one-sided push of 0.29 N tips the standing cylinder at any speed, and 0.29 N
+# is only 0.086 mm of blocked jaw travel. There is no jaw speed at which a
+# one-sided push is gentle. The only closure that is gentle is one where the
+# push is *reacted by the static pad* from the first newton -- i.e. no gap.
+#
+# So the gap is closed by the arm instead, and the arm is a far weaker spring
+# than the jaw at the same displacement, which is what makes this safe. Both
+# stiffnesses are the same servo seen through different geometry -- kp divided
+# by the square of how far the thing being pushed moves per radian:
+#
+#   jaw   kp / JAW_WIDTH_PER_RAD^2 = 17.8 / 0.0727^2 = 3.4 N/mm, everywhere
+#   arm   kp / sum_i (d x_seat / d q_i)^2, swept over each object's own
+#         placement region (63 points each, tests/test_expert_logic.py):
+#           cylinder, seat tangential, shoulder_pan alone   0.10-0.15 N/mm
+#           puck, seat partly radial, three pitch joints    0.23-1.46 N/mm
+#                                                           (median 0.37)
+#
+# So the arm is 2-30x softer than the jaw at the same overshoot, and on the
+# object that actually topples -- the cylinder, at 0.29 N -- it is softer by 23x
+# and uniformly so: it takes 2.0-2.9 mm of arm overshoot to reach the force that
+# 0.09 mm of jaw overshoot reaches. The seat can therefore afford to be aimed
+# *at* the object and to arrive with the arm's own ~1 mm of residual, which the
+# jaw never could. The puck's stiffest corner is the one place that margin is
+# thin, and there SEAT_CONTACT_TOL is what carries it: what the watchdog bounds
+# is the *travel*, and 0.6 mm of it against a 40 mm disc that slides at 0.29 N
+# is a disc that slides half a millimetre -- towards the static pad it is being
+# seated against, which is where it was going anyway.
+
+SEAT_GAP_M: float = 0.0
+"""Gap the SEAT state aims the static pad at, metres. Zero: kiss contact.
+
+Zero rather than a small positive number because the residual is symmetric and
+the two sides of it cost very different things. The arm arrives within about a
+millimetre of any waypoint it converges on (measured: 0.97 mm of TCP error at
+the filmed ADVANCE exit), so aiming at zero lands somewhere in +/-1 mm:
+
+* on the *interference* side the pad presses the object with 0.1-1.5 N per
+  millimetre of overshoot depending on the object and where in the region it
+  sits -- and the :data:`SEAT_CONTACT_TOL` watchdog ends the state as soon as it
+  sees the arm being blocked, which caps the overshoot at 0.95 mm (measured, a
+  seat blocked dead at its first step) and so the press at 0.12 N on the
+  cylinder, against the 0.29 N that tips it;
+* on the *gap* side whatever is left is what the moving jaw still has to shove
+  the object across, and the stored spring goes as the square of it: 6.7 mJ at
+  the full 2 mm clearance, 1.7 mJ at 1 mm, 0.15 mJ at 0.3 mm.
+
+Aiming at a positive gap would trade the cheap side for the expensive one.
+"""
+
+SEAT_CREEP_RATE_M: float = 5e-5
+"""Tool speed through the seat, metres per control step -- 1.5 mm/s at 30 Hz.
+
+Set by what the arm's stiffness does to a *blocked* seat: at 0.1-0.3 N/mm the
+press grows 5-13 mN per step of blocked travel, so the
+:data:`SEAT_CONTACT_TOL` watchdog (0.68 mm of excess tracking error, plus
+:data:`SEAT_CONTACT_STEPS` of confirmation) fires around 0.1 N -- a third of the
+cylinder's tipping threshold -- and 13 steps is long enough for the reading to
+be a reading rather than one sample of noise. Half the jaw's own creep rate
+(:data:`CLOSE_CREEP_RATE_RAD` is 0.11 mm of gap per step), which is the right
+side to err on: this is the motion that is *meant* to touch.
+"""
+
+SEAT_APPROACH_SETTLE_STEPS: int = 30
+"""Steps a **seating object's approach** dwells before SEAT is allowed to start.
+
+The precondition the seat cannot do without, and the reason the earlier
+1 mm-clearance experiment failed rather than a detail of it: a seat is only as
+well aimed as the pose it is aimed from, and a top-down DESCEND exits *the
+first step its ramp is done*, with 13-15 mrad still standing and the TCP
+5.3-5.9 mm from its waypoint (:data:`CONVERGE_TOL`). Creeping the last two
+millimetres out of a pose that is still six millimetres from where it thinks it
+is seats nothing.
+
+Thirty steps for the same reason :data:`SIDE_SETTLE_STEPS` is thirty -- that is
+what the droop integrator needs to take 20 mrad to 0.4 -- and it buys the
+contact watchdog its signal-to-noise as well: with the bias already converged,
+the only thing that can move the tracking error during SEAT is the object.
+Measured on the fake plant, a seat started from an unsettled DESCEND trips
+:data:`SEAT_CONTACT_TOL` on the integrator's own step change, ~2.2 mrad, with
+nothing in front of the pad at all.
+
+The side family already dwells this long at ADVANCE, so this only actually adds
+a dwell to a *top-down* seating object -- the 40 mm puck. Nothing that does not
+seat is affected (:func:`settle_steps`).
+"""
+
+SEAT_SETTLE_STEPS: int = 20
+"""Steps SEAT holds the seat pose after its ramp before it may exit.
+
+The same job :data:`SIDE_SETTLE_STEPS` does for the approach -- give the droop
+integrator steps to spend -- but a fifth of the size, because SEAT inherits an
+already-converged bias and only moves the tool 2 mm. It is also the window a
+*blocked* seat winds up over, which is the reason not to make it larger: the
+integrator folds in 12% of the standing error per step, so a seat that ends up
+pressing the object doubles that press over ~20 steps and no more.
+"""
+
+SEAT_CONVERGE_TOL: float = 0.004
+"""``max |measured - waypoint|`` (radians) ending a SEAT that never touched.
+
+4 mrad, which is 1.6-1.8 mm at the tool in either mode. Chosen to be reachable
+rather than aspirational: the arm's own floor with the integrator running is
+about 2 mrad (measured, the filmed PREGRASP and ADVANCE exits at 1.98 and
+2.15 mrad), so 4 mrad is met a few steps after the ramp and 1.5 mrad would not
+be met at all. It is deliberately *tighter* than either approach bar -- 20 mrad
+top-down, 7.4 mrad side -- because the whole point of the state is that the
+last two millimetres are aimed rather than thrown: a puck whose DESCEND exited
+5.8 mm from its waypoint has to be brought in before the jaws are trusted.
+"""
+
+SEAT_CONTACT_TOL: float = 0.0015
+"""Excess joint tracking error that counts as the pad having found the object, radians.
+
+1.5 mrad. *Excess* over the state's own reference, sampled a few steps into the
+creep (:data:`SEAT_CONTACT_REF_STEP`), so what it measures is the change since
+the seat started moving rather than the standing droop -- which is several times
+larger and is exactly what the bias is already cancelling. A free arm tracks the
+creep with a lag that is small and constant; a blocked one banks the whole
+commanded travel, every step, until this fires.
+
+Both sides of the bar are measured on the fake plant
+(``tests/test_expert_logic.py``), and it sits between them by about a factor of
+two on the worse object:
+
+* **free**, seat started from a settled approach: 0.23 mrad of excess on the
+  cylinder, 0.85 mrad on the puck, over the whole state;
+* **blocked**, the pad stopped dead at three different points of the creep:
+  trips 13 steps later on the cylinder and 5 on the puck -- the puck's 2 mm
+  costs four times the joint travel, so it banks error four times faster --
+  which is 0.65 mm and 0.25 mm of blocked creep, or 0.09 N and 0.06 N standing
+  on the object. Both an order below what moves either one.
+"""
+
+SEAT_CONTACT_LAG_STEPS: float = 3.0
+"""Steps of commanded travel the watchdog allows a free arm to lag by.
+
+The other half of the bar, and the half that has to be *per object*: a position
+servo tracking a ramp sits a fixed fraction of a step's travel behind it, so the
+lag scales with the commanded joint rate -- and the two seating objects do not
+share one. The same 2 mm of tool motion costs 5.5 mrad of shoulder_pan on the
+side-grasped cylinder (whose seat is tangential) and 20 mrad across the three
+pitch joints on the puck (whose seat is partly radial), four times as fast, so a
+bar that suits one is either deaf or trigger-happy on the other.
+
+So the bar is ``SEAT_CONTACT_TOL + SEAT_CONTACT_LAG_STEPS * (travel per step)``:
+1.9 mrad on the cylinder and 3.0 on the puck. Three steps rather than one
+because the plant's own transient at the start of a ramp takes a couple of steps
+to settle; more than three and the puck's bar would be looser than the contact
+it is looking for.
+"""
+
+SEAT_CONTACT_STEPS: int = 3
+"""Consecutive steps over the bar before contact is declared.
+
+Three, so a single noisy sample cannot end the state early. Costs three steps of
+commanded travel (0.15 mm, under 0.05 N) over the bare threshold.
+"""
+
+SEAT_CONTACT_REF_STEP: int = 2
+"""Step of SEAT whose tracking error is taken as the watchdog's zero.
+
+Not step 0 -- the plant needs a step or two to pick the ramp up -- and not much
+later than that either, because the reference is a **blind spot**: contact that
+is already there when it is sampled gets absorbed into it and then has to be
+re-earned. Two steps is 0.1 mm of it. The lag term
+(:data:`SEAT_CONTACT_LAG_STEPS`) is what buys the reference the right to be
+this early; without it the reference had to be taken at step 5, and a seat that
+started already touching pressed the puck with 0.38 N -- past the 0.29 N that
+slides it -- before the watchdog could re-earn its threshold.
+"""
+
 
 @dataclass(frozen=True)
 class ExpertConfig:
@@ -326,6 +550,21 @@ class ExpertConfig:
             ramp before it is allowed to exit, so the droop integrator can
             actually cancel the sag it is measuring (:data:`SIDE_SETTLE_STEPS`).
             Top-down states never dwell.
+        seat_gap: Gap the SEAT state aims the static pad at, metres
+            (:data:`SEAT_GAP_M`). Only an object with
+            :attr:`~manus.objects.ObjectSpec.seat_close` set has a SEAT at all.
+        seat_creep_rate: Tool speed through the seat, metres per step
+            (:data:`SEAT_CREEP_RATE_M`); with :attr:`seat_gap` it is what sets
+            SEAT's ramp length, since the stroke is fixed by the geometry.
+        seat_approach_settle: Steps the approach of a seating object dwells
+            before SEAT may start (:data:`SEAT_APPROACH_SETTLE_STEPS`) -- the
+            seat's precondition, not a refinement of it.
+        seat_settle_steps: Steps SEAT dwells after its ramp
+            (:data:`SEAT_SETTLE_STEPS`).
+        seat_converge_tol: Convergence bar ending a SEAT that never found the
+            object, radians (:data:`SEAT_CONVERGE_TOL`).
+        seat_contact_tol: Excess tracking error at which SEAT declares contact
+            and stops pushing, radians (:data:`SEAT_CONTACT_TOL`).
         state_budget: Per-state step ceiling; expiry advances the FSM anyway and
             is recorded in :attr:`ScriptedGraspExpert.timeouts`.
         hold_steps: Length of the terminal HOLD.
@@ -376,6 +615,12 @@ class ExpertConfig:
     converge_tol: float = CONVERGE_TOL
     side_converge_tol: float = SIDE_CONVERGE_TOL
     side_settle_steps: int = SIDE_SETTLE_STEPS
+    seat_gap: float = SEAT_GAP_M
+    seat_creep_rate: float = SEAT_CREEP_RATE_M
+    seat_approach_settle: int = SEAT_APPROACH_SETTLE_STEPS
+    seat_settle_steps: int = SEAT_SETTLE_STEPS
+    seat_converge_tol: float = SEAT_CONVERGE_TOL
+    seat_contact_tol: float = SEAT_CONTACT_TOL
     state_budget: int = 240
     hold_steps: int = 45
     gripper_open: float = GRIPPER_OPEN
@@ -398,10 +643,15 @@ class ExpertConfig:
         CLOSE is the only state whose ramp depends on what is being grasped:
         with :attr:`close_ramp` left at None it comes from `spec`, so pass the
         object whenever one is in hand. Without a spec an unset
-        :attr:`close_ramp` falls back to the tuned reference ramp.
+        :attr:`close_ramp` falls back to the tuned reference ramp. SEAT's is
+        derived rather than tuned -- the stroke is the same two millimetres for
+        every object, so the ramp is just that at the creep rate
+        (:func:`seat_ramp_steps`).
         """
         if state == CLOSE:
             return close_ramp_steps(spec, self)
+        if state == SEAT:
+            return seat_ramp_steps(self)
         return {
             PREGRASP: self.pregrasp_ramp,
             # ADVANCE is DESCEND's side-mode twin -- the same move onto the
@@ -430,19 +680,56 @@ def close_ramp_steps(spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CON
     return spec.close_ramp_steps
 
 
+def seat_stroke(config: ExpertConfig = DEFAULT_CONFIG) -> float:
+    """How far the SEAT state moves the tool, metres.
+
+    The clearance the approach deliberately kept, less the gap the seat is aimed
+    at: :data:`JAW_CLEARANCE` minus :attr:`~ExpertConfig.seat_gap`, 2.0 mm at
+    the shipped values. Read through the module global rather than captured, so
+    ``scripts/demo_expert.py --jaw-clearance`` moves the seat with the approach
+    it belongs to.
+    """
+    return max(0.0, JAW_CLEARANCE - config.seat_gap)
+
+
+def seat_ramp_steps(config: ExpertConfig = DEFAULT_CONFIG) -> int:
+    """Steps SEAT creeps its stroke over: :func:`seat_stroke` at the creep rate.
+
+    40 at the shipped values (2.0 mm at 0.05 mm/step). Nominal, not exact: the
+    ramp interpolates from the pose the approach actually *reached*, so an
+    approach that stopped short adds its own residual to the stroke and the real
+    tool speed is a little higher than the rate. That is the right way round --
+    the residual is the part that most needs bringing in.
+    """
+    return max(1, math.ceil(seat_stroke(config) / max(1e-9, config.seat_creep_rate)))
+
+
 def settle_steps(
     state: str, spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CONFIG
 ) -> int:
     """Steps `state` must hold its waypoint after the ramp before it may exit.
 
-    :attr:`~ExpertConfig.side_settle_steps` for the two states of a **side**
-    grasp that have to arrive accurately -- PREGRASP and ADVANCE -- and zero for
-    everything else, which leaves the top-down FSM's exit rule (and so every
-    dataset generated with it) bit-for-bit what it was. See
-    :data:`SIDE_SETTLE_STEPS` for what the dwell is for.
+    Four cases, and the last two are new with SEAT:
+
+    * :attr:`~ExpertConfig.side_settle_steps` for the two states of a **side**
+      grasp that have to arrive accurately -- PREGRASP and ADVANCE;
+    * :attr:`~ExpertConfig.seat_settle_steps` for SEAT itself, in either mode;
+    * :attr:`~ExpertConfig.seat_approach_settle` for the *approach* of an object
+      that seats, so the seat is aimed from a pose that has stopped moving
+      (:data:`SEAT_APPROACH_SETTLE_STEPS`);
+    * zero for everything else, which leaves the top-down FSM's exit rule (and
+      so every dataset generated with it) bit-for-bit what it was.
+
+    See :data:`SIDE_SETTLE_STEPS` for what the dwell is for.
     """
-    if spec is not None and is_side_grasp(spec) and state in (PREGRASP, ADVANCE):
+    if state == SEAT:
+        return config.seat_settle_steps
+    if spec is None:
+        return 0
+    if is_side_grasp(spec) and state in (PREGRASP, ADVANCE):
         return config.side_settle_steps
+    if seats(spec) and state == approach_state(spec):
+        return config.seat_approach_settle
     return 0
 
 
@@ -545,7 +832,10 @@ def close_command(
     measured against and it is scoped to the two objects that need it -- but
     the thing that would actually seat these two is a closure with **no shove
     at all** (the object against the static pad before the jaws move), which is
-    a plan change, not a ramp change.
+    a plan change, not a ramp change. That plan change is the :data:`SEAT`
+    state, and the two objects that creep are the two that seat: with the gap
+    already closed the creep is no longer crossing anything, it is simply the
+    gentlest available arrival at a surface that is already there.
 
     Args:
         entry: Jaw angle CLOSE was entered at, radians.
@@ -611,8 +901,19 @@ def state_budget(
     return config.state_budget
 
 
-def converge_tol(spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CONFIG) -> float:
+def converge_tol(
+    spec: ObjectSpec | None,
+    config: ExpertConfig = DEFAULT_CONFIG,
+    *,
+    state: str | None = None,
+) -> float:
     """Arm convergence tolerance for `spec`, radians.
+
+    **SEAT answers :attr:`~ExpertConfig.seat_converge_tol` in either mode**, and
+    is the only state that takes a bar of its own -- see
+    :data:`SEAT_CONVERGE_TOL` for why it is tighter than both approach bars.
+    Pass `state` to get it; the default (None) is the approach bar, which is
+    what every caller that predates SEAT wants.
 
     A **side** grasp answers :attr:`~ExpertConfig.side_converge_tol` flat: its
     residual is spent out of the hand's table clearance rather than off the
@@ -645,10 +946,13 @@ def converge_tol(spec: ObjectSpec | None, config: ExpertConfig = DEFAULT_CONFIG)
     Args:
         spec: Object being grasped; None means the reference width.
         config: Tunables; :attr:`~ExpertConfig.converge_tol` is read.
+        state: The state being exited, or None for the mode's approach bar.
 
     Returns:
         The tolerance, radians.
     """
+    if state == SEAT:
+        return config.seat_converge_tol
     if spec is None:
         return config.converge_tol
     if is_side_grasp(spec):
@@ -769,6 +1073,11 @@ has to be placed clear of it -- and the descent carries the full positioning
 error of the arm, ~2 mm at the convergence tolerance. The moving jaw then
 pushes the object back across this gap as it closes, so more clearance is a
 safer approach and a bigger shove at contact.
+
+That trade is exactly what the :data:`SEAT` state refuses to make: an object
+with :attr:`~manus.objects.ObjectSpec.seat_close` keeps the full clearance for
+the whole approach and then gives it back at 1.5 mm/s with the arm, so the
+approach is as safe as the clearance is wide and the shove is nothing at all.
 """
 
 
@@ -933,14 +1242,24 @@ def jaw_depth(gripper: float) -> float:
     return JAW_TIP_Z if gripper >= MOVING_JAW_CLEAR_RAD else MOVING_JAW_DEEPEST_Z
 
 
-def pad_lateral_offset(spec: ObjectSpec) -> float:
+def pad_lateral_offset(spec: ObjectSpec, clearance: float | None = None) -> float:
     """Where the object's centre should sit along TCP-frame x, metres.
 
     Negative: the object is offset *away* from the static jaw, by its own half
-    width plus :data:`JAW_CLEARANCE`, so that the descent passes the static
-    finger and the closing moving finger seats the object against it.
+    width plus `clearance`, so that the descent passes the static finger and the
+    closing moving finger seats the object against it.
+
+    Args:
+        spec: Object being grasped; supplies the grasp width.
+        clearance: Gap to leave to the static pad, metres. None -- the default
+            and every approach's answer -- reads :data:`JAW_CLEARANCE` at call
+            time, which is what makes ``--jaw-clearance`` an override rather
+            than a no-op. The SEAT state passes
+            :attr:`~ExpertConfig.seat_gap` instead: same object, same yaw, a
+            tool standing 2 mm closer (:func:`seat_stroke`).
     """
-    return JAW_FIXED_FACE_X - 0.5 * spec.grasp_width_m - JAW_CLEARANCE
+    gap = JAW_CLEARANCE if clearance is None else clearance
+    return JAW_FIXED_FACE_X - 0.5 * spec.grasp_width_m - gap
 
 
 def tip_clearance(spec: ObjectSpec) -> float:
@@ -958,9 +1277,30 @@ def is_side_grasp(spec: ObjectSpec) -> bool:
     return spec.grasp_mode == "side"
 
 
+def seats(spec: ObjectSpec) -> bool:
+    """Whether `spec` closes the last :data:`JAW_CLEARANCE` with the arm first.
+
+    :attr:`~manus.objects.ObjectSpec.seat_close`, i.e. whether the FSM walks a
+    :data:`SEAT` between the approach and CLOSE. Off for every object the tuned
+    closure already grasps -- their gate anchors are pinned and a state they do
+    not walk cannot move them.
+    """
+    return spec.seat_close
+
+
 def state_sequence(spec: ObjectSpec) -> tuple[str, ...]:
-    """The FSM's state order for `spec`: :data:`STATE_SEQUENCE` or its side twin."""
-    return SIDE_STATE_SEQUENCE if is_side_grasp(spec) else STATE_SEQUENCE
+    """The FSM's state order for `spec`: the mode's, plus a SEAT if it asks.
+
+    :data:`STATE_SEQUENCE` or :data:`SIDE_STATE_SEQUENCE` by
+    :func:`is_side_grasp`, with :data:`SEAT` spliced in before CLOSE when
+    :func:`seats` -- so the two shove-failing objects walk seven states and
+    every other object walks the six it always did.
+    """
+    base = SIDE_STATE_SEQUENCE if is_side_grasp(spec) else STATE_SEQUENCE
+    if not seats(spec):
+        return base
+    index = base.index(CLOSE)
+    return base[:index] + (SEAT,) + base[index:]
 
 
 def approach_state(spec: ObjectSpec) -> str:
@@ -1122,7 +1462,11 @@ def pregrasp_height(spec: ObjectSpec, config: ExpertConfig | None = None) -> flo
 
 
 def tcp_target(
-    object_xy: tuple[float, float], object_z: float, grasp_yaw: float, spec: ObjectSpec
+    object_xy: tuple[float, float],
+    object_z: float,
+    grasp_yaw: float,
+    spec: ObjectSpec,
+    clearance: float | None = None,
 ) -> np.ndarray:
     """TCP position (3,) placing the jaws around `spec` at `object_xy`.
 
@@ -1137,8 +1481,12 @@ def tcp_target(
     (16 mm). That is why the yaw branch has to be chosen before the IK rather
     than after it, and why a solver that silently pi-flips the yaw would put the
     tool 32 mm off target -- see :func:`plan_grasp`.
+
+    `clearance` is the gap to the static pad the tool is stood off by; None is
+    :data:`JAW_CLEARANCE`, the approach's, and the SEAT waypoint asks for
+    :attr:`~ExpertConfig.seat_gap` instead (:func:`pad_lateral_offset`).
     """
-    lateral = pad_lateral_offset(spec)
+    lateral = pad_lateral_offset(spec, clearance)
     return np.array(
         [
             object_xy[0] - lateral * math.cos(grasp_yaw),
@@ -1154,6 +1502,7 @@ def side_tcp_target(
     approach_azimuth: float,
     spec: ObjectSpec,
     tool_roll: float = SIDE_GRASP_ROLL,
+    clearance: float | None = None,
 ) -> np.ndarray:
     """TCP position (3,) placing the jaws around `spec` for a **side** grasp.
 
@@ -1180,12 +1529,19 @@ def side_tcp_target(
         spec: Object being grasped; supplies the grasp width.
         tool_roll: Jaw tilt off level, radians; the default is the level branch
             the whole side pipeline is planned at.
+        clearance: Gap to the static pad, metres; None is :data:`JAW_CLEARANCE`.
+            **This is the direction a side grasp seats along**, and it is not
+            the approach direction: the lateral offset is tangential here (see
+            above), so SEAT slides the flat hand sideways across the object's
+            face rather than pushing further in along the approach. Pushing
+            along the approach would drive the pads off the object's centre
+            line instead of closing the gap to the static pad.
 
     Returns:
         The (3,) TCP position, metres.
     """
     rotation = kinematics.horizontal_tool_rotation(approach_azimuth, tool_roll)
-    offset = np.array([pad_lateral_offset(spec), 0.0, TCP_TO_PAD_CENTRE])
+    offset = np.array([pad_lateral_offset(spec, clearance), 0.0, TCP_TO_PAD_CENTRE])
     return np.array([*object_xy, object_z]) - rotation @ offset
 
 
@@ -1322,6 +1678,15 @@ class GraspPlan:
         tcp_grasp: TCP position the grasp pose was solved for.
         lateral_offset: TCP-frame x the object centre was aimed at, metres
             (:func:`pad_lateral_offset`).
+        q_seat: Arm pose with the static pad against the object, or None for an
+            object that does not seat (:func:`seats`). The same grasp with
+            :attr:`~ExpertConfig.seat_gap` in place of :data:`JAW_CLEARANCE`,
+            which moves the tool :func:`seat_stroke` along its own -x.
+        tcp_seat: TCP position :attr:`q_seat` was solved for, or None.
+        seat_offset: TCP-frame x the object centre is aimed at *at the seat*,
+            metres, or None -- the seat's counterpart of
+            :attr:`lateral_offset`, and the difference between the two is the
+            stroke.
         lift_rise: TCP height gain from :attr:`q_grasp` to :attr:`q_lift`.
         close_target: Jaw target used by CLOSE.
         ik_converged: Whether both IK solves met their tolerances.
@@ -1346,6 +1711,9 @@ class GraspPlan:
     reason: str = ""
     grasp_mode: str = "top"
     approach_azimuth: float | None = None
+    q_seat: np.ndarray | None = None
+    tcp_seat: np.ndarray | None = None
+    seat_offset: float | None = None
 
     @property
     def ok(self) -> bool:
@@ -1353,7 +1721,19 @@ class GraspPlan:
         return self.reason == ""
 
     def waypoint(self, state: str) -> np.ndarray:
-        """Arm waypoint of an arm state (PREGRASP, DESCEND/ADVANCE or LIFT)."""
+        """Arm waypoint of an arm state (PREGRASP, DESCEND/ADVANCE, SEAT, LIFT).
+
+        Raises:
+            KeyError: `state` does not move the arm.
+            ValueError: SEAT was asked for on a plan that has no seat pose,
+                which means the FSM and the plan were built from different
+                specs -- worth failing loudly rather than seating on the
+                approach pose and calling the gap closed.
+        """
+        if state == SEAT:
+            if self.q_seat is None:
+                raise ValueError("plan has no seat pose; spec.seat_close is not set")
+            return self.q_seat
         return {
             PREGRASP: self.q_pregrasp,
             DESCEND: self.q_grasp,
@@ -1403,6 +1783,20 @@ def _plan_side_grasp(
     )
     q_lift, lift_rise = plan_lift(q_grasp, config.lift_rise)
 
+    # The seat is the same grasp with the tool stood 2 mm further along its own
+    # -x, which for a side grasp is *tangential* -- solved rather than nudged so
+    # the azimuth fixed point above still holds at the seated pose.
+    q_seat: np.ndarray | None = None
+    tcp_seat: np.ndarray | None = None
+    seat_ok = True
+    if seats(spec):
+        tcp_seat = side_tcp_target(
+            (x, y), object_z, azimuth, spec, clearance=config.seat_gap
+        )
+        q_seat, seat_ok = ik_solve(
+            tcp_seat, SIDE_GRASP_ROLL, family=kinematics.TOOL_HORIZONTAL
+        )
+
     rolled = max(
         abs(_wrap(_CHAIN.tool_roll(q_pregrasp) - SIDE_GRASP_ROLL)),
         abs(_wrap(_CHAIN.tool_roll(q_grasp) - SIDE_GRASP_ROLL)),
@@ -1410,6 +1804,8 @@ def _plan_side_grasp(
     reason = ""
     if not (pregrasp_ok and grasp_ok):
         reason = f"ik_{'pregrasp' if not pregrasp_ok else 'grasp'}_unreachable"
+    elif not seat_ok:
+        reason = "ik_seat_unreachable"
     elif rolled:
         reason = "ik_solved_the_flipped_roll"
     elif lift_rise < config.min_lift_rise:
@@ -1424,10 +1820,13 @@ def _plan_side_grasp(
         lateral_offset=pad_lateral_offset(spec),
         lift_rise=lift_rise,
         close_target=spec.close_target_rad,
-        ik_converged=bool(pregrasp_ok and grasp_ok),
+        ik_converged=bool(pregrasp_ok and grasp_ok and seat_ok),
         reason=reason,
         grasp_mode="side",
         approach_azimuth=float(_CHAIN.approach_azimuth(q_grasp)),
+        q_seat=q_seat,
+        tcp_seat=tcp_seat,
+        seat_offset=pad_lateral_offset(spec, config.seat_gap) if seats(spec) else None,
     )
 
 
@@ -1490,6 +1889,17 @@ def plan_grasp(
         q_pregrasp, pregrasp_ok = ik_solve(tcp_pregrasp, grasp_yaw)
         q_grasp, grasp_ok = ik_solve(tcp_grasp, grasp_yaw)
         q_lift, lift_rise = plan_lift(q_grasp, config.lift_rise)
+        # Same grasp, tool stood 2 mm along its own -x: a purely horizontal
+        # slide at the grasp height for a top-down grasp, so it costs the
+        # fingertips none of their table clearance.
+        q_seat: np.ndarray | None = None
+        tcp_seat: np.ndarray | None = None
+        seat_ok = True
+        if seats(spec):
+            tcp_seat = tcp_target(
+                (x, y), grasp_height(spec), grasp_yaw, spec, clearance=config.seat_gap
+            )
+            q_seat, seat_ok = ik_solve(tcp_seat, grasp_yaw)
         flipped = max(
             abs(_wrap(_CHAIN.tool_yaw(q_pregrasp) - grasp_yaw)),
             abs(_wrap(_CHAIN.tool_yaw(q_grasp) - grasp_yaw)),
@@ -1498,6 +1908,8 @@ def plan_grasp(
         if not (pregrasp_ok and grasp_ok):
             missed = "pregrasp" if not pregrasp_ok else "grasp"
             reason = f"ik_{missed}_unreachable"
+        elif not seat_ok:
+            reason = "ik_seat_unreachable"
         elif flipped:
             reason = "ik_solved_the_flipped_yaw"
         elif lift_rise < config.min_lift_rise:
@@ -1512,8 +1924,11 @@ def plan_grasp(
             lateral_offset=pad_lateral_offset(spec),
             lift_rise=lift_rise,
             close_target=spec.close_target_rad,
-            ik_converged=bool(pregrasp_ok and grasp_ok),
+            ik_converged=bool(pregrasp_ok and grasp_ok and seat_ok),
             reason=reason,
+            q_seat=q_seat,
+            tcp_seat=tcp_seat,
+            seat_offset=pad_lateral_offset(spec, config.seat_gap) if seats(spec) else None,
         )
         if plan.ok:
             return plan
@@ -1607,6 +2022,10 @@ class ScriptedGraspExpert:
         self._frozen_arm: np.ndarray | None = None
         self._last_arm_command = np.zeros(kinematics.NUM_ARM_JOINTS)
         self._gripper_history: deque[float] = deque(maxlen=config.gripper_stall_window + 1)
+        self._seat_reference: np.ndarray | None = None
+        self._seat_contact_steps = 0
+        self._seat_excess = 0.0
+        self._seat_exit: tuple[str, float] | None = None
         self._reports: list[StateReport] = []
         self._timeouts: list[str] = []
         self._started = False
@@ -1652,6 +2071,10 @@ class ScriptedGraspExpert:
         self._frozen_arm = None
         self._last_arm_command = np.zeros(kinematics.NUM_ARM_JOINTS)
         self._gripper_history.clear()
+        self._seat_reference = None
+        self._seat_contact_steps = 0
+        self._seat_excess = 0.0
+        self._seat_exit = None
         self._reports = []
         self._timeouts = []
         self._started = True
@@ -1755,6 +2178,9 @@ class ScriptedGraspExpert:
         self._entry_arm = arm.copy()
         self._entry_gripper = gripper
         self._gripper_history.clear()
+        self._seat_reference = None
+        self._seat_contact_steps = 0
+        self._seat_excess = 0.0
 
     def _leave(self, exit_reason: str, arm: np.ndarray, gripper: float) -> None:
         """Record the state being left and enter the next one."""
@@ -1781,12 +2207,15 @@ class ScriptedGraspExpert:
         )
         if exit_reason == "timeout":
             self._timeouts.append(self._state)
-        if self._state in APPROACH_STATES:
-            # CLOSE holds the arm exactly where the approach left it -- including
-            # the droop bias -- so the jaws close on the pose that was reached,
-            # not on a recomputed one that would nudge the arm mid-grasp.
-            self._frozen_arm = self._last_arm_command.copy()
-        if self._state == LIFT:
+        if self._state == SEAT:
+            self._seat_exit = (exit_reason, self._seat_excess)
+        if self._state in FREEZE_STATES:
+            # CLOSE holds the arm exactly where the approach (or the seat) left
+            # it -- including the droop bias -- so the jaws close on the pose
+            # that was reached, not on a recomputed one that would nudge the arm
+            # mid-grasp. On a seating object the latch happens twice and the
+            # second one wins, which is the point: what CLOSE must hold is the
+            # *seated* pose, pad against the object.
             self._frozen_arm = self._last_arm_command.copy()
         self._enter(self._sequence[self._sequence.index(self._state) + 1], arm, gripper)
 
@@ -1804,11 +2233,11 @@ class ScriptedGraspExpert:
     def _may_exit(self) -> bool:
         """Whether the current state has finished commanding *and* settling.
 
-        The dwell is zero everywhere except a side grasp's approach states, and
-        the commanded length is the state's ramp everywhere except a creeping
-        CLOSE (:func:`close_steps`) -- so for a top-down catalogue object this
-        is exactly ``self._ramp() >= 1.0``, the condition the FSM has always
-        used. CLOSE has to wait out its whole creep before a stall may end it,
+        The dwell is zero everywhere except a side grasp's approach states and
+        SEAT, and the commanded length is the state's ramp everywhere except a
+        creeping CLOSE (:func:`close_steps`) -- so for a top-down catalogue
+        object this is exactly ``self._ramp() >= 1.0``, the condition the FSM
+        has always used. CLOSE has to wait out its whole creep before a stall may end it,
         or the squeeze the object is held with would be whatever the creep had
         reached rather than the commanded target.
         """
@@ -1824,9 +2253,16 @@ class ScriptedGraspExpert:
         budget_spent = self._state_step >= state_budget(self._state, self.spec, self.config)
         if self._state == HOLD:
             return "elapsed" if self._state_step >= self.config.hold_steps else None
+        if self._state == SEAT and self._seat_contact(arm):
+            # The pad has found the object: stop pushing *now*, mid-ramp if need
+            # be. Everything after this is the moving jaw's job and it has a
+            # backstop to work against, which is the whole point of the state.
+            return "seated"
         if self._state in ARM_STATES:
             waypoint = self.plan.waypoint(self._state)
-            converged = float(np.abs(arm - waypoint).max()) < converge_tol(self.spec, self.config)
+            converged = float(np.abs(arm - waypoint).max()) < converge_tol(
+                self.spec, self.config, state=self._state
+            )
             if self._may_exit() and converged:
                 return "converged"
             return "timeout" if budget_spent else None
@@ -1836,6 +2272,55 @@ class ScriptedGraspExpert:
         if self._may_exit() and self._gripper_stalled():
             return "stalled"
         return "timeout" if budget_spent else None
+
+    def _seat_contact_bar(self) -> float:
+        """Excess tracking error this seat calls contact, radians.
+
+        :attr:`~ExpertConfig.seat_contact_tol` plus the lag a free arm is
+        entitled to at this seat's own commanded joint rate -- see
+        :data:`SEAT_CONTACT_LAG_STEPS`, which is where the per-object part of
+        the bar comes from.
+        """
+        assert self._entry_arm is not None
+        span = max(1, self.config.ramp_steps(SEAT, self.spec))
+        rate = float(np.abs(self.plan.waypoint(SEAT) - self._entry_arm).max()) / span
+        return self.config.seat_contact_tol + SEAT_CONTACT_LAG_STEPS * rate
+
+    def _seat_contact(self, arm: np.ndarray) -> bool:
+        """Whether the seating pad has run into the object, from tracking error alone.
+
+        The arm has no force sensor, so contact is read the same way CLOSE reads
+        it at the jaw: the servo is commanded somewhere it cannot go, and the
+        error stands. What makes it readable at 0.68 mm is that the *baseline*
+        is removed -- a drooping arm always tracks a few milliradians behind its
+        command, so what is watched is the growth since the seat started moving
+        (:data:`SEAT_CONTACT_REF_STEP`), not the error itself.
+
+        Deliberately conservative in both directions:
+
+        * the bar it is compared against carries an explicit allowance for the
+          lag the commanded creep itself produces, scaled by this seat's own
+          joint rate (:meth:`_seat_contact_bar`);
+        * it wants :data:`SEAT_CONTACT_STEPS` consecutive samples, so one noisy
+          step cannot end the seat two millimetres early.
+
+        Args:
+            arm: The (5,) measured arm pose this step, radians.
+
+        Returns:
+            Whether contact has been confirmed.
+        """
+        tracking = self._last_arm_command - arm
+        if self._seat_reference is None:
+            if self._state_step >= SEAT_CONTACT_REF_STEP:
+                self._seat_reference = tracking.copy()
+            return False
+        self._seat_excess = float(np.abs(tracking - self._seat_reference).max())
+        if self._seat_excess > self._seat_contact_bar():
+            self._seat_contact_steps += 1
+        else:
+            self._seat_contact_steps = 0
+        return self._seat_contact_steps >= SEAT_CONTACT_STEPS
 
     def _gripper_stalled(self) -> bool:
         """Whether the jaws have stopped moving over the stall window."""
@@ -1867,7 +2352,7 @@ class ScriptedGraspExpert:
             gripper_command = self._entry_gripper + alpha * (
                 config.gripper_open - self._entry_gripper
             )
-        elif self._state in APPROACH_STATES:
+        elif self._state in JAWS_OPEN_STATES:
             gripper_command = config.gripper_open
         elif self._state == CLOSE:
             gripper_command = close_command(
@@ -1940,6 +2425,12 @@ class ScriptedGraspExpert:
             "close_steps": close_steps(self.spec, self.config),
             "converge_tol": converge_tol(self.spec, self.config),
             "grasp_height": grasp_height(self.spec),
+            "seats": seats(self.spec),
+            "seat_gap": self.config.seat_gap if seats(self.spec) else None,
+            "seat_stroke": seat_stroke(self.config) if seats(self.spec) else None,
+            "seat_ramp": seat_ramp_steps(self.config) if seats(self.spec) else None,
+            "seat_exit": None if self._seat_exit is None else self._seat_exit[0],
+            "seat_excess": None if self._seat_exit is None else self._seat_exit[1],
             "state": self._state,
             "total_steps": self._total_steps,
             "timeouts": list(self._timeouts),

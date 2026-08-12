@@ -2073,11 +2073,22 @@ def test_the_catalogue_has_exactly_one_side_grasp_and_it_is_the_cylinder():
     assert [spec.name for spec in SIDE_OBJECTS] == ["cylinder_3cm"]
     assert expert_mod.is_side_grasp(CYLINDER)
     assert not expert_mod.is_side_grasp(CUBE)
-    assert expert_mod.state_sequence(CYLINDER) == expert_mod.SIDE_STATE_SEQUENCE
     assert expert_mod.state_sequence(CUBE) == STATE_SEQUENCE
     assert expert_mod.SIDE_STATE_SEQUENCE == (
         PREGRASP,
         expert_mod.ADVANCE,
+        CLOSE,
+        LIFT,
+        HOLD,
+        DONE,
+    )
+    # The cylinder walks the side sequence *plus* a SEAT, because it is also one
+    # of the two objects that closes the jaw clearance with the arm first; the
+    # two properties are independent and both are asserted where they belong.
+    assert expert_mod.state_sequence(CYLINDER) == (
+        PREGRASP,
+        expert_mod.ADVANCE,
+        expert_mod.SEAT,
         CLOSE,
         LIFT,
         HOLD,
@@ -2511,17 +2522,22 @@ def test_a_side_grasp_walks_advance_where_a_top_down_one_descends():
     expert = ScriptedGraspExpert(CYLINDER, a_placement(CYLINDER))
     states = [state for state, _ in run(expert, FakeArm())]
     assert [report.state for report in expert.reports] == list(
-        expert_mod.SIDE_STATE_SEQUENCE[:-1]
+        expert_mod.state_sequence(CYLINDER)[:-1]
     )
     assert ADVANCE in states and DESCEND not in states
     advances = [report for report in expert.reports if report.state == ADVANCE]
     assert advances and all(report.exit == "converged" for report in advances)
-    assert expert.sequence == expert_mod.SIDE_STATE_SEQUENCE
+    assert expert.sequence == expert_mod.state_sequence(CYLINDER)
 
 
 def test_advance_freezes_the_arm_for_close_the_way_descend_does():
-    """CLOSE holds whatever the approach reached -- either approach."""
-    from manus.expert import ADVANCE
+    """CLOSE holds whatever the state before it reached -- either approach.
+
+    On the cylinder that state is now SEAT rather than ADVANCE, and the
+    distinction is the whole of the seat: if CLOSE re-froze the *approach* pose
+    it would hand back the two millimetres the seat just closed.
+    """
+    from manus.expert import ADVANCE, SEAT
 
     expert = ScriptedGraspExpert(CYLINDER, a_placement(CYLINDER))
     plant = FakeArm(droop=0.03)
@@ -2537,25 +2553,30 @@ def test_advance_freezes_the_arm_for_close_the_way_descend_does():
             [targets[n] for n in kinematics.ARM_JOINT_NAMES]
         )
         measured = plant.apply(targets)
-    assert np.allclose(commands[CLOSE][0], commands[ADVANCE][-1])
+    assert np.allclose(commands[CLOSE][0], commands[SEAT][-1])
     assert np.allclose(commands[CLOSE][0], commands[CLOSE][-1])
+    # ... and the seat really did move the arm off the approach pose.
+    assert not np.allclose(commands[SEAT][-1], commands[ADVANCE][-1])
 
 
 def test_the_jaws_are_held_open_all_the_way_through_advance():
-    from manus.expert import ADVANCE
+    """Through the seat too: the arm closes the last 2 mm with the jaws wide."""
+    from manus.expert import ADVANCE, SEAT
 
     expert = ScriptedGraspExpert(CYLINDER, a_placement(CYLINDER))
     plant = FakeArm()
     measured = plant.q.copy()
-    seen = []
+    seen: dict[str, list[float]] = {}
     for _ in range(4000):
         if expert.done:
             break
         targets = expert.step(measured)
-        if expert.state == ADVANCE:
-            seen.append(targets["gripper"])
+        if expert.state in (ADVANCE, SEAT):
+            seen.setdefault(expert.state, []).append(targets["gripper"])
         measured = plant.apply(targets)
-    assert seen and all(value == pytest.approx(GRIPPER_OPEN) for value in seen)
+    assert set(seen) == {ADVANCE, SEAT}
+    for values in seen.values():
+        assert values and all(value == pytest.approx(GRIPPER_OPEN) for value in values)
 
 
 def test_the_advance_ramp_is_the_descend_ramp():
@@ -2811,6 +2832,303 @@ def test_a_creeping_close_still_ends_on_the_stall_and_still_squeezes():
     assert trace[-1][1][-1] == pytest.approx(spec.contact_angle_rad, abs=1e-3)
 
 
+# --- SEAT: closing the jaw clearance with the arm ------------------------------------
+
+
+class BlockingArm(FakeArm):
+    """A :class:`FakeArm` the object stops dead partway through the seat.
+
+    The crudest possible model of a pad meeting a surface -- the arm simply
+    cannot move past the pose it was in when the wall went up -- which is the
+    *worst* case for the contact watchdog: no compliance, no give, so every
+    millimetre the servo is commanded past it is a millimetre of blocked travel
+    the watchdog has to notice on its own.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.wall: np.ndarray | None = None
+
+    def apply(self, targets: dict[str, float]) -> np.ndarray:
+        held = None if self.wall is None else self.wall.copy()
+        measured = super().apply(targets)
+        if held is not None:
+            self.q[:ARM] = held
+            measured = self.q.copy()
+        return measured
+
+
+def seat_run(spec, *, block_at: int | None = None, droop: float = 0.03, config=None):
+    """Drive `spec` to DONE, optionally walling the arm off `block_at` steps into SEAT.
+
+    Returns ``(expert, plant)``.
+    """
+    from manus.expert import SEAT
+
+    expert = ScriptedGraspExpert(
+        spec, a_placement(spec), config=config or ExpertConfig()
+    )
+    plant = BlockingArm(droop=droop, jaw_stop=spec.contact_angle_rad)
+    measured = plant.q.copy()
+    for _ in range(4000):
+        if expert.done:
+            break
+        if expert.state == SEAT and block_at is not None and expert.state_step >= block_at:
+            if plant.wall is None:
+                plant.wall = plant.q[:ARM].copy()
+        else:
+            plant.wall = None
+        measured = plant.apply(expert.step(measured))
+    assert expert.done, expert.state
+    return expert, plant
+
+
+def test_only_the_shove_failing_objects_seat():
+    """The seat is scoped to the two objects whose CLOSE the shove destabilises.
+
+    Same scope as ``close_creep`` and for the same reason -- the five objects the
+    tuned closure already grasps have their gate anchors pinned, and a state they
+    never enter cannot move them.
+    """
+    from manus.expert import seats
+
+    assert [spec.name for spec in OBJECTS.values() if spec.seat_close] == [
+        "cylinder_3cm",
+        "puck_d40x20",
+    ]
+    assert [spec.name for spec in OBJECTS.values() if spec.seat_close] == [
+        spec.name for spec in OBJECTS.values() if spec.close_creep
+    ]
+    for spec in OBJECTS.values():
+        assert seats(spec) == spec.seat_close
+        if not spec.seat_close:
+            assert expert_mod.SEAT not in expert_mod.state_sequence(spec)
+
+
+def test_a_seating_object_walks_a_seat_between_its_approach_and_close():
+    """One state, spliced in front of CLOSE, in whichever mode the object uses."""
+    from manus.expert import ADVANCE, SEAT
+
+    assert expert_mod.state_sequence(THICK_PUCK) == (
+        PREGRASP,
+        DESCEND,
+        SEAT,
+        CLOSE,
+        LIFT,
+        HOLD,
+        DONE,
+    )
+    assert expert_mod.state_sequence(CYLINDER) == (
+        PREGRASP,
+        ADVANCE,
+        SEAT,
+        CLOSE,
+        LIFT,
+        HOLD,
+        DONE,
+    )
+    for spec in (THICK_PUCK, CYLINDER):
+        expert, _ = seat_run(spec)
+        walked = [report.state for report in expert.reports]
+        assert walked == list(expert_mod.state_sequence(spec)[:-1])
+        assert walked.index(SEAT) == walked.index(CLOSE) - 1
+
+
+def test_the_seat_gives_back_exactly_the_jaw_clearance_and_no_height():
+    """Geometry: 2 mm along the tool's own -x, in the tool frame, in both modes.
+
+    Along -x and nowhere else is the whole claim. For a top-down grasp that is a
+    horizontal slide at the grasp height, so it costs the fingertips none of
+    their table clearance; for a side grasp it is *tangential*, not along the
+    approach -- pushing further in along the approach would drive the pads off
+    the object's centre line rather than closing the gap to the static pad.
+    """
+    from manus.expert import JAW_CLEARANCE, seat_stroke
+
+    config = ExpertConfig()
+    for spec in (THICK_PUCK, CYLINDER):
+        plan = plan_grasp(spec, a_placement(spec))
+        assert plan.ok, plan.reason
+        assert plan.seat_offset == pytest.approx(
+            -0.5 * spec.grasp_width_m - config.seat_gap
+        )
+        assert plan.lateral_offset - plan.seat_offset == pytest.approx(-JAW_CLEARANCE)
+
+        move = plan.tcp_seat - plan.tcp_grasp
+        assert np.linalg.norm(move) == pytest.approx(seat_stroke(config), abs=1e-9)
+        assert move[2] == pytest.approx(0.0, abs=1e-12), "the seat is horizontal"
+
+        # ... and it is the tool's own -x, read off the solved pose's rotation.
+        rotation = CHAIN.fk_tcp(plan.q_grasp)[1]
+        assert float(move @ rotation[:, 0]) == pytest.approx(
+            -seat_stroke(config), abs=1e-6
+        )
+        assert abs(float(move @ rotation[:, 2])) < 1e-6, "not along the approach"
+
+        # The solved seat pose delivers it: FK, not the request.
+        by_fk = CHAIN.fk_tcp(plan.q_seat)[0] - CHAIN.fk_tcp(plan.q_grasp)[0]
+        assert np.linalg.norm(by_fk - move) < 1e-4
+
+
+def test_the_seat_is_a_creep_and_the_approach_is_not():
+    """Two millimetres over 40 steps, against 30-40 mm over 30."""
+    from manus.expert import seat_ramp_steps, seat_stroke
+
+    config = ExpertConfig()
+    seat_speed = seat_stroke(config) / seat_ramp_steps(config)
+    assert seat_speed == pytest.approx(config.seat_creep_rate, abs=1e-9)
+    # The approach covers its own stand-off in descend_ramp steps; the seat is
+    # more than an order of magnitude slower than either mode's.
+    for stroke in (config.hover_height, config.side_retract):
+        assert seat_speed < 0.1 * stroke / config.descend_ramp
+    # Slower than the jaw's own creep, too, which is the right side to err on.
+    assert seat_speed < objects.JAW_WIDTH_PER_RAD * expert_mod.CLOSE_CREEP_RATE_RAD
+
+
+def test_a_free_seat_never_calls_itself_seated():
+    """With nothing in front of the pad the watchdog stays quiet, with margin.
+
+    The margin is what licenses :data:`~manus.expert.SEAT_CONTACT_TOL`: the seat
+    is started from a settled approach precisely so that the only thing left
+    that can move the tracking error is the object.
+    """
+    for spec in (CYLINDER, THICK_PUCK):
+        expert, _ = seat_run(spec)
+        report = next(item for item in expert.reports if item.state == expert_mod.SEAT)
+        assert report.exit == "converged"
+        excess = expert.telemetry()["seat_excess"]
+        assert excess < ExpertConfig().seat_contact_tol
+        assert report.joint_error < ExpertConfig().seat_converge_tol
+
+
+def seat_stiffness(plan) -> float:
+    """Tool stiffness along `plan`'s seat direction, N/m.
+
+    The same servo the jaw is, seen through different geometry: hold a force F
+    at the tool along the seat direction and joint *i* takes ``F * dx/dq_i`` of
+    torque and gives up ``that / kp`` of angle, so the tool moves
+    ``F / kp * sum_i (dx/dq_i)^2``. Inverting that is the stiffness, and it is
+    what turns "how far past the object was the pad commanded" into newtons.
+    """
+    unit = plan.tcp_seat - plan.tcp_grasp
+    unit = unit / np.linalg.norm(unit)
+    gradient = np.zeros(kinematics.NUM_ARM_JOINTS)
+    for index in range(kinematics.NUM_ARM_JOINTS):
+        step = np.zeros(kinematics.NUM_ARM_JOINTS)
+        step[index] = 1e-6
+        gradient[index] = float(
+            (CHAIN.fk_tcp(plan.q_grasp + step)[0] - CHAIN.fk_tcp(plan.q_grasp - step)[0])
+            @ unit
+        ) / 2e-6
+    return specs.STS3215_KP / float(gradient @ gradient)
+
+
+def test_the_seat_stops_as_soon_as_the_pad_is_blocked():
+    """A walled-off arm ends the state, and ends it before it can move the object.
+
+    Bounded is the point, and the bound that matters is in newtons rather than
+    steps: the commanded creep is 0.05 mm per step, so the travel banked between
+    the block and the watchdog firing is what the pad ends up pressing the object
+    with, and the arm's own stiffness along the seat turns that into a force.
+
+    The failure being bounded is **tipping**, because that is the one that loses
+    the grasp: a cylinder tipped even 3 deg is wider than the closing gap and
+    gets levered out. Both thresholds are derived from the objects rather than
+    declared -- ``m g r / h`` about the base edge, 0.29 N on the cylinder at its
+    40 mm grasp and 0.42 N on the puck at its 14 mm one.
+
+    *Sliding* is not bounded and does not need to be. It relieves the press
+    rather than adding to it (an object that gives way is an object the servo
+    error stops growing on, which is why the press is taken as the smaller of
+    the two here), and it slides the object *towards* the static pad it is being
+    seated against -- the direction it was going anyway.
+
+    Blocking at several points of the creep also covers the one blind spot the
+    watchdog has by construction: a block that lands before
+    :data:`~manus.expert.SEAT_CONTACT_REF_STEP` is partly absorbed into the
+    reference and has to be re-earned. That is why ``block_at=0`` banks the most.
+    """
+    from manus.expert import SEAT
+
+    config = ExpertConfig()
+    for spec in (CYLINDER, THICK_PUCK):
+        tips = spec.mass_kg * 9.81 * spec.radius / expert_mod.grasp_height(spec)
+        slides = objects.NOMINAL_FRICTION * spec.mass_kg * 9.81
+        stiffness = seat_stiffness(plan_grasp(spec, a_placement(spec)))
+        for block_at in (0, 5, 10, 25, 35):
+            expert, _ = seat_run(spec, block_at=block_at)
+            report = next(item for item in expert.reports if item.state == SEAT)
+            assert report.exit == "seated", (spec.name, block_at)
+            banked = report.steps - block_at
+            assert 0 < banked <= 20, (spec.name, block_at, banked)
+            press = min(banked * config.seat_creep_rate * stiffness, slides)
+            assert press < 0.75 * tips, (spec.name, block_at, press)
+            # The state still ended early, which is the difference between
+            # stopping on contact and stopping on arithmetic: an unblocked seat
+            # runs its whole ramp and dwell.
+            assert report.steps < (
+                expert_mod.seat_ramp_steps(config) + config.seat_settle_steps
+            )
+
+
+def test_a_blocked_seat_still_hands_close_a_squeezed_grasp():
+    """Ending SEAT early must not end the attempt early: CLOSE still runs."""
+    from manus.expert import SEAT
+
+    expert, _ = seat_run(CYLINDER, block_at=5)
+    states = [report.state for report in expert.reports]
+    assert states == list(expert_mod.state_sequence(CYLINDER)[:-1])
+    seat = next(item for item in expert.reports if item.state == SEAT)
+    close = next(item for item in expert.reports if item.state == CLOSE)
+    assert seat.exit == "seated" and close.exit == "stalled"
+    assert close.gripper == pytest.approx(CYLINDER.contact_angle_rad, abs=1e-3)
+    assert expert.timeouts == []
+
+
+def test_close_holds_the_seated_pose_on_a_top_down_seat():
+    """The freeze latch is the seat's, not the descent's -- the puck's copy."""
+    from manus.expert import SEAT
+
+    expert = ScriptedGraspExpert(THICK_PUCK, a_placement(THICK_PUCK))
+    plant = FakeArm(droop=0.03)
+    commands: dict[str, list[list[float]]] = {}
+    measured = plant.q.copy()
+    for _ in range(4000):
+        if expert.done:
+            break
+        targets = expert.step(measured)
+        commands.setdefault(expert.state, []).append(
+            [targets[name] for name in kinematics.ARM_JOINT_NAMES]
+        )
+        measured = plant.apply(targets)
+    assert np.allclose(commands[CLOSE][0], commands[SEAT][-1])
+    assert np.allclose(commands[CLOSE][0], commands[CLOSE][-1])
+    assert not np.allclose(commands[SEAT][-1], commands[DESCEND][-1])
+
+
+def test_a_plan_that_does_not_seat_refuses_to_be_asked_for_a_seat_pose():
+    """Failing loudly beats seating on the approach pose and calling it closed."""
+    plan = plan_grasp(CUBE, (0.20, 0.0, 0.0))
+    assert plan.q_seat is None and plan.tcp_seat is None and plan.seat_offset is None
+    with pytest.raises(ValueError, match="seat_close"):
+        plan.waypoint(expert_mod.SEAT)
+
+
+def test_the_seat_moves_with_the_jaw_clearance_it_gives_back(monkeypatch):
+    """``--jaw-clearance`` is one knob, not two: the approach and the seat share it."""
+    from manus.expert import seat_ramp_steps, seat_stroke
+
+    config = ExpertConfig()
+    monkeypatch.setattr(expert_mod, "JAW_CLEARANCE", 0.004)
+    assert seat_stroke(config) == pytest.approx(0.004)
+    assert seat_ramp_steps(config) == math.ceil(0.004 / config.seat_creep_rate)
+    plan = plan_grasp(THICK_PUCK, a_placement(THICK_PUCK))
+    assert np.linalg.norm(plan.tcp_seat - plan.tcp_grasp) == pytest.approx(0.004)
+    # A seat aimed at the clearance it already has is no seat at all.
+    zero = dataclasses.replace(config, seat_gap=0.004)
+    assert seat_stroke(zero) == pytest.approx(0.0)
+
+
 # --- The side approach's error budget -----------------------------------------------
 
 
@@ -2903,14 +3221,16 @@ def test_a_side_approach_holds_its_waypoint_until_the_droop_is_cancelled():
     assert early.joint_error > advance.joint_error
 
 
-def test_only_a_side_approach_dwells():
-    """The dwell is scoped to the side approach, so no top-down state moves.
+def test_only_a_side_approach_and_a_seat_dwell():
+    """The dwell is scoped to the side approach and to seating, so nothing else moves.
 
-    :func:`~manus.expert.settle_steps` is the whole scope: DESCEND, CLOSE, LIFT
-    and HOLD answer zero, which makes the FSM's exit rule for a top-down grasp
-    bit-for-bit the one every committed dataset was generated under.
+    :func:`~manus.expert.settle_steps` is the whole scope: on an object that
+    neither side-grasps nor seats -- which is five of the seven -- DESCEND,
+    CLOSE, LIFT and HOLD all answer zero, which makes the FSM's exit rule for a
+    top-down grasp bit-for-bit the one every committed dataset was generated
+    under.
     """
-    from manus.expert import settle_steps
+    from manus.expert import SEAT, settle_steps
 
     config = ExpertConfig()
     for state in (PREGRASP, DESCEND, CLOSE, LIFT, HOLD):
@@ -2920,6 +3240,17 @@ def test_only_a_side_approach_dwells():
     for state in (PREGRASP, expert_mod.ADVANCE):
         assert settle_steps(state, CYLINDER, config) == config.side_settle_steps
     assert settle_steps(PREGRASP, None, config) == 0
+    # The seat itself dwells in either mode, and so does the approach in front
+    # of it -- the seat is aimed from the pose the approach stopped at, so that
+    # pose has to have stopped.
+    for spec in (CYLINDER, THICK_PUCK):
+        assert settle_steps(SEAT, spec, config) == config.seat_settle_steps
+        assert (
+            settle_steps(expert_mod.approach_state(spec), spec, config)
+            >= config.seat_approach_settle
+        )
+    assert settle_steps(DESCEND, THICK_PUCK, config) == config.seat_approach_settle
+    assert settle_steps(SEAT, None, config) == config.seat_settle_steps
 
     # And the top-down FSM's step counts are unchanged against a fixed plant.
     plant = FakeArm(droop=np.full(ARM, 0.01))

@@ -273,6 +273,16 @@ class ObjectSpec:
             every object the tuned ramp already grasps -- it is for the two the
             *shove* destabilises: an object the closing jaw can topple (the
             standing cylinder) or squirt out of the hand (the 40 mm puck).
+        seat_close: Whether the FSM walks a :data:`manus.expert.SEAT` between
+            the approach and CLOSE -- the arm closing the last
+            :data:`manus.expert.JAW_CLEARANCE` onto the static pad at a creep,
+            so the moving jaw finds the object already against its stop and
+            has no gap to shove it across. The other half of the same two
+            objects' problem, and the half ``close_creep`` could not reach:
+            creeping makes the shove slow, seating removes it. Off by default,
+            and off for every object the tuned closure already grasps -- their
+            gate anchors are pinned, and a state they do not walk cannot move
+            them.
         experimental: Whether this object is known not to grasp reliably. It
             stays in :data:`OBJECTS` and can be run by name, but it is left out
             of :data:`DEFAULT_OBJECTS`, so a sweep over "every object" does not
@@ -308,6 +318,7 @@ class ObjectSpec:
     close_ramp: int | None = None
     tip_clearance_m: float | None = None
     close_creep: bool = False
+    seat_close: bool = False
     experimental: bool = False
     grasp_mode: GraspMode = "top"
 
@@ -521,6 +532,7 @@ OBJECTS: dict[str, ObjectSpec] = {
         yaw_symmetry="free",
         grasp_mode="side",
         close_creep=True,
+        seat_close=True,
         experimental=True,  # fails at CLOSE: seating-shove energy dump (see fix-crew notes)
     ),
     # A 16 mm acrylic die (~1200 kg/m^3): the smallest thing in the catalogue,
@@ -646,6 +658,7 @@ OBJECTS: dict[str, ObjectSpec] = {
         yaw_symmetry="free",
         tip_clearance_m=0.01176,
         close_creep=True,
+        seat_close=True,
         experimental=True,  # fails at CLOSE: seating-shove energy dump (see fix-crew notes)
     ),
     # A regulation ping-pong ball: 40 mm, 2.7 g, hollow (~80 kg/m^3). Kept at
