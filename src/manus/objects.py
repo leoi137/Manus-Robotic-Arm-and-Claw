@@ -27,6 +27,9 @@ Shape = Literal["cuboid", "cylinder", "sphere"]
 YawSymmetry = Literal["quarter", "half", "free"]
 """How much yaw freedom the grasp has; see :attr:`ObjectSpec.yaw_symmetry`."""
 
+GraspMode = Literal["top", "side"]
+"""How the hand comes at an object; see :attr:`ObjectSpec.grasp_mode`."""
+
 DEFAULT_COLOR: tuple[float, float, float] = (0.75, 0.25, 0.2)
 """Linear-RGB diffuse colour an object spawns with.
 
@@ -274,6 +277,13 @@ class ObjectSpec:
             ``"free"`` (round — any yaw at all). Declared per object and
             checked against the geometry, since it is the one property the
             expert cannot recover from :attr:`grasp_width_m` alone.
+        grasp_mode: ``"top"`` — the hand comes straight down, the default and
+            what every object but one is grasped with — or ``"side"``, the hand
+            laid flat and driven in radially so the jaws close across the
+            object horizontally, the way a hand takes a cup. Side mode is a
+            different tool family, a different placement region and a different
+            approach state in the FSM; see :data:`manus.kinematics.TOOL_HORIZONTAL`
+            and :data:`manus.expert.ADVANCE`.
         half_extents: Half-sizes (x, y, z) in metres. Cuboids only.
         radius: Cylinder or sphere radius in metres.
         height: Cylinder height in metres. Cylinders only.
@@ -292,6 +302,7 @@ class ObjectSpec:
     close_ramp: int | None = None
     tip_clearance_m: float | None = None
     experimental: bool = False
+    grasp_mode: GraspMode = "top"
 
     def __post_init__(self) -> None:
         if self.shape == "cuboid":
@@ -319,6 +330,18 @@ class ObjectSpec:
             raise ValueError(f"{self.name}: close_ramp must be at least one step")
         if self.tip_clearance_m is not None and self.tip_clearance_m < 0.0:
             raise ValueError(f"{self.name}: tip_clearance_m cannot be negative")
+        if self.grasp_mode not in ("top", "side"):
+            raise ValueError(f"{self.name}: unknown grasp_mode {self.grasp_mode!r}")
+        if self.grasp_mode == "side" and self.yaw_symmetry != "free":
+            # A side grasp spends the arm's fifth freedom on the closing plane's
+            # roll, which leaves the *approach azimuth* pinned by the reach
+            # direction (manus.kinematics.TOOL_HORIZONTAL). So the jaws arrive
+            # along whatever radius the object happens to sit on and the object
+            # has to look the same from all of them.
+            raise ValueError(
+                f"{self.name}: a side grasp cannot choose its approach azimuth, so the "
+                f"object must be round about its own z ('free'), not {self.yaw_symmetry!r}"
+            )
 
     @property
     def local_x_extent(self) -> float:
@@ -447,14 +470,22 @@ OBJECTS: dict[str, ObjectSpec] = {
     # d = 3 cm, h = 6 cm, standing on one flat end (~1900 kg/m^3). Grasped
     # across the diameter, so the jaw span matches the cube's.
     #
-    # The catalogue's topple case, and the only object the closing-jaw bar in
-    # manus.expert.grasp_height raises: standing 60 mm tall it reached 26 mm
-    # above a mid-height grasp, into the part of the sweep where the moving
-    # finger's face leans inward (manus.expert.JAW_PARALLEL_REACH), so the jaw
-    # met its upper body 26 mm above its centre of mass and 2.0 mm before the
-    # pads reached its 30 mm body, and pushed it over. It is grasped at 36 mm
-    # instead, which is still inside the object and keeps the pads over its
-    # upper 26 mm with the centre of mass hanging below them.
+    # THE CATALOGUE'S SIDE GRASP -- taken like a cup of water, hand flat, jaws
+    # closing horizontally across its waist at its own mid-height. That is the
+    # answer to the failure top-down kept having with it: 60 mm standing tall
+    # is 26 mm above a mid-height top-down grasp, deep into the part of the
+    # closing sweep where the moving finger's face leans inward
+    # (manus.expert.JAW_PARALLEL_REACH), so the jaw met its upper body 26 mm
+    # above its centre of mass and 2.0 mm before the pads reached its 30 mm
+    # body, and pushed it over. Raising the top-down grasp to 36 mm shrank that
+    # lead but kept the same hand-over-the-lid geometry; coming in from the side
+    # removes it. Horizontally the object is 30 mm across at every height, so
+    # nothing about the object is "above the TCP" any more -- only its own
+    # radius, 11 mm of it, is, well inside the parallel band.
+    #
+    # Its height is what makes it the side case rather than the puck: at a
+    # 30 mm grasp the hand's own housing clears the table by 5.8 mm
+    # (manus.expert.SIDE_JAW_DEPTH), which nothing shorter would allow.
     "cylinder_3cm": ObjectSpec(
         name="cylinder_3cm",
         shape="cylinder",
@@ -465,6 +496,7 @@ OBJECTS: dict[str, ObjectSpec] = {
         spawn_z=0.03,
         close_target_rad=close_target_for_width(0.03),
         yaw_symmetry="free",
+        grasp_mode="side",
     ),
     # A 16 mm acrylic die (~1200 kg/m^3): the smallest thing in the catalogue,
     # and the object the arm's own convergence residual is worst for -- 5.9 mm
@@ -532,6 +564,30 @@ OBJECTS: dict[str, ObjectSpec] = {
         close_target_rad=close_target_for_width(0.040),
         yaw_symmetry="free",
         experimental=True,
+    ),
+    # The 10 mm puck's respec: same 40 mm disc, twice as thick (~1200 kg/m^3,
+    # 30 g). The width, and so the close target and the contact angle, are
+    # identical -- what changes is the one thing the thin puck's failure was
+    # about, how much rim the pads get.
+    #
+    # A 20 mm rim is tall enough for grasp_height to centre the pads on it
+    # (the fingertips end up 7.7 mm off the table, past MIN_TIP_CLEARANCE with
+    # 2.7 mm to spare), so the grasp is its own mid-height and the pads cover
+    # 12.3 mm of the rim. The 10 mm puck cannot be centred at all: raised until
+    # the tips clear, its pads reach only the top 5.0 mm, and the closing finger
+    # -- still descending 16 mm per radian when it arrives -- meets the top edge
+    # first and drags the whole thing down and in. At 20 mm the same finger
+    # arrives on the rim's flat, below its top edge.
+    "puck_d40x20": ObjectSpec(
+        name="puck_d40x20",
+        shape="cylinder",
+        radius=0.020,
+        height=0.020,
+        mass_kg=0.030,
+        grasp_width_m=0.040,
+        spawn_z=0.010,
+        close_target_rad=close_target_for_width(0.040),
+        yaw_symmetry="free",
     ),
     # A regulation ping-pong ball: 40 mm, 2.7 g, hollow (~80 kg/m^3). Kept at
     # its real mass deliberately -- it is the catalogue's slip-and-roll case,

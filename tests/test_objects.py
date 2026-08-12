@@ -74,6 +74,7 @@ def test_catalogue_keys_match_spec_names():
         "die_16mm",
         "domino_20x40",
         "puck_d40x10",
+        "puck_d40x20",
         "pingpong_40mm",
         "duplo_32x64",
     }
@@ -180,7 +181,10 @@ def test_close_targets_are_pinned():
         "cylinder_3cm": 0.05,
         "die_16mm": -0.1036,  # LIGHT_SQUEEZE_RAD, not the full squeeze
         "domino_20x40": -0.0876,
+        # The two pucks are the same 40 mm disc, so the same target: the width
+        # is what the jaws span, and the respec changed only the rim's height.
         "puck_d40x10": 0.1876,
+        "puck_d40x20": 0.1876,
         "pingpong_40mm": 0.1876,
         "duplo_32x64": 0.0748,
     }
@@ -258,6 +262,7 @@ def test_close_ramps_are_pinned():
         "die_16mm": 150,
         "domino_20x40": 104,
         "puck_d40x10": 120,
+        "puck_d40x20": 85,  # twice the puck's mass, so the jaws may come in faster
         "pingpong_40mm": 150,
         "duplo_32x64": 104,
     }
@@ -524,3 +529,93 @@ def test_quat_from_z_axis_maps_z_onto_the_direction(direction):
 def test_quat_from_z_axis_rejects_the_zero_vector():
     with pytest.raises(ValueError, match="non-zero"):
         quat_from_z_axis_xyzw((0.0, 0.0, 0.0))
+
+
+# --- Per-mode placement regions -----------------------------------------------------
+#
+# A side-grasped object is placed on a different annulus, so the draw has to
+# know which object it is drawing for. What must *not* change is everything
+# else about the draw -- and, for a top-down object, not even the placement.
+
+GOLDEN_TOP_DOWN_DRAW = {
+    "object_x": 0.1077012236965687,
+    "object_y": -0.11191569290331138,
+    "object_yaw": -0.9431381922702697,
+    "object_color": [0.15418878646169656, 0.5613792582366869, 0.4586327750467186],
+    "object_static_friction": 0.8235333022006006,
+    "object_dynamic_friction": 0.8235333022006006,
+    "dome_intensity": 447.7512484151919,
+    "distant_intensity": 700.863433358707,
+    "distant_azimuth": 5.87677178442419,
+    "distant_elevation": 0.5343219004161894,
+    "cam_dpos": [0.001622654240251633, 0.0017808265135320122, -0.0022005880641807773],
+    "cam_dquat_xyzw": [
+        0.003963767333973988,
+        0.011387546686311784,
+        -0.0069675547703871065,
+        0.9999030280529762,
+    ],
+    "ground_albedo": 0.22187591912019738,
+}
+"""``draw_episode("grasp_cube_v2", 7)`` recorded before ``draw_episode`` learned
+about grasp modes.
+
+Every digit of it, because a draw *is* the replay contract: a dataset records
+the values it was generated with and re-derives nothing, so a draw that moved
+would silently make every committed episode unreproducible.
+"""
+
+
+def test_a_top_down_draw_is_byte_identical_to_the_one_before_grasp_modes():
+    from manus.objects import OBJECTS
+    from manus.randomize import draw_episode
+
+    assert draw_episode("grasp_cube_v2", 7).to_dict() == GOLDEN_TOP_DOWN_DRAW
+    # ... naming a top-down object, or none at all, is the same call.
+    assert draw_episode("grasp_cube_v2", 7, OBJECTS["cube_3cm"]).to_dict() == (
+        GOLDEN_TOP_DOWN_DRAW
+    )
+    assert draw_episode("grasp_cube_v2", 7, OBJECTS["puck_d40x20"]).to_dict() == (
+        GOLDEN_TOP_DOWN_DRAW
+    )
+
+
+def test_a_side_object_is_drawn_from_the_side_region_and_nothing_else_moves():
+    """The placement moves to the other annulus; the rest of the draw does not.
+
+    Same seed, same rng, same number of draws -- only the region the first two
+    numbers are mapped through. That is what keeps a side-mode dataset
+    comparable with a top-down one: the lighting, friction, colour and camera
+    jitter of attempt *n* are the same scene either way.
+    """
+    from manus.kinematics import GRASP_REGION, SIDE_GRASP_REGION
+    from manus.objects import OBJECTS
+    from manus.randomize import draw_episode, placement_region
+
+    top = draw_episode("grasp_cube_v2", 7).to_dict()
+    side = draw_episode("grasp_cube_v2", 7, OBJECTS["cylinder_3cm"]).to_dict()
+    moved = {key for key in top if top[key] != side[key]}
+    assert moved == {"object_x", "object_y"}
+    assert SIDE_GRASP_REGION.contains(side["object_x"], side["object_y"])
+    assert not GRASP_REGION.contains(side["object_x"], side["object_y"])
+    assert placement_region(OBJECTS["cylinder_3cm"]) is SIDE_GRASP_REGION
+    assert placement_region(OBJECTS["cube_3cm"]) is GRASP_REGION
+    assert placement_region() is GRASP_REGION
+
+
+@pytest.mark.parametrize("name", list(OBJECTS))
+def test_every_object_is_drawn_inside_its_own_region(name):
+    from manus.randomize import draw_episode, placement_region
+
+    spec = OBJECTS[name]
+    region = placement_region(spec)
+    for attempt in range(200):
+        draw = draw_episode("region_sweep", attempt, spec)
+        assert region.contains(draw.object_x, draw.object_y), (name, attempt)
+
+
+def test_the_two_regions_are_reachable_through_the_mode_table():
+    from manus.kinematics import GRASP_REGION, GRASP_REGIONS, SIDE_GRASP_REGION
+
+    assert GRASP_REGIONS == {"top": GRASP_REGION, "side": SIDE_GRASP_REGION}
+    assert {spec.grasp_mode for spec in OBJECTS.values()} <= set(GRASP_REGIONS)

@@ -27,23 +27,31 @@ import numpy as np
 from manus.kinematics import (
     BASE_KEEPOUT_ABS_Y,
     BASE_KEEPOUT_X,
+    GRASP_REGION,
+    GRASP_REGIONS,
     PAN_AXIS_XY,
     REGION_AZ_DEG,
     REGION_R,
+    SIDE_GRASP_REGION,
+    GraspRegion,
     in_base_keepout,
     in_grasp_region,
 )
+from manus.objects import ObjectSpec
 
 __all__ = [
     "BASE_KEEPOUT_ABS_Y",
     "BASE_KEEPOUT_X",
+    "GRASP_REGION",
     "PAN_AXIS_XY",
     "REGION_AZ_DEG",
     "REGION_R",
+    "SIDE_GRASP_REGION",
     "EpisodeDraw",
     "draw_episode",
     "in_base_keepout",
     "in_grasp_region",
+    "placement_region",
     "quat_from_rpy_xyzw",
     "quat_from_z_axis_xyzw",
     "quat_mul_xyzw",
@@ -241,21 +249,41 @@ def stable_hash64(dataset_name: str, attempt_index: int) -> int:
     return int.from_bytes(digest[:8], "big")
 
 
-def _sample_object_xy(rng: np.random.Generator) -> tuple[float, float]:
-    """Draw a placement uniformly by area over the region, outside the keep-out.
+def placement_region(spec: ObjectSpec | None = None) -> GraspRegion:
+    """The patch of table `spec` should be placed on.
+
+    :data:`~manus.kinematics.GRASP_REGION` for a top-down object and for
+    ``None``, :data:`~manus.kinematics.SIDE_GRASP_REGION` for a side-grasped
+    one. The two do not overlap -- a side grasp stands the whole hand out along
+    the table, which is worth ~160 mm of reach -- so this is not a refinement of
+    one region but a choice between two.
+    """
+    return GRASP_REGIONS["top" if spec is None else spec.grasp_mode]
+
+
+def _sample_object_xy(
+    rng: np.random.Generator, region: GraspRegion = GRASP_REGION
+) -> tuple[float, float]:
+    """Draw a placement uniformly by area over `region`, outside the keep-out.
 
     Radius is drawn as ``sqrt(U(r_min^2, r_max^2))`` so samples spread evenly
     over the annulus sector instead of piling up at its inner edge.
+
+    Two rng draws per try whichever region is passed, and a second try is only
+    spent when the keep-out rejects the first. The side region never reaches the
+    keep-out at all, so a side placement always costs exactly two draws -- the
+    same as the overwhelming majority of top-down ones -- and the rest of the
+    episode's randomization lands on the same numbers either way.
     """
-    r_min, r_max = REGION_R
-    az_max = math.radians(REGION_AZ_DEG)
-    pan_x, pan_y = PAN_AXIS_XY
+    r_min, r_max = region.radius
+    az_max = math.radians(region.azimuth_max_deg)
+    pan_x, pan_y = region.pan_axis_xy
     for _ in range(_MAX_PLACEMENT_TRIES):
         radius = math.sqrt(rng.uniform(r_min**2, r_max**2))
         azimuth = rng.uniform(-az_max, az_max)
         x = pan_x + radius * math.cos(azimuth)
         y = pan_y + radius * math.sin(azimuth)
-        if not in_base_keepout(x, y):
+        if not region.in_keepout(x, y):
             return float(x), float(y)
     raise RuntimeError(
         f"no placement outside the base keep-out in {_MAX_PLACEMENT_TRIES} tries; "
@@ -263,7 +291,9 @@ def _sample_object_xy(rng: np.random.Generator) -> tuple[float, float]:
     )
 
 
-def draw_episode(dataset_name: str, attempt_index: int) -> EpisodeDraw:
+def draw_episode(
+    dataset_name: str, attempt_index: int, spec: ObjectSpec | None = None
+) -> EpisodeDraw:
     """Sample the full randomization for one attempt.
 
     Deterministic in its arguments: the same pair always yields an identical
@@ -274,13 +304,20 @@ def draw_episode(dataset_name: str, attempt_index: int) -> EpisodeDraw:
         dataset_name: Dataset the attempt belongs to, e.g. ``"grasp_cube_v1"``.
         attempt_index: Attempt counter within that dataset. Held-out evaluation
             placements live at ``>= 10_000_000`` by convention.
+        spec: Object the attempt will grasp, which decides *which region* the
+            placement is drawn from (:func:`placement_region`) -- a side grasp
+            reaches a different annulus entirely. None means the top-down
+            region, so every pre-existing call is unchanged, and the seed and
+            the number of rng draws do not depend on this argument either way:
+            the same ``(dataset_name, attempt_index)`` gives the same lighting,
+            colour, friction and camera jitter whatever is being grasped.
 
     Returns:
         The sampled :class:`EpisodeDraw`.
     """
     rng = np.random.default_rng(stable_hash64(dataset_name, attempt_index))
 
-    object_x, object_y = _sample_object_xy(rng)
+    object_x, object_y = _sample_object_xy(rng, placement_region(spec))
     static_friction = float(rng.uniform(*FRICTION_RANGE))
     # PhysX expects dynamic <= static. Clamping rather than re-drawing keeps the
     # number of rng calls independent of the values drawn.

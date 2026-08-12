@@ -581,7 +581,7 @@ def main() -> int:
     print(f"  fixed-jaw sensor bodies : {runner.probes[0].body_names}")
     print(f"  moving-jaw sensor bodies: {runner.probes[1].body_names}")
 
-    draw = draw_episode(args_cli.namespace, args_cli.attempt)
+    draw = draw_episode(args_cli.namespace, args_cli.attempt, spec)
     if args_cli.pose is not None:
         x, y, yaw = args_cli.pose
         draw = dataclasses.replace(draw, object_x=x, object_y=y, object_yaw=yaw)

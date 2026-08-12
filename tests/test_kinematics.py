@@ -648,3 +648,560 @@ def test_ik_rejects_malformed_arguments():
         kinematics.ik_solve(np.zeros(2), 0.0)
     with pytest.raises(ValueError, match="q_seed must have shape"):
         kinematics.ik_solve(np.array([0.25, 0.0, 0.03]), 0.0, q_seed=np.zeros(6))
+
+
+# --- The horizontal tool family -----------------------------------------------
+#
+# Everything below is derived here rather than taken from the module: the two
+# families' constants look similar and are not, and a prose claim about which
+# way the tool points is exactly the kind of thing that is wrong for a year.
+
+SIDE_REGION = kinematics.SIDE_GRASP_REGION
+HORIZONTAL = kinematics.TOOL_HORIZONTAL
+VERTICAL = kinematics.TOOL_VERTICAL
+
+SIDE_TCP_Z = 0.030
+"""TCP height the side grasps below are solved at: the cylinder's own mid-height."""
+
+SIDE_RETRACT = 0.040
+"""Radial stand-off the side pregrasp sits at, metres (ExpertConfig.side_retract)."""
+
+
+def _horizontal_configs(count: int = 200, seed: int = 3) -> list[np.ndarray]:
+    """Seeded in-limit configurations whose pitch sum lays the tool flat."""
+    rng = np.random.default_rng(seed)
+    configs: list[np.ndarray] = []
+    while len(configs) < count:
+        q = rng.uniform(ARM_LOWER, ARM_UPPER)
+        q[3] = kinematics.wrist_flex_for_pitch_sum(q[1], q[2], kinematics.PITCH_SUM_HORIZONTAL)
+        if ARM_LOWER[3] <= q[3] <= ARM_UPPER[3]:
+            configs.append(q)
+    return configs
+
+
+HORIZONTAL_CONFIGS = _horizontal_configs()
+
+
+def test_wrist_flex_for_pitch_sum_generalises_the_vertical_one():
+    assert kinematics.wrist_flex_for_pitch_sum(0.4, -0.9) == kinematics.wrist_flex_for_vertical(
+        0.4, -0.9
+    )
+    q = np.array([0.0, 0.4, -0.9, kinematics.wrist_flex_for_pitch_sum(0.4, -0.9, 0.0), 0.0])
+    assert kinematics.pitch_sum(q) == pytest.approx(kinematics.PITCH_SUM_HORIZONTAL, abs=1e-12)
+
+
+def test_pitch_sum_horizontal_lays_the_approach_axis_flat_and_aims_it_outward():
+    """The direction convention, measured -- not asserted from the docstring.
+
+    At ``shoulder_pan = 0`` the tool's +Z comes out as world **+X**, i.e.
+    radially *outward*, away from the base and along the table. That is the
+    sense a side grasp needs: the wrist ends up behind the TCP, between the
+    object and the robot, so the hand reaches a standing object from the base's
+    side rather than over the top of it.
+    """
+    q = np.array([0.0, 0.3, -0.3, 0.0, 0.0])
+    assert kinematics.pitch_sum(q) == pytest.approx(kinematics.PITCH_SUM_HORIZONTAL, abs=1e-12)
+    _, rotation = CHAIN.fk_tcp(q)
+    assert rotation[:, 2] == pytest.approx([1.0, 0.0, 0.0], abs=1e-4)
+    # ... and the wrist really is behind it, at the same height. Measured at the
+    # level roll, which is the only one a side grasp is ever solved at: the
+    # 7.9 mm TCP swing is vertical at other rolls and would tilt this.
+    level = kinematics._horizontal_roll_for(np.pi, 0.0)
+    poses = CHAIN.fk(np.array([0.0, 0.3, -0.3, 0.0, level]))
+    offset = poses[kinematics.TCP_LINK][0] - poses[kinematics._WRIST_ORIGIN_LINK][0]
+    assert offset[0] > 0.15, "the TCP is not out in front of the wrist"
+    assert abs(offset[2]) < 1e-3, "the horizontal family is not level with its own wrist"
+    approach = CHAIN.fk_tcp(np.array([0.0, 0.3, -0.3, 0.0, level]))[1][:, 2]
+    assert float(offset @ approach) == pytest.approx(
+        kinematics.TCP_TO_WRIST_HORIZONTAL, abs=5e-4
+    )
+    # ... and it is the same 159 mm the vertical family drops, not a new number.
+    vertical = kinematics._tcp_from_wrist(0.0, 0.0, VERTICAL)
+    assert abs(vertical[2]) == pytest.approx(kinematics.TCP_TO_WRIST_HORIZONTAL, abs=5e-4)
+
+
+def test_the_horizontal_family_is_flat_everywhere_and_its_azimuth_is_minus_the_pan():
+    """Two facts the side plan rests on, swept over the whole in-limit family.
+
+    The approach axis stays in the table plane (so a "side" grasp is level, not
+    a shallow dive), and its world azimuth is exactly ``-shoulder_pan``. The
+    second is why the approach azimuth cannot be *requested*: it is whatever the
+    reach direction makes it, which is what the planner's fixed point is for.
+    """
+    worst_tilt = max(_horizontal_tilt_deg(q) for q in HORIZONTAL_CONFIGS)
+    assert worst_tilt < 0.01, f"tool not level, worst {worst_tilt:.4f} deg"
+    worst_azimuth = max(
+        abs(np.degrees(kinematics._wrap(CHAIN.approach_azimuth(q) + q[0])))
+        for q in HORIZONTAL_CONFIGS
+    )
+    assert worst_azimuth < 0.01, f"approach azimuth is not -pan, worst {worst_azimuth:.4f} deg"
+
+
+def _horizontal_tilt_deg(q: np.ndarray) -> float:
+    """Angle between the tool approach axis and the table plane, in degrees."""
+    _, rotation = CHAIN.fk_tcp(q)
+    return float(abs(np.degrees(np.arcsin(np.clip(rotation[2, 2], -1.0, 1.0)))))
+
+
+def test_the_tool_orientation_depends_only_on_the_pitch_sum_not_on_its_split():
+    """Why one number can stand for the whole tilt: the pitch joints share an axis."""
+    reference = CHAIN.fk_tcp(np.array([0.4, 0.0, 0.0, 0.0, 0.9]))[1]
+    for lift, elbow in ((0.3, -0.3), (-0.5, 0.5), (0.8, -0.8), (1.2, -1.2)):
+        rotation = CHAIN.fk_tcp(np.array([0.4, lift, elbow, -lift - elbow, 0.9]))[1]
+        assert kinematics.rotation_error_deg(reference, rotation) < 0.01, (lift, elbow)
+
+
+def test_tool_roll_relation_holds_at_horizontal_configs():
+    """``tool_roll = TOOL_ROLL_OFFSET - wrist_roll``, and shoulder_pan drops out.
+
+    The horizontal counterpart of :func:`test_tool_yaw_relation_holds_at_vertical_configs`
+    -- and deliberately checked against a formula with *no pan term and the
+    opposite roll sign*, because the vertical relation's shape is the thing most
+    likely to be assumed here by analogy. It is wrong by up to a full turn of
+    pan if it is.
+    """
+
+    def error_deg(q: np.ndarray) -> float:
+        predicted = kinematics.TOOL_ROLL_OFFSET - q[4]
+        return abs(np.degrees((CHAIN.tool_roll(q) - predicted + np.pi) % (2 * np.pi) - np.pi))
+
+    worst = max(HORIZONTAL_CONFIGS, key=error_deg)
+    assert error_deg(worst) < 0.1, f"roll relation broken at q={worst}"
+    # The vertical relation is *not* it -- pan really does drop out. (The
+    # 0.0002 deg left over is the URDF's own asymmetry, the same thing that
+    # makes the pitch axis 90.00036 deg rather than 90.)
+    panned = [
+        CHAIN.tool_roll(np.array([pan, 0.0, 0.0, 0.0, 0.3]))
+        for pan in np.linspace(-1.9, 1.9, 9)
+    ]
+    assert np.degrees(np.ptp(panned)) < 0.001, "tool roll moved with shoulder_pan"
+
+
+def test_the_roll_offset_is_the_yaw_offsets_own_calibration_term():
+    """Both constants are the same 0.0486795 rad wrist_roll origin offset."""
+    calibration = kinematics.ARM_JOINTS[4].rpy[1]
+    assert kinematics.TOOL_YAW_OFFSET == pytest.approx(np.pi - calibration, abs=1e-5)
+    assert kinematics.TOOL_ROLL_OFFSET == pytest.approx(-np.pi / 2 + calibration, abs=1e-5)
+
+
+def test_tool_yaw_cannot_serve_as_the_horizontal_familys_residual_row():
+    """Why the fifth residual row had to change with the pitch sum.
+
+    Sweeping wrist_roll through a whole turn at a horizontal tool sweeps the
+    jaws from level to vertical and back, but the tool *yaw* only ever takes two
+    values 180 deg apart -- because the tool's +X stays perpendicular to a
+    horizontal approach axis, so the azimuth of its shadow cannot move. A
+    residual row built on it is a step function with a zero derivative, and
+    damped least squares would simply stop steering wrist_roll.
+    """
+    yaws, rolls = [], []
+    for roll in np.linspace(-np.pi, np.pi, 73):
+        q = np.array([0.2, 0.0, 0.0, 0.0, float(roll)])
+        # Skip the two rolls where the jaws close vertically: the tool's +X is
+        # then straight up and its azimuth is genuinely undefined, so what comes
+        # back is arctan2 of rounding noise. That is the same degeneracy, seen
+        # from the other side.
+        if abs(abs(CHAIN.tool_roll(q)) - np.pi / 2) < np.radians(5.0):
+            continue
+        yaws.append(CHAIN.tool_yaw(q))
+        rolls.append(CHAIN.tool_roll(q))
+    distinct = np.unique(np.round(np.degrees(yaws), 1))
+    assert len(distinct) == 2, f"tool yaw took {len(distinct)} values, not two: {distinct}"
+    assert abs(abs(distinct[1] - distinct[0]) - 180.0) < 0.1
+    # ... while the roll this family uses instead sweeps the whole turn, so its
+    # residual row has a derivative to steer on.
+    assert np.ptp(np.degrees(rolls)) > 340.0
+
+
+def test_horizontal_tool_rotation_inverts_tool_roll_of():
+    """The planner's forward map and the solver's measurement are the same convention."""
+    for azimuth in np.linspace(-2.0, 2.0, 9):
+        for roll in np.linspace(-3.0, 3.0, 13):
+            rotation = kinematics.horizontal_tool_rotation(float(azimuth), float(roll))
+            assert rotation.T @ rotation == pytest.approx(np.eye(3), abs=1e-12)
+            assert np.linalg.det(rotation) == pytest.approx(1.0)
+            assert kinematics.tool_roll_of(rotation) == pytest.approx(
+                float(kinematics._wrap(roll)), abs=1e-9
+            )
+            assert float(np.arctan2(rotation[1, 2], rotation[0, 2])) == pytest.approx(
+                float(azimuth), abs=1e-12
+            )
+
+
+def test_a_level_roll_points_the_jaw_axis_along_the_table():
+    """``tool_roll = 0`` and ``pi`` are the two cup grasps, and pi puts +Y down.
+
+    That last half is what :data:`~manus.expert.SIDE_GRASP_ROLL` spends the free
+    choice on -- the hand is not symmetric about its own y, so which way up it
+    is decides how close its housing comes to the table.
+    """
+    for roll, tool_y_z in ((0.0, +1.0), (np.pi, -1.0)):
+        rotation = kinematics.horizontal_tool_rotation(0.7, roll)
+        assert rotation[2, 0] == pytest.approx(0.0, abs=1e-12), "jaw axis is not level"
+        assert rotation[:, 1] == pytest.approx([0.0, 0.0, tool_y_z], abs=1e-12)
+    # Half-way between them the jaws close vertically instead -- the thing a
+    # cup grasp must not do.
+    assert abs(kinematics.horizontal_tool_rotation(0.7, np.pi / 2)[2, 0]) == pytest.approx(1.0)
+
+
+def test_tool_roll_is_undefined_where_the_vertical_family_lives():
+    """An exactly-vertical approach has no "level" direction to measure from."""
+    straight_down = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+    assert np.linalg.det(straight_down) == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="vertical approach axis"):
+        kinematics.tool_roll_of(straight_down)
+
+
+def test_both_level_rolls_are_inside_the_wrist_travel_at_every_pan():
+    """The side grasp has no wrist_roll gap, unlike the top-down one.
+
+    The vertical family loses a 40 deg band of tool yaws at any given pan
+    (:func:`test_the_pi_flipped_grasp_covers_the_wrist_roll_gap`). The
+    horizontal one loses nothing: the roll it needs does not depend on pan at
+    all, and both level branches sit ~70 deg inside the stops.
+    """
+    lower, upper = specs.JOINT_LIMITS["wrist_roll"]
+    for target in (0.0, np.pi):
+        rolls = {
+            round(kinematics._horizontal_roll_for(target, pan), 12)
+            for pan in np.linspace(-1.9, 1.9, 21)
+        }
+        assert len(rolls) == 1, "the level roll moved with pan"
+        roll = rolls.pop()
+        assert lower < roll < upper
+        assert min(roll - lower, upper - roll) > np.radians(60.0)
+
+
+# --- The side-grasp seed and region ---------------------------------------------
+
+
+def _side_targets(seed: int, count: int = 400) -> list[tuple[np.ndarray, float]]:
+    """Seeded ``(target_pos, target_roll)`` requests over the whole side region."""
+    inner, outer = SIDE_REGION.radius
+    azimuth_max = np.radians(SIDE_REGION.azimuth_max_deg)
+    pan_x, pan_y = SIDE_REGION.pan_axis_xy
+    rng = np.random.default_rng(seed)
+    targets = []
+    while len(targets) < count:
+        radius = np.sqrt(rng.uniform(inner**2, outer**2))
+        azimuth = rng.uniform(-azimuth_max, azimuth_max)
+        # The TCP stands a stand-off short of the object, and the pregrasp a
+        # further 40 mm: both are sampled, since both have to solve.
+        radius -= rng.choice([0.0, SIDE_RETRACT])
+        targets.append(
+            (
+                np.array(
+                    [
+                        pan_x + radius * np.cos(azimuth),
+                        pan_y + radius * np.sin(azimuth),
+                        SIDE_TCP_Z,
+                    ]
+                ),
+                float(rng.choice([0.0, np.pi])),
+            )
+        )
+    return targets
+
+
+SIDE_TARGETS = tuple(_side_targets(seed=5))
+
+
+def test_the_horizontal_seed_is_already_the_answer_and_far_more_exactly():
+    """The exact plane solve, measured: microns, against the vertical seed's tens.
+
+    The horizontal family does not iterate at all -- it puts the TCP on the
+    plane parallel to the arm's own pitch plane in one closed-form step -- so
+    the only error left is the URDF's own sub-milliradian asymmetry.
+    """
+    worst = max(
+        kinematics.ik_errors(
+            kinematics.analytic_seed(target, roll, HORIZONTAL)[0], target, roll, HORIZONTAL
+        )[0]
+        for target, roll in SIDE_TARGETS
+    )
+    assert worst < 1e-5, f"horizontal seed off by {worst * 1e6:.2f} um"
+
+
+def test_the_vertical_familys_fixed_point_would_not_have_solved_the_horizontal_one():
+    """Why the two seeds are different code, measured rather than asserted.
+
+    Running the vertical family's ``pan -> wrist -> pan`` iteration against a
+    horizontal target does not converge: the TCP stands 161 mm out along the
+    arm's plane, so subtracting it leaves a wrist at a much smaller radius where
+    the same lateral offset subtends a much larger azimuth. The iteration is a
+    two-cycle, and the swing does not shrink.
+    """
+    target = np.array([kinematics.PAN_AXIS_XY[0] + 0.32, 0.0, SIDE_TCP_Z])
+    roll = kinematics._horizontal_roll_for(np.pi, 0.0)
+
+    pan = kinematics._pan_for_point(target)
+    history = [pan]
+    for _ in range(kinematics._SEED_PASSES):
+        wrist = target - kinematics._tcp_from_wrist(pan, roll, HORIZONTAL)
+        pan = kinematics._pan_for_point(wrist)
+        history.append(pan)
+    # It swings back and forth by degrees instead of settling.
+    assert np.ptp(np.degrees(history)) > 3.0, f"no oscillation: {np.degrees(history)}"
+
+    # And the seed it would build is centimetres out, against the exact solve's
+    # fraction of a micron -- five orders of magnitude, on the same target.
+    planar = np.linalg.solve(
+        kinematics._shoulder_frame(pan),
+        np.append(target - kinematics._tcp_from_wrist(pan, roll, HORIZONTAL), 1.0),
+    )
+    lift, elbow = kinematics._planar_2r(planar[0], planar[1], 1.0)
+    iterated = np.array([pan, lift, elbow, -lift - elbow, roll])
+    exact = kinematics.analytic_seed(target, np.pi, HORIZONTAL)[0]
+    assert kinematics.ik_errors(iterated, target, np.pi, HORIZONTAL)[0] > 5e-3
+    assert kinematics.ik_errors(exact, target, np.pi, HORIZONTAL)[0] < 1e-6
+
+
+def test_ik_round_trips_the_side_grasp_region():
+    """Every side request answered, and every answer verified by running FK back."""
+    worst = {"pos": 0.0, "tilt": 0.0, "roll": 0.0, "pitch": 0.0}
+    for target, roll in SIDE_TARGETS:
+        q, converged = kinematics.ik_solve(target, roll, family=HORIZONTAL)
+        assert converged, f"unsolved side target {target} roll {roll}"
+        assert np.all(q >= ARM_LOWER) and np.all(q <= ARM_UPPER), f"{q} at {target}"
+        position_error, tilt, roll_error = kinematics.ik_errors(q, target, roll, HORIZONTAL)
+        worst["pos"] = max(worst["pos"], position_error)
+        worst["tilt"] = max(worst["tilt"], np.degrees(tilt))
+        worst["roll"] = max(worst["roll"], np.degrees(roll_error))
+        worst["pitch"] = max(
+            worst["pitch"],
+            abs(np.degrees(kinematics.pitch_sum(q) - kinematics.PITCH_SUM_HORIZONTAL)),
+        )
+    assert worst["pos"] < MAX_IK_POS_ERROR, f"worst position error {worst['pos'] * 1e3:.4f} mm"
+    assert worst["tilt"] < MAX_IK_TILT_DEG, f"worst tool tilt {worst['tilt']:.4f} deg"
+    assert worst["roll"] < MAX_IK_YAW_DEG, f"worst tool roll error {worst['roll']:.4f} deg"
+    assert worst["pitch"] < MAX_IK_TILT_DEG, f"worst pitch-sum error {worst['pitch']:.4f} deg"
+
+
+def test_ik_solves_the_whole_boundary_of_the_side_region():
+    """The edges, swept deterministically -- including the retracted pregrasp.
+
+    The interior of an annulus this thin says nothing about its edges, and both
+    of them are hard limits: wrist_flex's stop inside, the arm's own reach
+    outside. Every point is checked at the grasp depth *and* 40 mm back, which
+    is what actually has to solve.
+    """
+    pan_x, pan_y = SIDE_REGION.pan_axis_xy
+    radii = np.linspace(*SIDE_REGION.radius, 9)
+    span = SIDE_REGION.azimuth_max_deg
+    azimuths = np.radians(np.linspace(-span, span, 9))
+    edge = [(radius, azimuths[0]) for radius in radii]
+    edge += [(radius, azimuths[-1]) for radius in radii]
+    edge += [(SIDE_REGION.radius[0], azimuth) for azimuth in azimuths]
+    edge += [(SIDE_REGION.radius[1], azimuth) for azimuth in azimuths]
+    for radius, azimuth in edge:
+        for depth in (0.0, SIDE_RETRACT):
+            reach = radius - depth
+            target = np.array(
+                [pan_x + reach * np.cos(azimuth), pan_y + reach * np.sin(azimuth), SIDE_TCP_Z]
+            )
+            for roll in (0.0, np.pi):
+                q, converged = kinematics.ik_solve(target, roll, family=HORIZONTAL)
+                assert converged, (
+                    f"side edge unreachable: r={radius:.3f} az={np.degrees(azimuth):+.1f} deg "
+                    f"back={depth * 1e3:.0f} mm roll={np.degrees(roll):.0f} -> q={np.round(q, 4)}"
+                )
+
+
+def _side_margin_deg(radius: float, azimuth_deg: float = 0.0) -> float | None:
+    """Smallest joint travel left over a side grasp and its pregrasp, in degrees.
+
+    `radius` is an *object placement* radius, so the TCP stands
+    ``TCP_TO_PAD_CENTRE`` short of it (the pads sit that far along the approach)
+    and the pregrasp a further :data:`SIDE_RETRACT` back. The tool's 17 mm
+    tangential stand-off is left out -- this is a radial bound, and the planner's
+    own coverage of the region is checked in ``tests/test_expert_logic.py``.
+    """
+    pan_x, pan_y = SIDE_REGION.pan_axis_xy
+    azimuth = np.radians(azimuth_deg)
+    worst = np.inf
+    for depth in (0.0, SIDE_RETRACT):
+        reach = radius - kinematics.TCP_TO_PAD_CENTRE - depth
+        target = np.array(
+            [pan_x + reach * np.cos(azimuth), pan_y + reach * np.sin(azimuth), SIDE_TCP_Z]
+        )
+        q, converged = kinematics.ik_solve(target, np.pi, family=HORIZONTAL)
+        if not converged:
+            return None
+        worst = min(worst, float(np.min(np.minimum(q - ARM_LOWER, ARM_UPPER - q))))
+    return float(np.degrees(worst))
+
+
+def test_the_side_regions_inner_edge_is_the_wrist_flex_stop():
+    """Where 0.358 m comes from: a hand's length of reach the arm has to fold back.
+
+    Just inside the region the binding joint is wrist_flex, hard against its
+    -95 deg stop, and the plan dies a couple of centimetres further in. The
+    committed inner radius keeps >= 10 deg on every joint -- the same order as
+    GRASP_REGION's own inner edge (11.8 deg, measured below).
+    """
+    assert _side_margin_deg(0.328) is None, "the region reaches further in than measured"
+    assert _side_margin_deg(0.332) == pytest.approx(0.0, abs=0.1), "the stop moved"
+    assert _side_margin_deg(SIDE_REGION.radius[0]) > 10.0
+    # ... and it is wrist_flex that runs out, not something else.
+    pan_x, _ = SIDE_REGION.pan_axis_xy
+    reach = 0.334 - kinematics.TCP_TO_PAD_CENTRE - SIDE_RETRACT
+    q, converged = kinematics.ik_solve(
+        np.array([pan_x + reach, 0.0, SIDE_TCP_Z]), np.pi, family=HORIZONTAL
+    )
+    assert converged
+    tightest = int(np.argmin(np.minimum(q - ARM_LOWER, ARM_UPPER - q)))
+    assert kinematics.ARM_JOINT_NAMES[tightest] == "wrist_flex"
+    assert q[tightest] == pytest.approx(ARM_LOWER[tightest], abs=np.radians(1.0))
+
+
+def test_the_side_regions_outer_edge_keeps_reach_in_hand_not_joint_angle():
+    """Where 0.420 m comes from, and why it is not a joint-margin bound.
+
+    Near full extension the joint margins stay comfortable right up to the
+    cliff, so they are the wrong measure: the plan still has 9 deg on every
+    joint two millimetres before it stops solving at all. The committed outer
+    radius keeps 10 mm of *radius* in hand instead.
+    """
+    assert _side_margin_deg(0.428) > 9.0, "the margin measure is not saturating after all"
+    assert _side_margin_deg(0.432) is None
+    assert SIDE_REGION.radius[1] <= 0.430 - 0.010
+
+
+def test_the_top_regions_edges_carry_the_margin_the_side_regions_inner_edge_copies():
+    """The calibration behind "10 deg": what GRASP_REGION's own edges have left."""
+    pan_x, _ = kinematics.GRASP_REGION.pan_axis_xy
+    margins = []
+    for radius in kinematics.GRASP_REGION.radius:
+        # The cube's own two waypoint heights: the grasp and its 30 mm hover.
+        worst = min(
+            float(
+                np.degrees(
+                    np.min(np.minimum(*_limits_gap(np.array([pan_x + radius, 0.0, height]))))
+                )
+            )
+            for height in (0.019, 0.049)
+        )
+        margins.append(worst)
+    assert margins == pytest.approx([13.6, 9.8], abs=0.3)
+    assert min(margins) < _side_margin_deg(SIDE_REGION.radius[0])
+
+
+def _limits_gap(target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(q - lower, upper - q)`` of the top-down solve at `target`, radians."""
+    q, converged = kinematics.ik_solve(target, 0.0)
+    assert converged, target
+    return q - ARM_LOWER, ARM_UPPER - q
+
+
+def test_the_side_region_azimuth_leaves_pan_travel_the_way_the_top_one_does():
+    """105 deg is shared, and it is a shave rather than a retreat here too."""
+    assert SIDE_REGION.azimuth_max_deg == kinematics.REGION_AZ_DEG
+    mid = float(np.mean(SIDE_REGION.radius))
+    assert _side_margin_deg(mid, +SIDE_REGION.azimuth_max_deg) > 3.0
+    assert _side_margin_deg(mid, -SIDE_REGION.azimuth_max_deg) > 3.0
+    # ... and the arm really does run out just past it, so the cap is a shave
+    # rather than workspace thrown away.
+    assert _side_margin_deg(mid, 112.0) is None
+    assert _side_margin_deg(mid, -112.0) is None
+
+
+def test_the_two_regions_do_not_overlap():
+    """A side grasp reaches a different annulus, not a corner of the same one."""
+    assert kinematics.GRASP_REGION.radius[1] < SIDE_REGION.radius[0]
+    for x, y in ((0.20, 0.0), (0.10, 0.15), (0.02, -0.18)):
+        assert kinematics.GRASP_REGION.contains(x, y)
+        assert not SIDE_REGION.contains(x, y)
+
+
+def test_the_side_region_never_touches_the_base_keepout():
+    """It carries the same rectangle, and the rectangle can never bite out there."""
+    assert SIDE_REGION.keepout_x == kinematics.GRASP_REGION.keepout_x
+    assert SIDE_REGION.keepout_abs_y == kinematics.GRASP_REGION.keepout_abs_y
+    pan_x, pan_y = SIDE_REGION.pan_axis_xy
+    for radius in np.linspace(*SIDE_REGION.radius, 7):
+        for azimuth in np.radians(
+            np.linspace(-SIDE_REGION.azimuth_max_deg, SIDE_REGION.azimuth_max_deg, 61)
+        ):
+            x = pan_x + radius * np.cos(azimuth)
+            y = pan_y + radius * np.sin(azimuth)
+            assert not SIDE_REGION.in_keepout(x, y)
+
+
+def test_the_region_table_is_the_two_regions():
+    assert kinematics.GRASP_REGIONS == {
+        "top": kinematics.GRASP_REGION,
+        "side": kinematics.SIDE_GRASP_REGION,
+    }
+
+
+# --- The default family is the old solver, bit for bit --------------------------
+
+GOLDEN_VERTICAL_SOLVES = {
+    (0.150, 0.000, 0.030, 0.0): (
+        -0.003312248059109457,
+        -0.6099686092652772,
+        0.9159839899867617,
+        1.264780946073412,
+        0.045364984779012296,
+    ),
+    (0.220, -0.080, 0.045, 1.1): (
+        0.4548612031959012,
+        0.0588708963644482,
+        0.15161487706594912,
+        1.3603105533644992,
+        -1.53805421755577,
+    ),
+    (0.100, 0.120, 0.015, -2.4): (
+        -1.0826311214028066,
+        -0.33141555927854105,
+        0.8134331278189824,
+        1.0887787582544552,
+        -0.2923612349748925,
+    ),
+    (0.060, -0.180, 0.019, 0.7): (
+        1.4876456285703554,
+        0.019864045497194116,
+        0.4009744152490695,
+        1.149957866048633,
+        -0.9052697921813158,
+    ),
+}
+"""Solves recorded from the solver *before* it learned about tool families.
+
+Every digit, not a tolerance: generalising ``ik_solve`` was allowed to add a
+family and forbidden to move the answers, because these joint angles are what
+the 200-attempt Step 8 gate and every committed dataset were produced with.
+"""
+
+
+@pytest.mark.parametrize("request_", list(GOLDEN_VERTICAL_SOLVES), ids=str)
+def test_the_generalised_solver_reproduces_the_old_one_bit_for_bit(request_):
+    *position, yaw = request_
+    q, converged = kinematics.ik_solve(np.array(position), yaw)
+    assert converged
+    assert tuple(q.tolist()) == GOLDEN_VERTICAL_SOLVES[request_]
+
+
+def test_naming_the_default_family_changes_nothing():
+    """Passing TOOL_VERTICAL explicitly is the same call, to the last bit."""
+    for target, yaw in REGION_TARGETS[::37]:
+        implicit = kinematics.ik_solve(target, yaw)
+        explicit = kinematics.ik_solve(target, yaw, family=VERTICAL)
+        assert np.array_equal(implicit[0], explicit[0])
+        assert implicit[1] == explicit[1]
+        assert np.array_equal(
+            kinematics.analytic_seed(target, yaw)[0],
+            kinematics.analytic_seed(target, yaw, VERTICAL)[0],
+        )
+        assert kinematics.ik_errors(implicit[0], target, yaw) == kinematics.ik_errors(
+            implicit[0], target, yaw, VERTICAL
+        )
+
+
+def test_the_vertical_family_still_describes_itself_correctly():
+    assert VERTICAL.pitch_sum == kinematics.PITCH_SUM_VERTICAL
+    assert VERTICAL.measure is kinematics.tool_yaw_of
+    assert HORIZONTAL.pitch_sum == kinematics.PITCH_SUM_HORIZONTAL
+    assert HORIZONTAL.measure is kinematics.tool_roll_of
+    q = np.array([0.2, 0.5, -0.6, 0.3, -0.4])
+    assert VERTICAL.measure(CHAIN.fk_tcp(q)[1]) == CHAIN.tool_yaw(q)

@@ -38,6 +38,38 @@ States, in order -- :data:`STATE_SEQUENCE`:
     Everything still for :data:`ExpertConfig.hold_steps`, which is what the
     success predicate's "sustained" is measured over.
 
+**Side grasps** (``spec.grasp_mode == "side"``, :data:`SIDE_STATE_SEQUENCE`)
+walk the same five states with DESCEND replaced by ADVANCE, and they are a
+different plan rather than the same plan rotated:
+
+``PREGRASP``
+    Tool **flat**, approach axis horizontal and pointing radially outward, jaws
+    open and level; standing :attr:`ExpertConfig.side_retract` back from the
+    grasp along that axis, at the grasp's own height. The hand never passes over
+    the object.
+``ADVANCE``
+    Straight out along the approach axis onto the grasp pose, so the object ends
+    up between the pads -- the same ``(lateral, 0, TCP_TO_PAD_CENTRE)`` in the
+    tool's own frame as a top-down grasp, which in the world is now *tangential*
+    and *radial* rather than lateral and vertical (:func:`side_tcp_target`).
+``CLOSE``
+    Arm frozen, jaws driven to ``spec.close_target_rad`` -- deliberately past
+    contact, so the servo squeezes against its effort limit.
+``LIFT``
+    Joint-space retraction: the three pitch joints follow the TCP-height
+    gradient to a raised pose while shoulder_pan and wrist_roll hold still.
+    **No verticality constraint** -- the tool-vertical family tops out at
+    0.0903 m TCP height, which is not enough clearance, so the tool is allowed
+    to tilt (see :func:`plan_lift`).
+``HOLD``
+    Everything still for :data:`ExpertConfig.hold_steps`, which is what the
+    success predicate's "sustained" is measured over.
+
+CLOSE, LIFT and HOLD are shared verbatim: the jaws do not know which way the
+hand is pointing, and the lift is a pitch retraction either way -- it tips a
+side-held cylinder as it raises it, which the squeeze holds against just as it
+holds against the ~30 deg the top-down lift already tilts through.
+
 Three behaviours are worth knowing before reading the code:
 
 **The tool frame is not the grasp frame.** The jaws straddle the *wrist_roll
@@ -85,6 +117,7 @@ from manus.randomize import EpisodeDraw
 
 __all__ = [
     "CONVERGE_TOL",
+    "SIDE_STATE_SEQUENCE",
     "STATE_SEQUENCE",
     "ExpertConfig",
     "GraspPlan",
@@ -96,11 +129,15 @@ __all__ = [
     "converge_tol",
     "grasp_height",
     "grasp_yaw_candidates",
+    "is_side_grasp",
     "jaw_depth",
     "joint_vector",
     "plan_grasp",
     "plan_lift",
     "pregrasp_height",
+    "side_body_behind_tcp",
+    "side_tcp_target",
+    "state_sequence",
     "tip_clearance",
     "yaw_symmetry",
 ]
@@ -138,16 +175,33 @@ ARM_UPPER: np.ndarray = np.array(
 
 PREGRASP = "PREGRASP"
 DESCEND = "DESCEND"
+ADVANCE = "ADVANCE"
 CLOSE = "CLOSE"
 LIFT = "LIFT"
 HOLD = "HOLD"
 DONE = "DONE"
 
 STATE_SEQUENCE: tuple[str, ...] = (PREGRASP, DESCEND, CLOSE, LIFT, HOLD, DONE)
-"""Every state, in the order the FSM walks them. ``DONE`` is terminal."""
+"""Every state of a **top-down** grasp, in the order the FSM walks them.
 
-ARM_STATES: frozenset[str] = frozenset({PREGRASP, DESCEND, LIFT})
+``DONE`` is terminal. See :data:`SIDE_STATE_SEQUENCE` for the side grasp's, and
+:func:`state_sequence` for the accessor that picks between them."""
+
+SIDE_STATE_SEQUENCE: tuple[str, ...] = (PREGRASP, ADVANCE, CLOSE, LIFT, HOLD, DONE)
+"""Every state of a **side** grasp: :data:`STATE_SEQUENCE` with DESCEND replaced.
+
+The two are the same shape and the same code -- one waypoint move onto the
+grasp pose, with the jaws held open -- but they are not the same motion, and
+the name is what a recorded episode carries into the dataset. ADVANCE pushes the
+flat hand *outward along the table* onto a standing object; DESCEND lowers it
+onto one lying under it. A policy reading the two as one state would be reading
+two different action distributions as one."""
+
+ARM_STATES: frozenset[str] = frozenset({PREGRASP, DESCEND, ADVANCE, LIFT})
 """States that move the arm and therefore end on joint convergence."""
+
+APPROACH_STATES: frozenset[str] = frozenset({DESCEND, ADVANCE})
+"""The per-mode move onto the grasp pose: what CLOSE freezes the arm after."""
 
 CONVERGE_TOL: float = 0.02
 """``max |measured - waypoint|`` (radians, arm joints) ending a move on a
@@ -181,6 +235,17 @@ class ExpertConfig:
 
     Attributes:
         hover_height: PREGRASP TCP height above the grasp point, metres.
+            Top-down only; a side grasp stands off *radially* instead, by
+            :attr:`side_retract`, at the grasp's own height.
+        side_retract: How far back along the approach axis a side grasp's
+            PREGRASP sits, metres. 40 mm, which puts the open fingertips 22.7 mm
+            clear of a 30 mm cylinder's near face (:data:`JAW_TIP_Z` eats 6.3 of
+            the 40, and the object's near face is 11 mm short of the TCP) --
+            room for the arm's own 5-6 mm of convergence residual and for the
+            object to be a little wider than declared. It is also the whole of
+            the ADVANCE stroke, which is why it is not larger: every millimetre
+            is a millimetre the hand travels with the jaws already open and the
+            object in front of them.
         hover_margin: Clearance PREGRASP keeps between the lowest jaw material
             and the *top of the object*, metres, when that is the binding
             constraint (:func:`pregrasp_height`). Measured against the 4-6 mm of
@@ -237,6 +302,7 @@ class ExpertConfig:
 
     hover_height: float = 0.03
     hover_margin: float = 0.008
+    side_retract: float = 0.040
     converge_tol: float = CONVERGE_TOL
     state_budget: int = 240
     hold_steps: int = 45
@@ -266,7 +332,11 @@ class ExpertConfig:
             return close_ramp_steps(spec, self)
         return {
             PREGRASP: self.pregrasp_ramp,
+            # ADVANCE is DESCEND's side-mode twin -- the same move onto the
+            # grasp pose over the same distance (a 40 mm radial push against a
+            # 30 mm drop), so it shares the knob rather than adding a second one.
             DESCEND: self.descend_ramp,
+            ADVANCE: self.descend_ramp,
             LIFT: self.lift_ramp,
         }.get(state, 1)
 
@@ -490,6 +560,55 @@ See :func:`grasp_height`; this is the CLOSE-time sibling of the approach-time
 clearance :func:`pregrasp_height` keeps with :data:`JAW_TIP_Z`.
 """
 
+SIDE_JAW_DEPTH: float = 0.0242
+"""How far below the tool axis the hand's lowest material hangs at a level side
+grasp, metres. **Measured off the meshes** (``tests/test_expert_logic.py``
+re-derives it): the top-down :func:`jaw_depth`'s counterpart, and the thing that
+sets how low a side grasp can be taken.
+
+With the tool horizontal and the jaws level, "down" is the tool frame's +Y (at
+:data:`SIDE_GRASP_ROLL`, where +Y points world *down*), so what decides the
+table clearance is the hand's *half-width*, not its fingertips. And the fingers
+are not the widest part of it: across the whole closing sweep the fingers
+themselves stay inside +/-11.7 mm of the tool axis, while the wrist_roll
+follower's housing -- 50 to 100 mm back along the approach, i.e. between the
+object and the base -- reaches 27.8 mm on one side and 24.2 mm on the other.
+
+That asymmetry is why :data:`SIDE_GRASP_ROLL` is pi rather than 0. The two are
+the same level grasp with the fingers swapped, but they put opposite sides of
+the housing down, and 3.6 mm is the difference between a 30 mm cup grasp
+clearing the table by 5.8 mm and clearing it by 2.2 mm. (The gripper servo body
+is the next widest at 20.5 mm and never decides it.)"""
+
+SIDE_GRASP_ROLL: float = math.pi
+"""Tool roll a side grasp is planned at, radians -- see
+:func:`manus.kinematics.tool_roll_of`.
+
+Level, so the jaws close horizontally across the object the way a hand closes
+on a cup. Both level rolls (0 and pi) are the same physical grasp with the
+fingers swapped and both are inside wrist_roll's travel at every pan, so the
+choice is free -- and it is spent on table clearance: see
+:data:`SIDE_JAW_DEPTH`. At pi the tool's +Y points world **down**."""
+
+SIDE_AZIMUTH_PASSES: int = 3
+"""Fixed-point passes closing a side plan's approach azimuth (:func:`plan_grasp`).
+
+A side grasp has to stand the tool so the object lands between the pads, which
+needs the tool's *rotation* -- and the approach azimuth half of that is not
+something :func:`~manus.kinematics.ik_solve` takes as a request. The arm has
+five joints and the side grasp spends them all on position, pitch sum and roll;
+the azimuth is then whatever the reach direction makes it (see
+:meth:`~manus.kinematics.KinematicChain.approach_azimuth`), and it misses the
+object's own azimuth by up to ~2.7 deg because the tool stands 17 mm off to one
+side.
+
+So the plan solves, reads the azimuth back off the solution, and re-aims. It is
+a sharp contraction -- re-aiming by an angle moves the TCP by only the 17.5 mm
+pad offset, which at a 0.36-0.42 m radius feeds back about a hundredth of it --
+so the naive aim's 0.44 mm miss becomes 4 um after one pass and 0.15 um after
+two, which is the URDF's own noise floor. Three is that plus a pass in hand.
+"""
+
 YAW_MATCH_TOL: float = math.radians(2.0)
 """How far the solved tool yaw may sit from the requested one, radians.
 
@@ -537,11 +656,56 @@ def tip_clearance(spec: ObjectSpec) -> float:
     return MIN_TIP_CLEARANCE if spec.tip_clearance_m is None else spec.tip_clearance_m
 
 
+def is_side_grasp(spec: ObjectSpec) -> bool:
+    """Whether `spec` is grasped from the side rather than from above."""
+    return spec.grasp_mode == "side"
+
+
+def state_sequence(spec: ObjectSpec) -> tuple[str, ...]:
+    """The FSM's state order for `spec`: :data:`STATE_SEQUENCE` or its side twin."""
+    return SIDE_STATE_SEQUENCE if is_side_grasp(spec) else STATE_SEQUENCE
+
+
+def approach_state(spec: ObjectSpec) -> str:
+    """The state that moves onto the grasp pose: ``DESCEND`` or ``ADVANCE``."""
+    return ADVANCE if is_side_grasp(spec) else DESCEND
+
+
+def side_body_behind_tcp(spec: ObjectSpec) -> float:
+    """How far a side-grasped object reaches back past the TCP, metres.
+
+    The side grasp's version of "how far the object stands above the TCP" --
+    the quantity :data:`JAW_PARALLEL_REACH` bounds. Rotating the hand onto its
+    side rotates that question with it: what used to be the object's height
+    above the pads is now its own *radius* behind them, since the pads sit
+    :data:`~manus.kinematics.TCP_TO_PAD_CENTRE` along the approach and the
+    object's near face is a half-width short of its centre.
+
+    For the 30 mm cylinder that is 11 mm against the 20 mm shelf -- and unlike
+    the top-down bar it is a fixed property of the object, not something
+    :func:`grasp_height` can trade height for, because moving the tool along the
+    approach axis moves the pads off the object's centre line. An object round
+    enough to be side-grasped at all is therefore either inside the shelf or not
+    side-graspable; the catalogue's one is inside it by 9 mm.
+    """
+    return 0.5 * spec.grasp_width_m - TCP_TO_PAD_CENTRE
+
+
 def grasp_height(spec: ObjectSpec) -> float:
     """Height above the table the jaw pads centre on for `spec`, metres.
 
-    The object's own mid-height, which puts the pads across the widest part of
-    it -- raised, whichever of two bars binds, and both of them are raises:
+    **Side grasps** take the object at its own mid-height -- the pads centre on
+    the tool axis, which is horizontal, so there is no
+    :data:`~manus.kinematics.TCP_TO_PAD_CENTRE` in the vertical any more and the
+    TCP simply sits at this height. One bar can raise it: the hand's own housing
+    hangs :data:`SIDE_JAW_DEPTH` below the tool axis and has to clear the table
+    by :func:`tip_clearance`, so nothing can be side-grasped below 29.2 mm. The
+    60 mm cylinder's 30 mm mid-height clears it by 0.8 mm, which is the whole
+    reason the catalogue's side object is the tall one.
+
+    **Top-down grasps** take the object at its own mid-height, which puts the
+    pads across the widest part of it -- raised, whichever of two bars binds,
+    and both of them are raises:
 
     * **too short**: until the fingertips clear the table by
       :func:`tip_clearance`. Only the 10 mm puck is short enough to feel it,
@@ -557,15 +721,23 @@ def grasp_height(spec: ObjectSpec) -> float:
     Neither bar can be met by lowering the grasp, so the two never fight: the
     answer is the highest of the three.
     """
+    if is_side_grasp(spec):
+        return max(spec.spawn_z, SIDE_JAW_DEPTH + tip_clearance(spec))
     lowest_centre = JAW_TIP_Z - TCP_TO_PAD_CENTRE + tip_clearance(spec)
     closing_centre = spec.top_z - TCP_TO_PAD_CENTRE - JAW_PARALLEL_REACH
     return max(spec.spawn_z, lowest_centre, closing_centre)
 
 
 def pregrasp_height(spec: ObjectSpec, config: ExpertConfig | None = None) -> float:
-    """TCP height PREGRASP hovers at, and DESCEND starts from, metres.
+    """TCP height PREGRASP waits at, and the approach starts from, metres.
 
-    The higher of two bars:
+    **A side grasp's PREGRASP is at the grasp's own height** -- it stands off
+    along the table rather than above it, by :attr:`~ExpertConfig.side_retract`,
+    so ADVANCE is a pure radial push and nothing about the approach is vertical.
+    There is no hover bar to compute: the object is *beside* the hand at the
+    stand-off, not under it.
+
+    For a top-down grasp, the higher of two bars:
 
     * :attr:`~ExpertConfig.hover_height` above the grasp pose, the fixed
       stand-off the descent was tuned as, and
@@ -592,6 +764,8 @@ def pregrasp_height(spec: ObjectSpec, config: ExpertConfig | None = None) -> flo
         TCP height above the table, metres.
     """
     config = DEFAULT_CONFIG if config is None else config
+    if is_side_grasp(spec):
+        return grasp_height(spec)
     stand_off = grasp_height(spec) + TCP_TO_PAD_CENTRE + config.hover_height
     clearing = spec.top_z + jaw_depth(config.gripper_open) + config.hover_margin
     return max(stand_off, clearing)
@@ -622,6 +796,47 @@ def tcp_target(
             object_z + TCP_TO_PAD_CENTRE,
         ]
     )
+
+
+def side_tcp_target(
+    object_xy: tuple[float, float],
+    object_z: float,
+    approach_azimuth: float,
+    spec: ObjectSpec,
+    tool_roll: float = SIDE_GRASP_ROLL,
+) -> np.ndarray:
+    """TCP position (3,) placing the jaws around `spec` for a **side** grasp.
+
+    The same inversion :func:`tcp_target` does, written with the rotation matrix
+    instead of by hand because the side grasp's tool frame is not axis-aligned::
+
+        tcp = object - R(approach_azimuth, tool_roll) @ (lateral, 0, pad)
+
+    -- and the same object placement in the tool frame, ``(lateral, 0,
+    TCP_TO_PAD_CENTRE)``, because *the hand does not know it has been rotated*.
+    What changes is where those two offsets point in the world: the lateral one
+    is now **tangential** (it swings the tool sideways around the object rather
+    than across it) and the pad one is now **radial** (the TCP stands 4 mm short
+    of the object's centre along the approach instead of 4 mm above it). The
+    grasp height, which was the tool's height plus the pad offset, is now the
+    tool's height exactly.
+
+    Args:
+        object_xy: Object centre (x, y) in base_link coordinates, metres.
+        object_z: Height the pads should centre on, metres
+            (:func:`grasp_height`).
+        approach_azimuth: World azimuth the hand comes in along, radians. Not a
+            free request -- see :data:`SIDE_AZIMUTH_PASSES`.
+        spec: Object being grasped; supplies the grasp width.
+        tool_roll: Jaw tilt off level, radians; the default is the level branch
+            the whole side pipeline is planned at.
+
+    Returns:
+        The (3,) TCP position, metres.
+    """
+    rotation = kinematics.horizontal_tool_rotation(approach_azimuth, tool_roll)
+    offset = np.array([pad_lateral_offset(spec), 0.0, TCP_TO_PAD_CENTRE])
+    return np.array([*object_xy, object_z]) - rotation @ offset
 
 
 YAW_PERIOD_RAD: dict[str, float] = {"quarter": math.pi / 2, "half": math.pi, "free": 0.0}
@@ -746,9 +961,12 @@ class GraspPlan:
     """The waypoints one attempt is driven through, all in radians / metres.
 
     Attributes:
-        grasp_yaw: Tool yaw the grasp is planned at.
-        q_pregrasp: Arm pose hovering above the object.
-        q_grasp: Arm pose at grasp height.
+        grasp_yaw: Tool angle the grasp is planned at: a tool *yaw* for a
+            top-down grasp, a tool *roll* off level for a side one -- whichever
+            the mode's :class:`~manus.kinematics.ToolFamily` measures, and what
+            was handed to :func:`~manus.kinematics.ik_solve`.
+        q_pregrasp: Arm pose standing off from the object.
+        q_grasp: Arm pose at the grasp.
         q_lift: Arm pose after the retraction.
         tcp_pregrasp: TCP position the pregrasp pose was solved for.
         tcp_grasp: TCP position the grasp pose was solved for.
@@ -758,6 +976,11 @@ class GraspPlan:
         close_target: Jaw target used by CLOSE.
         ik_converged: Whether both IK solves met their tolerances.
         reason: ``""`` when :attr:`ok`, else why the plan is not trustworthy.
+        grasp_mode: ``"top"`` or ``"side"`` -- which of the two plans this is.
+        approach_azimuth: World azimuth the hand comes in along for a side
+            grasp, radians, as the solved pose actually delivers it (see
+            :data:`SIDE_AZIMUTH_PASSES`); None for a top-down grasp, whose
+            approach is straight down.
     """
 
     grasp_yaw: float
@@ -771,6 +994,8 @@ class GraspPlan:
     close_target: float
     ik_converged: bool
     reason: str = ""
+    grasp_mode: str = "top"
+    approach_azimuth: float | None = None
 
     @property
     def ok(self) -> bool:
@@ -778,8 +1003,82 @@ class GraspPlan:
         return self.reason == ""
 
     def waypoint(self, state: str) -> np.ndarray:
-        """Arm waypoint of an arm state (`PREGRASP`, `DESCEND` or `LIFT`)."""
-        return {PREGRASP: self.q_pregrasp, DESCEND: self.q_grasp, LIFT: self.q_lift}[state]
+        """Arm waypoint of an arm state (PREGRASP, DESCEND/ADVANCE or LIFT)."""
+        return {
+            PREGRASP: self.q_pregrasp,
+            DESCEND: self.q_grasp,
+            ADVANCE: self.q_grasp,
+            LIFT: self.q_lift,
+        }[state]
+
+
+def _plan_side_grasp(
+    spec: ObjectSpec,
+    x: float,
+    y: float,
+    config: ExpertConfig,
+) -> GraspPlan:
+    """Solve the three waypoints for a **side** grasp of `spec` at ``(x, y)``.
+
+    No yaw branches: the object is round (the catalogue refuses a side grasp on
+    anything else) and the approach azimuth is not a choice, so the only branch
+    a top-down plan would search over -- which way to face -- does not exist.
+    What replaces it is the azimuth fixed point (:data:`SIDE_AZIMUTH_PASSES`):
+    stand the tool where the object's *own* azimuth says, solve, and re-aim at
+    the azimuth the arm actually delivered, until the object really is between
+    the pads.
+
+    PREGRASP then backs the solved grasp pose straight out along its own
+    approach axis by :attr:`~ExpertConfig.side_retract`, so ADVANCE is a pure
+    radial push and the hand never passes over the object.
+    """
+    region = kinematics.SIDE_GRASP_REGION
+    object_z = grasp_height(spec)
+    azimuth = region.polar(x, y)[1]
+    tcp_grasp = side_tcp_target((x, y), object_z, azimuth, spec)
+    q_grasp, grasp_ok = ik_solve(
+        tcp_grasp, SIDE_GRASP_ROLL, family=kinematics.TOOL_HORIZONTAL
+    )
+    for _ in range(SIDE_AZIMUTH_PASSES):
+        azimuth = _CHAIN.approach_azimuth(q_grasp)
+        tcp_grasp = side_tcp_target((x, y), object_z, azimuth, spec)
+        q_grasp, grasp_ok = ik_solve(
+            tcp_grasp, SIDE_GRASP_ROLL, family=kinematics.TOOL_HORIZONTAL
+        )
+
+    approach = _CHAIN.fk_tcp(q_grasp)[1][:, 2]
+    tcp_pregrasp = tcp_grasp - config.side_retract * approach
+    q_pregrasp, pregrasp_ok = ik_solve(
+        tcp_pregrasp, SIDE_GRASP_ROLL, family=kinematics.TOOL_HORIZONTAL
+    )
+    q_lift, lift_rise = plan_lift(q_grasp, config.lift_rise)
+
+    rolled = max(
+        abs(_wrap(_CHAIN.tool_roll(q_pregrasp) - SIDE_GRASP_ROLL)),
+        abs(_wrap(_CHAIN.tool_roll(q_grasp) - SIDE_GRASP_ROLL)),
+    ) > YAW_MATCH_TOL
+    reason = ""
+    if not (pregrasp_ok and grasp_ok):
+        reason = f"ik_{'pregrasp' if not pregrasp_ok else 'grasp'}_unreachable"
+    elif rolled:
+        reason = "ik_solved_the_flipped_roll"
+    elif lift_rise < config.min_lift_rise:
+        reason = f"lift_rise_{lift_rise * 1e3:.0f}mm_below_minimum"
+    return GraspPlan(
+        grasp_yaw=SIDE_GRASP_ROLL,
+        q_pregrasp=q_pregrasp,
+        q_grasp=q_grasp,
+        q_lift=q_lift,
+        tcp_pregrasp=tcp_pregrasp,
+        tcp_grasp=tcp_grasp,
+        lateral_offset=pad_lateral_offset(spec),
+        lift_rise=lift_rise,
+        close_target=spec.close_target_rad,
+        ik_converged=bool(pregrasp_ok and grasp_ok),
+        reason=reason,
+        grasp_mode="side",
+        approach_azimuth=float(_CHAIN.approach_azimuth(q_grasp)),
+    )
 
 
 def plan_grasp(
@@ -789,6 +1088,10 @@ def plan_grasp(
     config: ExpertConfig = DEFAULT_CONFIG,
 ) -> GraspPlan:
     """Solve the three waypoints for grasping `spec` at `placement`.
+
+    A side-mode object (:func:`is_side_grasp`) goes to :func:`_plan_side_grasp`,
+    which is a different tool family over a different region and has no yaw
+    branches to search; everything below is the top-down plan.
 
     Branches are tried in :func:`grasp_yaw_candidates` order and the first one
     that survives *three* checks is taken: both IK solves converge, and the yaw
@@ -823,6 +1126,8 @@ def plan_grasp(
         anyway and report an honest failure rather than a skipped sample.
     """
     x, y, object_yaw = _placement(placement)
+    if is_side_grasp(spec):
+        return _plan_side_grasp(spec, x, y, config)
     start = (
         np.zeros(kinematics.NUM_ARM_JOINTS)
         if q_current is None
@@ -941,6 +1246,7 @@ class ScriptedGraspExpert:
     ) -> None:
         self.spec = spec
         self.config = config
+        self._sequence: tuple[str, ...] = state_sequence(spec)
         self._plan: GraspPlan | None = None
         self._state: str = PREGRASP
         self._state_step: int = 0
@@ -1006,8 +1312,13 @@ class ScriptedGraspExpert:
 
     @property
     def state(self) -> str:
-        """Current state, one of :data:`STATE_SEQUENCE`."""
+        """Current state, one of :attr:`sequence`."""
         return self._state
+
+    @property
+    def sequence(self) -> tuple[str, ...]:
+        """The state order this expert walks: :func:`state_sequence` of its spec."""
+        return self._sequence
 
     @property
     def done(self) -> bool:
@@ -1120,14 +1431,14 @@ class ScriptedGraspExpert:
         )
         if exit_reason == "timeout":
             self._timeouts.append(self._state)
-        if self._state == DESCEND:
-            # CLOSE holds the arm exactly where DESCEND left it -- including the
-            # droop bias -- so the jaws close on the pose that was reached, not
-            # on a recomputed one that would nudge the arm mid-grasp.
+        if self._state in APPROACH_STATES:
+            # CLOSE holds the arm exactly where the approach left it -- including
+            # the droop bias -- so the jaws close on the pose that was reached,
+            # not on a recomputed one that would nudge the arm mid-grasp.
             self._frozen_arm = self._last_arm_command.copy()
         if self._state == LIFT:
             self._frozen_arm = self._last_arm_command.copy()
-        self._enter(STATE_SEQUENCE[STATE_SEQUENCE.index(self._state) + 1], arm, gripper)
+        self._enter(self._sequence[self._sequence.index(self._state) + 1], arm, gripper)
 
     def _waypoint(self) -> np.ndarray | None:
         """Arm waypoint of the current state, or None if it does not move the arm."""
@@ -1190,7 +1501,7 @@ class ScriptedGraspExpert:
             gripper_command = self._entry_gripper + alpha * (
                 config.gripper_open - self._entry_gripper
             )
-        elif self._state == DESCEND:
+        elif self._state in APPROACH_STATES:
             gripper_command = config.gripper_open
         elif self._state == CLOSE:
             gripper_command = self._entry_gripper + alpha * (
@@ -1245,12 +1556,15 @@ class ScriptedGraspExpert:
         plan = self.plan
         return {
             "object": self.spec.name,
+            "grasp_mode": plan.grasp_mode,
             "grasp_yaw": plan.grasp_yaw,
+            "approach_azimuth": plan.approach_azimuth,
             "ik_converged": plan.ik_converged,
             "plan_ok": plan.ok,
             "plan_reason": plan.reason,
             "lift_rise": plan.lift_rise,
             "close_target": plan.close_target,
+            "approach_ramp": self.config.ramp_steps(approach_state(self.spec), self.spec),
             "close_ramp": self.config.ramp_steps(CLOSE, self.spec),
             "converge_tol": converge_tol(self.spec, self.config),
             "grasp_height": grasp_height(self.spec),

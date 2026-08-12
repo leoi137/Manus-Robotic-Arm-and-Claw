@@ -15,6 +15,7 @@ never does, and assert the two produce different exits.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import xml.etree.ElementTree as ET
 
@@ -45,16 +46,34 @@ from manus.expert import (
 )
 from manus.kinematics import GRASP_REGION, TCP_TO_PAD_CENTRE, KinematicChain
 from manus.objects import OBJECTS, ObjectSpec
-from manus.randomize import draw_episode
+from manus.randomize import draw_episode, placement_region
 
 CHAIN = KinematicChain()
 CUBE = OBJECTS["cube_3cm"]
-CYLINDER = OBJECTS["cylinder_3cm"]
+CYLINDER = OBJECTS["cylinder_3cm"]  # the catalogue's one SIDE grasp
 DIE = OBJECTS["die_16mm"]  # the narrowest grasp, and the tightest converge_tol
 DOMINO = OBJECTS["domino_20x40"]  # the rectangular case: two branches, not four
 PUCK = OBJECTS["puck_d40x10"]  # the widest grasp and the only raised one
+THICK_PUCK = OBJECTS["puck_d40x20"]  # the same disc with a rim the pads can centre on
 BALL = OBJECTS["pingpong_40mm"]  # 2.7 g, round in every direction
 DUPLO = OBJECTS["duplo_32x64"]  # the other rectangular case, 32 mm across
+
+TOP_CYLINDER = dataclasses.replace(CYLINDER, grasp_mode="top")
+"""The cylinder as it was grasped before Step 23: straight down, at 36 mm.
+
+Kept as a fixture rather than deleted, because several tests below are the
+*record* of why the top-down cylinder failed -- and the top-down arithmetic that
+produced those numbers has to go on producing them, or "we changed the mode, not
+the maths" is an untested claim.
+"""
+
+TOP_OBJECTS = [spec for spec in OBJECTS.values() if spec.grasp_mode == "top"]
+SIDE_OBJECTS = [spec for spec in OBJECTS.values() if spec.grasp_mode == "side"]
+TOP_IDS = [spec.name for spec in TOP_OBJECTS]
+SIDE_IDS = [spec.name for spec in SIDE_OBJECTS]
+"""The catalogue split by grasp mode: the top-down bars do not apply to a side
+grasp and vice versa, so the parametrised geometry tests run over one or the
+other rather than over everything."""
 
 ARM = kinematics.NUM_ARM_JOINTS
 HOME = np.zeros(ARM)
@@ -74,19 +93,36 @@ plan.
 """
 
 
-def region_samples(n_radius: int = 5, n_azimuth: int = 9) -> list[tuple[float, float]]:
-    """A coarse grid of legal placements spanning the whole grasp region."""
-    r_min, r_max = GRASP_REGION.radius
+def region_samples(
+    n_radius: int = 5, n_azimuth: int = 9, spec=None
+) -> list[tuple[float, float]]:
+    """A coarse grid of legal placements spanning `spec`'s whole grasp region.
+
+    ``spec=None`` means the top-down region, which is what every caller written
+    before side grasps existed wants.
+    """
+    region = placement_region(spec)
+    r_min, r_max = region.radius
     points = []
     for radius in np.linspace(r_min, r_max, n_radius):
         for azimuth in np.radians(
-            np.linspace(-GRASP_REGION.azimuth_max_deg, GRASP_REGION.azimuth_max_deg, n_azimuth)
+            np.linspace(-region.azimuth_max_deg, region.azimuth_max_deg, n_azimuth)
         ):
-            x = GRASP_REGION.pan_axis_xy[0] + radius * math.cos(azimuth)
-            y = GRASP_REGION.pan_axis_xy[1] + radius * math.sin(azimuth)
-            if not GRASP_REGION.in_keepout(x, y):
+            x = region.pan_axis_xy[0] + radius * math.cos(azimuth)
+            y = region.pan_axis_xy[1] + radius * math.sin(azimuth)
+            if not region.in_keepout(x, y):
                 points.append((float(x), float(y)))
     return points
+
+
+def a_placement(spec, yaw: float = 0.0) -> tuple[float, float, float]:
+    """One legal ``(x, y, yaw)`` in the middle of `spec`'s own region.
+
+    The stand-in for the ``(0.20, 0.0, 0.0)`` literal that the FSM and predicate
+    fixtures used when every object shared one region.
+    """
+    region = placement_region(spec)
+    return (region.pan_axis_xy[0] + sum(region.radius) / 2.0, region.pan_axis_xy[1], yaw)
 
 
 # --- Fake plants ---------------------------------------------------------------
@@ -236,12 +272,16 @@ def hover_clearance(spec, config=ExpertConfig()) -> float:
     return pregrasp_height(spec, config) - jaw_depth(config.gripper_open) - spec.top_z
 
 
-@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+@pytest.mark.parametrize("spec", TOP_OBJECTS, ids=TOP_IDS)
 def test_the_hover_clears_the_top_of_every_object(spec):
     """The Step 21 fix, by FK: no jaw is inside the object at the pregrasp waypoint.
 
     Read off the *solved* waypoint rather than the requested height, so an IK
     solve that quietly landed low would fail this too.
+
+    Top-down objects only: a side grasp's PREGRASP is beside the object at the
+    grasp's own height, not above it, so there is no jaw over the lid to clear
+    -- see :func:`test_the_side_pregrasp_stands_off_along_the_approach`.
     """
     from manus.expert import jaw_depth, pregrasp_height
 
@@ -272,13 +312,19 @@ def test_every_hover_height_is_pinned():
         name: round(pregrasp_height(spec) * 1e3, 1) for name, spec in OBJECTS.items()
     } == {
         "cube_3cm": 49.0,
-        "cylinder_3cm": 74.3,
+        # The side grasp waits at the grasp's own height and stands off
+        # radially instead, so its "hover" is the grasp height exactly.
+        "cylinder_3cm": 30.0,
         "die_16mm": 42.0,
         "domino_20x40": 41.5,
         "puck_d40x10": 41.3,
+        "puck_d40x20": 44.0,
         "pingpong_40mm": 54.3,
         "duplo_32x64": 46.0,
     }
+    # ... and the top-down arithmetic that produced the cylinder's old 74.3 mm
+    # is untouched: only the mode changed.
+    assert round(pregrasp_height(TOP_CYLINDER) * 1e3, 1) == 74.3
 
 
 def test_the_hover_only_rises_for_an_object_tall_enough_to_need_it():
@@ -297,9 +343,9 @@ def test_the_hover_only_rises_for_an_object_tall_enough_to_need_it():
 
     config = ExpertConfig()
     raised = {
-        name: round((pregrasp_height(spec, config)
-                     - (grasp_height(spec) + TCP_TO_PAD_CENTRE + config.hover_height)) * 1e3, 1)
-        for name, spec in OBJECTS.items()
+        spec.name: round((pregrasp_height(spec, config)
+                          - (grasp_height(spec) + TCP_TO_PAD_CENTRE + config.hover_height)) * 1e3, 1)
+        for spec in [*TOP_OBJECTS, TOP_CYLINDER]
     }
     assert raised == {
         "cube_3cm": 0.0,
@@ -307,6 +353,7 @@ def test_the_hover_only_rises_for_an_object_tall_enough_to_need_it():
         "die_16mm": 0.0,
         "domino_20x40": 0.0,
         "puck_d40x10": 0.0,
+        "puck_d40x20": 0.0,
         "pingpong_40mm": 0.3,
         "duplo_32x64": 0.0,
     }
@@ -328,14 +375,14 @@ def test_the_old_fixed_hover_really_did_bury_the_fingers_in_the_cylinder():
     old_tcp_z = CYLINDER.spawn_z + TCP_TO_PAD_CENTRE + config.hover_height
     old_gap = old_tcp_z - jaw_depth(config.gripper_open) - CYLINDER.top_z
     assert old_gap == pytest.approx(-0.0023, abs=1e-4)
-    assert hover_clearance(CYLINDER) == pytest.approx(0.008, abs=1e-4)
+    assert hover_clearance(TOP_CYLINDER) == pytest.approx(0.008, abs=1e-4)
 
 
 def test_the_descent_starts_at_the_hover_and_goes_straight_down():
     """DESCEND's start is the raised hover, and it is directly above the grasp."""
     from manus.expert import pregrasp_height
 
-    for spec in (CUBE, CYLINDER):
+    for spec in (CUBE, BALL, THICK_PUCK):
         plan = plan_grasp(spec, (0.19, 0.02, 0.3))
         assert plan.tcp_pregrasp[2] == pytest.approx(pregrasp_height(spec))
         assert plan.tcp_pregrasp[:2] == pytest.approx(plan.tcp_grasp[:2])
@@ -350,8 +397,8 @@ def test_a_taller_hover_margin_lifts_the_hover_and_a_zero_one_does_not():
     """The margin is a real knob, not a constant baked into the formula."""
     from manus.expert import pregrasp_height
 
-    generous = pregrasp_height(CYLINDER, ExpertConfig(hover_margin=0.02))
-    assert generous == pytest.approx(pregrasp_height(CYLINDER) + 0.012)
+    generous = pregrasp_height(BALL, ExpertConfig(hover_margin=0.02))
+    assert generous == pytest.approx(pregrasp_height(BALL) + 0.012)
     assert pregrasp_height(CUBE, ExpertConfig(hover_margin=0.0)) == pytest.approx(
         pregrasp_height(CUBE)
     )
@@ -388,16 +435,22 @@ def test_every_grasp_height_is_pinned():
         name: round(grasp_height(spec) * 1e3, 1) for name, spec in OBJECTS.items()
     } == {
         "cube_3cm": 15.0,
-        "cylinder_3cm": 36.0,
+        # Side grasp: its own mid-height, the way a hand takes a cup, and
+        # 0.8 mm above the lowest a side grasp can go (SIDE_JAW_DEPTH).
+        "cylinder_3cm": 30.0,
         "die_16mm": 8.0,
         "domino_20x40": 7.5,
         "puck_d40x10": 7.3,
+        "puck_d40x20": 10.0,
         "pingpong_40mm": 20.0,
         "duplo_32x64": 12.0,
     }
+    # The cylinder's 36.0 mm was the top-down answer and still is: the object
+    # moved mode, the two bars in grasp_height did not move.
+    assert round(grasp_height(TOP_CYLINDER) * 1e3, 1) == 36.0
 
 
-@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+@pytest.mark.parametrize("spec", [*TOP_OBJECTS, TOP_CYLINDER], ids=[*TOP_IDS, "cylinder_top"])
 def test_only_an_object_the_hand_cannot_centre_on_is_raised(spec):
     """grasp_height centres the pads on the object unless one of its two bars binds.
 
@@ -423,7 +476,7 @@ def test_only_an_object_the_hand_cannot_centre_on_is_raised(spec):
     assert grasp_height(spec) < spec.spawn_z + 0.5 * spec.extent_z
 
 
-@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+@pytest.mark.parametrize("spec", TOP_OBJECTS, ids=TOP_IDS)
 def test_the_fingertips_stay_off_the_table_at_the_grasp_pose(spec):
     """Every object's grasp pose keeps both jaws clear of the ground.
 
@@ -473,7 +526,7 @@ def test_plan_covers_the_whole_region_for_every_object(spec):
     a rectangular object can only spend two of the four yaw branches getting
     out of the way.
     """
-    for x, y in region_samples():
+    for x, y in region_samples(spec=spec):
         for yaw in np.radians([0.0, 37.0, 90.0, 143.0]):
             plan = plan_grasp(spec, (x, y, float(yaw)))
             assert plan.ok, f"{spec.name} at ({x:.3f}, {y:.3f}, {yaw:.2f}): {plan.reason}"
@@ -677,7 +730,7 @@ def test_the_static_jaw_face_constant_matches_the_mesh():
     assert band[:, 0].min() == pytest.approx(JAW_FIXED_FACE_X, abs=1e-3)
 
 
-@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+@pytest.mark.parametrize("spec", TOP_OBJECTS, ids=TOP_IDS)
 def test_the_descent_corridor_is_clear_of_the_static_jaw(spec):
     """With the planned offset, no static-jaw material overlaps the object's footprint."""
     static, moving = jaw_clouds(GRIPPER_OPEN)
@@ -839,9 +892,16 @@ def test_the_cylinder_was_toppled_by_the_lean_and_the_raise_is_what_answers_it()
     preview shows it toppling (``runs/object_previews/cylinder_3cm_demo.json``:
     ``not_in_hand``, the object riding the shut jaws). The raised grasp puts the
     first contact back near the pads, with less lead than the cube's own.
+
+    Measured against :data:`TOP_CYLINDER`, because the cylinder is now grasped
+    from the side and Step 23's claim is that this whole problem is the
+    *top-down* geometry's -- which means the top-down numbers have to still be
+    exactly these. What the side grasp does with them is
+    :func:`test_the_side_grasp_has_no_lean_to_answer`.
     """
     from manus.expert import grasp_height
 
+    CYLINDER = TOP_CYLINDER  # noqa: N806 -- the object this failure belonged to
     old_tcp = CYLINDER.spawn_z + TCP_TO_PAD_CENTRE
     new_tcp = grasp_height(CYLINDER) + TCP_TO_PAD_CENTRE
     assert new_tcp - old_tcp == pytest.approx(0.006, abs=5e-4)
@@ -1118,7 +1178,7 @@ def test_a_cylinder_is_grasped_at_the_current_tool_yaw():
     assert candidates[0] == pytest.approx(0.4)
 
 
-@pytest.mark.parametrize("spec", OBJECTS.values(), ids=list(OBJECTS))
+@pytest.mark.parametrize("spec", TOP_OBJECTS, ids=TOP_IDS)
 def test_the_planned_wrist_roll_keeps_clear_of_its_limits(spec):
     """wrist_roll is the joint the yaw branch spends, and the one with least travel.
 
@@ -1197,6 +1257,7 @@ def test_the_convergence_bar_is_scaled_by_the_object_and_pinned_per_object():
         "die_16mm": round(0.02 * 16 / 30, 6),
         "domino_20x40": round(0.02 * 20 / 30, 6),
         "puck_d40x10": 0.02,
+        "puck_d40x20": 0.02,
         "pingpong_40mm": 0.02,
         "duplo_32x64": 0.02,
     }
@@ -1509,9 +1570,15 @@ PREVIEW_GRASP_HEIGHT_M = {"cube_3cm": 0.015, "die_16mm": 0.008, "cylinder_3cm": 
 """Grasp height each preview was flown at, metres: every object's own mid-height.
 
 Spelled out rather than read from :func:`~manus.expert.grasp_height`, because
-the cylinder's has since been raised to 36 mm and these files record the run
-before that.
+the cylinder's was first raised to 36 mm and then, at Step 23, moved to a side
+grasp; these files record the run before either. :func:`preview_spec` does the
+same for the mode.
 """
+
+
+def preview_spec(name: str) -> ObjectSpec:
+    """The catalogue spec as the preview run had it: every preview was top-down."""
+    return dataclasses.replace(OBJECTS[name], grasp_mode="top")
 
 
 def preview(name: str) -> dict:
@@ -1536,7 +1603,7 @@ def descend_exit_pose(record: dict) -> tuple[np.ndarray, np.ndarray]:
     """
     from manus.expert import plan_lift, tcp_target
 
-    spec = OBJECTS[record["telemetry"]["object"]]
+    spec = preview_spec(record["telemetry"]["object"])
     draw, states = record["draw"], {s["state"]: s for s in record["telemetry"]["states"]}
     yaw = record["telemetry"]["grasp_yaw"]
     target = tcp_target(
@@ -1695,6 +1762,11 @@ RECORDED_STALL_RAD = {
     "duplo_32x64": 0.21495,
     "pingpong_40mm": 0.23276,
     "puck_d40x10": 0.18839,  # sat on the commanded target: JAWS EMPTY
+    # Not filmed -- the respec is Step 23 and the preview run is Step 21. The
+    # 40 mm disc's own contact angle stands in, which is what a held one has to
+    # stall at, and it is the same disc so it is the same angle as the thin
+    # puck's *nominal* one rather than the empty-jaw reading recorded above.
+    "puck_d40x20": round(THICK_PUCK.contact_angle_rad, 5),
 }
 """HOLD-phase jaw angle of each filmed preview, from ``runs/object_previews/*_demo.json``.
 
@@ -1704,14 +1776,14 @@ robot -- which is what the stall clause is for.
 """
 
 
-def lift_pose(spec, stall: float, placement=(0.20, 0.0, 0.0)):
+def lift_pose(spec, stall: float, placement=None):
     """``(joints, object_pos)`` for `spec` held in the pads at the lift pose.
 
     The object is placed where a seated one sits -- at the pad centre in the
     tool's own frame -- so the in-hand clause sees a real grasp geometry and the
     stall clause sees `stall`.
     """
-    plan = plan_grasp(spec, placement)
+    plan = plan_grasp(spec, a_placement(spec) if placement is None else placement)
     assert plan.ok, plan.reason
     position, rotation = CHAIN.fk_tcp(plan.q_lift)
     seated = position + rotation @ np.array(
@@ -1951,3 +2023,698 @@ def test_the_demo_driver_names_its_artefacts_after_the_object():
     # ... and nothing writes the old fixed names any more.
     assert '"demo.json"' not in source
     assert '"tuning.json"' not in source
+
+
+# --- The side grasp ---------------------------------------------------------------
+#
+# The cup grasp, re-derived here end to end: where the tool stands, which way up
+# the hand is, what the closing jaw meets, and what the table clearance costs.
+# None of it is read back from the constants it is checking -- the mesh clouds
+# and the solved FK poses are the inputs.
+
+SIDE_ROLL = expert_mod.SIDE_GRASP_ROLL
+
+
+def side_plan(spec=CYLINDER, radius: float | None = None, azimuth_deg: float = 0.0, yaw=0.9):
+    """``(plan, object_xyz)`` for a side grasp at a polar spot in the side region."""
+    from manus.expert import grasp_height
+
+    region = placement_region(spec)
+    radius = float(np.mean(region.radius)) if radius is None else radius
+    azimuth = math.radians(azimuth_deg)
+    x = region.pan_axis_xy[0] + radius * math.cos(azimuth)
+    y = region.pan_axis_xy[1] + radius * math.sin(azimuth)
+    plan = plan_grasp(spec, (x, y, yaw))
+    assert plan.ok, plan.reason
+    return plan, np.array([x, y, grasp_height(spec)])
+
+
+def test_the_catalogue_has_exactly_one_side_grasp_and_it_is_the_cylinder():
+    assert [spec.name for spec in SIDE_OBJECTS] == ["cylinder_3cm"]
+    assert expert_mod.is_side_grasp(CYLINDER)
+    assert not expert_mod.is_side_grasp(CUBE)
+    assert expert_mod.state_sequence(CYLINDER) == expert_mod.SIDE_STATE_SEQUENCE
+    assert expert_mod.state_sequence(CUBE) == STATE_SEQUENCE
+    assert expert_mod.SIDE_STATE_SEQUENCE == (
+        PREGRASP,
+        expert_mod.ADVANCE,
+        CLOSE,
+        LIFT,
+        HOLD,
+        DONE,
+    )
+
+
+def test_a_side_grasp_cannot_be_declared_on_an_object_with_a_grasp_axis():
+    """The catalogue refuses what the arm cannot do: pick the approach azimuth."""
+    with pytest.raises(ValueError, match="cannot choose its approach azimuth"):
+        dataclasses.replace(CUBE, grasp_mode="side")
+    with pytest.raises(ValueError, match="unknown grasp_mode"):
+        dataclasses.replace(CUBE, grasp_mode="diagonal")
+
+
+def test_the_side_grasp_puts_the_object_between_the_pads():
+    """The whole point of the plan, closed back through the FK over the region.
+
+    The object ends up at exactly the same place in the tool's own frame as a
+    top-down grasp does -- ``(pad_lateral_offset, 0, TCP_TO_PAD_CENTRE)`` -- and
+    that is the claim, because it is what makes the jaws' own geometry (the
+    close target, the clearance, the contact angle) carry over unchanged.
+    """
+    for radius in np.linspace(*placement_region(CYLINDER).radius, 4):
+        for azimuth_deg in (-105.0, -40.0, 0.0, 40.0, 105.0):
+            plan, object_xyz = side_plan(radius=float(radius), azimuth_deg=azimuth_deg)
+            position, rotation = CHAIN.fk_tcp(plan.q_grasp)
+            local = rotation.T @ (object_xyz - position)
+            assert local[0] == pytest.approx(plan.lateral_offset, abs=1e-4)
+            assert local[1] == pytest.approx(0.0, abs=1e-4)
+            assert local[2] == pytest.approx(TCP_TO_PAD_CENTRE, abs=1e-4)
+
+
+def test_the_side_grasp_is_level_and_the_hand_lies_flat():
+    """Pitch sum zero, jaws level, tool +Y pointing world down."""
+    plan, _ = side_plan()
+    assert plan.grasp_mode == "side"
+    for q in (plan.q_pregrasp, plan.q_grasp):
+        assert kinematics.pitch_sum(q) == pytest.approx(
+            kinematics.PITCH_SUM_HORIZONTAL, abs=1e-3
+        )
+        rotation = CHAIN.fk_tcp(q)[1]
+        assert abs(rotation[2, 2]) < 1e-3, "the approach axis is not level"
+        assert abs(rotation[2, 0]) < 1e-3, "the jaws are not closing level"
+        # SIDE_GRASP_ROLL is pi, which is the branch with +Y pointing down.
+        assert rotation[:, 1] == pytest.approx([0.0, 0.0, -1.0], abs=1e-3)
+    assert plan.grasp_yaw == SIDE_ROLL == pytest.approx(math.pi)
+
+
+def test_the_side_approach_is_radial_and_the_plan_says_which_way():
+    """The azimuth is reported, not requested -- and it is close to the object's own.
+
+    The arm has no freedom left to aim the approach, so it comes out along the
+    reach direction: within a couple of degrees of the object's own azimuth,
+    the difference being the 17 mm the tool stands off to one side.
+    """
+    for azimuth_deg in (-105.0, -40.0, 0.0, 40.0, 105.0):
+        plan, object_xyz = side_plan(azimuth_deg=azimuth_deg)
+        _, object_azimuth = placement_region(CYLINDER).polar(*object_xyz[:2])
+        delivered = CHAIN.approach_azimuth(plan.q_grasp)
+        assert plan.approach_azimuth == pytest.approx(delivered, abs=1e-9)
+        offset_deg = abs(math.degrees(_wrap_pi(delivered - object_azimuth)))
+        assert 0.5 < offset_deg < 3.0, f"approach is {offset_deg:.2f} deg off the radius"
+
+
+def _wrap_pi(angle: float) -> float:
+    return float((angle + math.pi) % (2 * math.pi) - math.pi)
+
+
+def test_the_azimuth_fixed_point_is_what_puts_the_object_between_the_pads():
+    """One pass is millimetres out; three are sub-micron. The contraction, measured.
+
+    Standing the tool where the *object's* azimuth says, without closing the
+    loop on the azimuth the arm actually delivers, misses by the pad offset
+    times the azimuth error: 0.44 mm, which is 1.5% of the object it is trying
+    to centre between the pads. Each pass takes ~99% of what is left, so the
+    third one is already down on the URDF's own 0.15 um noise floor.
+    """
+    from manus.expert import side_tcp_target
+
+    plan, object_xyz = side_plan()
+    region = placement_region(CYLINDER)
+    misses = []
+    azimuth = region.polar(*object_xyz[:2])[1]
+    for _ in range(4):
+        target = side_tcp_target(tuple(object_xyz[:2]), object_xyz[2], azimuth, CYLINDER)
+        q, converged = kinematics.ik_solve(
+            target, SIDE_ROLL, family=kinematics.TOOL_HORIZONTAL
+        )
+        assert converged
+        position, rotation = CHAIN.fk_tcp(q)
+        local = rotation.T @ (object_xyz - position)
+        misses.append(
+            float(np.linalg.norm(local - [plan.lateral_offset, 0.0, TCP_TO_PAD_CENTRE]))
+        )
+        azimuth = CHAIN.approach_azimuth(q)
+    assert misses[0] == pytest.approx(4.0e-4, abs=1e-4), "the naive aim moved"
+    assert misses[1] < 0.02 * misses[0]
+    assert misses[expert_mod.SIDE_AZIMUTH_PASSES] < 1e-6
+    # ... and the plan itself lands where the last pass does.
+    position, rotation = CHAIN.fk_tcp(plan.q_grasp)
+    local = rotation.T @ (object_xyz - position)
+    assert float(
+        np.linalg.norm(local - [plan.lateral_offset, 0.0, TCP_TO_PAD_CENTRE])
+    ) < 1e-6
+
+
+def test_the_side_pregrasp_stands_off_along_the_approach():
+    """PREGRASP is 40 mm straight back, at the same height -- no hover at all.
+
+    And that 40 mm buys a real gap: the open fingertips reach 6.3 mm past the
+    TCP and the cylinder's near face is 11 mm short of it, so the hand waits
+    22.7 mm clear of the object rather than over it.
+    """
+    plan, object_xyz = side_plan()
+    _, rotation = CHAIN.fk_tcp(plan.q_grasp)
+    approach = rotation[:, 2]
+    offset = plan.tcp_grasp - plan.tcp_pregrasp
+    assert float(offset @ approach) == pytest.approx(ExpertConfig().side_retract, abs=1e-9)
+    assert float(np.linalg.norm(offset)) == pytest.approx(ExpertConfig().side_retract, abs=1e-9)
+    # Level to within the 1e-5 rad the URDF's own asymmetry leaves in the
+    # approach axis, i.e. microns over a 40 mm stand-off.
+    assert plan.tcp_pregrasp[2] == pytest.approx(plan.tcp_grasp[2], abs=1e-5)
+    assert plan.tcp_pregrasp[2] == pytest.approx(expert_mod.grasp_height(CYLINDER), abs=1e-5)
+
+    tips = CHAIN.fk_tcp(plan.q_pregrasp)[0] + rotation[:, 2] * expert_mod.JAW_TIP_Z
+    near_face = object_xyz - approach * CYLINDER.radius
+    assert float((near_face - tips) @ approach) == pytest.approx(0.0227, abs=5e-4)
+    # ... and the stand-off really is radial: it moves the tool *in*, not down.
+    assert float(np.linalg.norm(plan.tcp_pregrasp[:2])) < float(
+        np.linalg.norm(plan.tcp_grasp[:2])
+    )
+
+
+def side_world_cloud(plan, gripper: float) -> np.ndarray:
+    """Both jaw meshes in world coordinates at a solved side-grasp pose, metres."""
+    position, rotation = CHAIN.fk_tcp(plan.q_grasp)
+    return np.vstack(jaw_clouds(gripper)) @ rotation.T + position
+
+
+def test_side_jaw_depth_is_the_housings_half_width_not_the_fingertips():
+    """SIDE_JAW_DEPTH, re-derived off the meshes, and *which part* sets it.
+
+    Turned on its side the hand's table clearance stops being about how far the
+    fingers reach past the TCP and starts being about how wide the hand is. The
+    fingers are slim -- everything forward of 50 mm behind the TCP stays inside
+    11.7 mm of the tool axis -- but the wrist_roll follower's housing behind
+    them is not, and it is asymmetric: 24.2 mm one way, 27.8 mm the other.
+    """
+    from manus.expert import SIDE_JAW_DEPTH
+
+    sweep = [float(angle) for angle in np.arange(-0.174, 1.55, 0.02)]
+    clouds = [np.vstack(jaw_clouds(angle)) for angle in sweep]
+    assert max(cloud[:, 1].max() for cloud in clouds) == pytest.approx(SIDE_JAW_DEPTH, abs=1e-4)
+    assert min(cloud[:, 1].min() for cloud in clouds) == pytest.approx(-0.0278, abs=1e-4)
+    # The fingers alone would allow a grasp half as low again.
+    fingers = max(
+        float(np.abs(cloud[cloud[:, 2] >= -0.05][:, 1]).max()) for cloud in clouds
+    )
+    assert fingers == pytest.approx(0.0117, abs=5e-4)
+    assert fingers < 0.55 * SIDE_JAW_DEPTH
+
+
+def test_the_side_roll_branch_is_the_shallower_side_of_the_hand_down():
+    """Why SIDE_GRASP_ROLL is pi and not 0: 3.6 mm of table clearance.
+
+    Both level rolls are the same grasp with the fingers swapped, so the choice
+    is free -- and it is spent here. Measured by putting the mesh through the
+    *solved* pose of each branch: at pi the hand clears the table by 5.8 mm, at
+    0 by 2.2 mm, which is inside the arm's own convergence residual.
+    """
+    from manus.expert import SIDE_JAW_DEPTH, side_tcp_target
+
+    _, object_xyz = side_plan()
+    lowest = {}
+    for roll in (0.0, math.pi):
+        azimuth = placement_region(CYLINDER).polar(*object_xyz[:2])[1]
+        for _ in range(expert_mod.SIDE_AZIMUTH_PASSES + 1):
+            target = side_tcp_target(
+                tuple(object_xyz[:2]), object_xyz[2], azimuth, CYLINDER, roll
+            )
+            q, converged = kinematics.ik_solve(
+                target, roll, family=kinematics.TOOL_HORIZONTAL
+            )
+            assert converged
+            azimuth = CHAIN.approach_azimuth(q)
+        position, rotation = CHAIN.fk_tcp(q)
+        cloud = np.vstack(jaw_clouds(GRIPPER_OPEN)) @ rotation.T + position
+        lowest[roll] = float(cloud[:, 2].min())
+    assert lowest[math.pi] == pytest.approx(0.0058, abs=5e-4)
+    assert lowest[0.0] == pytest.approx(0.0022, abs=5e-4)
+    assert lowest[math.pi] - lowest[0.0] == pytest.approx(0.0036, abs=2e-4)
+    assert SIDE_ROLL == math.pi
+    assert expert_mod.grasp_height(CYLINDER) - lowest[math.pi] == pytest.approx(
+        SIDE_JAW_DEPTH, abs=5e-4
+    )
+
+
+def test_the_side_grasp_keeps_the_hand_off_the_table_through_the_whole_close():
+    """Every jaw angle, at the solved pose, by FK -- not just the open hand.
+
+    The moving finger swings during CLOSE, so the clearance is checked over the
+    sweep rather than at one angle. It does not move: the lowest thing on the
+    hand is the static housing, which does not swing.
+    """
+    from manus.expert import MIN_TIP_CLEARANCE
+
+    plan, _ = side_plan()
+    for angle in (GRIPPER_OPEN, 0.5, 0.3, CYLINDER.contact_angle_rad, CYLINDER.close_target_rad):
+        lowest = float(side_world_cloud(plan, float(angle))[:, 2].min())
+        assert lowest >= MIN_TIP_CLEARANCE, f"jaws at {angle:.3f}: {lowest * 1e3:.2f} mm"
+        assert lowest == pytest.approx(0.0058, abs=5e-4)
+
+
+def test_the_side_grasp_height_is_the_cup_grasp_and_the_table_is_the_only_bar():
+    """Its own mid-height, and 0.8 mm of margin on the only thing that could raise it."""
+    from manus.expert import SIDE_JAW_DEPTH, grasp_height, tip_clearance
+
+    assert grasp_height(CYLINDER) == CYLINDER.spawn_z == 0.030
+    floor = SIDE_JAW_DEPTH + tip_clearance(CYLINDER)
+    assert floor == pytest.approx(0.0292, abs=1e-4)
+    assert grasp_height(CYLINDER) - floor == pytest.approx(0.0008, abs=1e-4)
+    # A shorter cylinder would be pushed up off its own centre, like the puck.
+    short = dataclasses.replace(
+        CYLINDER, name="short", height=0.04, spawn_z=0.02, grasp_mode="side"
+    )
+    assert grasp_height(short) == pytest.approx(floor)
+
+
+def _side_penetration(spec, cloud: np.ndarray, lateral: float) -> np.ndarray:
+    """How far each vertex is inside a side-grasped cylinder, metres, tool frame.
+
+    The object's axis is now along the tool's y (it is standing on the table and
+    the tool is lying flat), so its circular section lives in the tool's (x, z)
+    plane rather than its (x, y) one -- the same rotation the whole grasp is.
+    """
+    inside_height = np.abs(cloud[:, 1]) <= 0.5 * spec.extent_z
+    radial = spec.radius - np.hypot(cloud[:, 0] - lateral, cloud[:, 2] - TCP_TO_PAD_CENTRE)
+    return np.where(inside_height, radial, -1.0)
+
+
+def _side_closing_contact(spec, band=None) -> tuple[float, np.ndarray]:
+    """First jaw angle whose moving-jaw material enters a side-grasped `spec`."""
+    lateral = expert_mod.pad_lateral_offset(spec)
+    for angle in np.arange(0.9, -0.175, -0.002):
+        _, moving = cached_clouds(float(angle))
+        penetration = _side_penetration(spec, moving, lateral)
+        if band is not None:
+            penetration = np.where(
+                (moving[:, 2] >= band[0]) & (moving[:, 2] <= band[1]), penetration, -1.0
+            )
+        deepest = int(penetration.argmax())
+        if penetration[deepest] > 0.0:
+            return float(angle), moving[deepest]
+    raise AssertionError(f"the closing jaw never reached {spec.name}")
+
+
+def test_the_side_grasp_has_no_lean_to_answer():
+    """The lean that toppled the top-down cylinder does not exist side-on.
+
+    :data:`~manus.expert.JAW_PARALLEL_REACH` bounds how far an object may stand
+    *past the TCP along the tool's -z*, because that is where the moving
+    finger's face leans in. Rotate the hand onto its side and the object's
+    height stops pointing that way -- only its own radius does, 11 mm of it,
+    half the shelf. Measured off the meshes, the closing finger reaches the
+    cylinder at exactly the same angle at the pads as anywhere else: zero lead,
+    against 2.0 mm at the old mid-height top-down grasp and 0.7 mm at the raised
+    one, and 4.3 mm below the tool axis rather than 26 mm above the object's
+    centre of mass.
+    """
+    from manus.expert import JAW_PARALLEL_REACH, JAW_TIP_Z, side_body_behind_tcp
+
+    assert side_body_behind_tcp(CYLINDER) == pytest.approx(0.011)
+    assert side_body_behind_tcp(CYLINDER) < 0.6 * JAW_PARALLEL_REACH
+
+    anywhere, point = _side_closing_contact(CYLINDER)
+    at_pads, _ = _side_closing_contact(CYLINDER, (-0.002, JAW_TIP_Z))
+    lead = (anywhere - at_pads) * objects.JAW_WIDTH_PER_RAD
+    assert lead == pytest.approx(0.0, abs=1e-4), f"the side jaw leads by {lead * 1e3:.2f} mm"
+    # +y is world *down* at SIDE_GRASP_ROLL, so a positive y is below the axis.
+    assert point[1] * 1e3 == pytest.approx(4.3, abs=1.0)
+    # ... and the top-down cylinder's lead is still what it was.
+    assert jaw_lead(TOP_CYLINDER, expert_mod.grasp_height(TOP_CYLINDER) + TCP_TO_PAD_CENTRE)[
+        0
+    ] > 2 * lead + 3e-4
+
+
+def test_the_contact_angle_is_width_based_and_does_not_care_which_way_the_hand_points():
+    """Why the close target carries over to a side grasp unchanged.
+
+    The jaws span the same 30 mm and meet it over the same slice of the
+    approach axis: a 30 mm cylinder gripped across its diameter presents its
+    surface from 11 mm behind the TCP to 6.3 mm in front of it -- which is,
+    to the millimetre, the band a 30 mm cube presents to a top-down grasp. So
+    the mesh-measured contact angle is the same number, and
+    :func:`~manus.objects.contact_angle_for_width` -- which only ever saw the
+    width -- is right for both.
+    """
+    from manus.expert import JAW_TIP_Z, grasp_height
+
+    top_band = engaged_band(CUBE)
+    side_low = TCP_TO_PAD_CENTRE - CYLINDER.radius
+    assert side_low == pytest.approx(top_band[0], abs=1e-4)
+    assert JAW_TIP_Z == pytest.approx(top_band[1])
+
+    assert contact_angle(CYLINDER) == pytest.approx(contact_angle(CUBE), abs=1e-3)
+    assert CYLINDER.close_target_rad == CUBE.close_target_rad
+    assert CYLINDER.contact_angle_rad == CUBE.contact_angle_rad
+    # The pads really do shut on it: the same squeeze bar the catalogue holds.
+    assert grasp_height(CYLINDER) > 0.0
+    assert jaw_gap(CYLINDER.close_target_rad, CYLINDER) < CYLINDER.grasp_width_m - 0.005
+
+
+def test_the_side_lift_carries_the_object_past_the_success_bar():
+    """LIFT is unchanged code and still clears the predicate's 5 cm, everywhere."""
+    from manus.expert import SUCCESS_LIFT_M
+
+    worst = math.inf
+    for radius in np.linspace(*placement_region(CYLINDER).radius, 4):
+        for azimuth_deg in (-105.0, 0.0, 105.0):
+            plan, _ = side_plan(radius=float(radius), azimuth_deg=azimuth_deg)
+            worst = min(worst, plan.lift_rise)
+    assert worst >= MIN_LIFT_RISE
+    assert worst > SUCCESS_LIFT_M + 0.02, f"only {worst * 1e3:.0f} mm of lift"
+
+
+def test_the_side_plan_is_deterministic_and_needs_no_current_pose():
+    """No yaw branch means no dependence on where the arm happens to be."""
+    placement = a_placement(CYLINDER, 0.4)
+    first = plan_grasp(CYLINDER, placement)
+    second = plan_grasp(CYLINDER, placement, np.array([1.0, -0.3, 0.2, 0.5, 2.0]))
+    assert np.array_equal(first.q_grasp, second.q_grasp)
+    assert first.grasp_yaw == second.grasp_yaw
+    # ... and the object's own yaw is irrelevant too: it is round.
+    spun = plan_grasp(CYLINDER, (placement[0], placement[1], 2.7))
+    assert np.array_equal(first.q_grasp, spun.q_grasp)
+
+
+def test_a_top_down_placement_is_out_of_reach_for_a_side_grasp_and_says_so():
+    """The two regions are disjoint, and a plan in the wrong one fails honestly."""
+    plan = plan_grasp(CYLINDER, (0.20, 0.0, 0.0))
+    assert not plan.ok and plan.reason.startswith("ik_")
+    assert plan.q_grasp.shape == (ARM,)
+    lower = np.array([specs.JOINT_LIMITS[n][0] for n in kinematics.ARM_JOINT_NAMES])
+    upper = np.array([specs.JOINT_LIMITS[n][1] for n in kinematics.ARM_JOINT_NAMES])
+    assert np.all(plan.q_grasp >= lower - 1e-9) and np.all(plan.q_grasp <= upper + 1e-9)
+
+
+def test_a_side_grasp_walks_advance_where_a_top_down_one_descends():
+    """The FSM's own sequence, driven against a converging plant."""
+    from manus.expert import ADVANCE
+
+    expert = ScriptedGraspExpert(CYLINDER, a_placement(CYLINDER))
+    states = [state for state, _ in run(expert, FakeArm())]
+    assert [report.state for report in expert.reports] == list(
+        expert_mod.SIDE_STATE_SEQUENCE[:-1]
+    )
+    assert ADVANCE in states and DESCEND not in states
+    advances = [report for report in expert.reports if report.state == ADVANCE]
+    assert advances and all(report.exit == "converged" for report in advances)
+    assert expert.sequence == expert_mod.SIDE_STATE_SEQUENCE
+
+
+def test_advance_freezes_the_arm_for_close_the_way_descend_does():
+    """CLOSE holds whatever the approach reached -- either approach."""
+    from manus.expert import ADVANCE
+
+    expert = ScriptedGraspExpert(CYLINDER, a_placement(CYLINDER))
+    plant = FakeArm(droop=0.03)
+    commands = {}
+    measured = plant.q.copy()
+    for _ in range(4000):
+        if expert.done:
+            break
+        targets = expert.step(measured)
+        # After the call, because step() decides the transition first and then
+        # issues the command for whichever state it ended up in.
+        commands.setdefault(expert.state, []).append(
+            [targets[n] for n in kinematics.ARM_JOINT_NAMES]
+        )
+        measured = plant.apply(targets)
+    assert np.allclose(commands[CLOSE][0], commands[ADVANCE][-1])
+    assert np.allclose(commands[CLOSE][0], commands[CLOSE][-1])
+
+
+def test_the_jaws_are_held_open_all_the_way_through_advance():
+    from manus.expert import ADVANCE
+
+    expert = ScriptedGraspExpert(CYLINDER, a_placement(CYLINDER))
+    plant = FakeArm()
+    measured = plant.q.copy()
+    seen = []
+    for _ in range(4000):
+        if expert.done:
+            break
+        targets = expert.step(measured)
+        if expert.state == ADVANCE:
+            seen.append(targets["gripper"])
+        measured = plant.apply(targets)
+    assert seen and all(value == pytest.approx(GRIPPER_OPEN) for value in seen)
+
+
+def test_the_advance_ramp_is_the_descend_ramp():
+    """One approach knob, not two -- the two moves are the same size."""
+    from manus.expert import ADVANCE
+
+    config = ExpertConfig(descend_ramp=17)
+    assert config.ramp_steps(ADVANCE, CYLINDER) == config.ramp_steps(DESCEND, CUBE) == 17
+
+
+def test_the_side_telemetry_says_which_grasp_it_was():
+    import json
+
+    expert = ScriptedGraspExpert(CYLINDER, a_placement(CYLINDER))
+    run(expert, FakeArm())
+    telemetry = expert.telemetry()
+    assert telemetry["grasp_mode"] == "side"
+    assert telemetry["approach_azimuth"] == pytest.approx(expert.plan.approach_azimuth)
+    assert json.dumps(telemetry)
+    top = ScriptedGraspExpert(CUBE, (0.20, 0.0, 0.0))
+    run(top, FakeArm())
+    assert top.telemetry()["grasp_mode"] == "top"
+    assert top.telemetry()["approach_azimuth"] is None
+
+
+# --- The thick puck ----------------------------------------------------------------
+
+
+def test_the_thick_puck_is_the_thin_ones_disc_with_a_rim_the_pads_can_hold():
+    """The respec, measured: 12.3 mm of rim between the pads instead of 5.0.
+
+    The thin puck has to be raised until its fingertips clear the table, which
+    leaves the pads on the top half of a 10 mm rim. The thick one is tall enough
+    to be centred -- the tips clear by 7.7 mm at its own mid-height, past
+    :data:`~manus.expert.MIN_TIP_CLEARANCE` with 2.7 mm to spare -- so the pads
+    get more than twice the purchase, and the bar for the respec was 8 mm.
+    """
+    from manus.expert import JAW_TIP_Z, MIN_TIP_CLEARANCE, grasp_height
+
+    assert THICK_PUCK.grasp_width_m == PUCK.grasp_width_m == 0.040
+    assert THICK_PUCK.close_target_rad == PUCK.close_target_rad
+    assert THICK_PUCK.extent_z == 2 * PUCK.extent_z
+
+    purchase = {}
+    for spec in (PUCK, THICK_PUCK):
+        clearance = grasp_height(spec) + TCP_TO_PAD_CENTRE - JAW_TIP_Z
+        purchase[spec.name] = spec.extent_z - clearance
+        assert clearance >= MIN_TIP_CLEARANCE - 1e-9
+    assert purchase["puck_d40x10"] == pytest.approx(0.0050, abs=1e-4)
+    assert purchase["puck_d40x20"] == pytest.approx(0.0123, abs=1e-4)
+    assert purchase["puck_d40x20"] >= 0.008
+    # Centred rather than raised: the table never gets a say.
+    assert grasp_height(THICK_PUCK) == THICK_PUCK.spawn_z
+    assert grasp_height(PUCK) > PUCK.spawn_z
+
+
+def test_the_thick_pucks_rim_is_met_below_its_top_edge():
+    """The thin puck's actual failure, and why 20 mm answers it.
+
+    The moving finger arrives tilted and still descending, so on a 10 mm rim it
+    touches within 0.7 mm of the top face and drags the puck down and in. On a
+    20 mm rim the same finger lands 2.9 mm below the top edge, on the rim's
+    flat, with the pads' own band around it.
+    """
+    thin = first_rim_contact(PUCK, expert_mod.MIN_TIP_CLEARANCE)
+    thick_clearance = (
+        expert_mod.grasp_height(THICK_PUCK) + TCP_TO_PAD_CENTRE - expert_mod.JAW_TIP_Z
+    )
+    thick = first_rim_contact(THICK_PUCK, thick_clearance)
+    assert PUCK.top_z - thin[1] == pytest.approx(0.0007, abs=5e-4)
+    assert THICK_PUCK.top_z - thick[1] == pytest.approx(0.0029, abs=5e-4)
+    assert THICK_PUCK.top_z - thick[1] > 3 * (PUCK.top_z - thin[1])
+    assert thick[2] > 2 * thin[2]
+    assert not THICK_PUCK.experimental and PUCK.experimental
+
+
+def test_the_thick_puck_joins_the_default_sweep_and_the_thin_one_does_not():
+    from manus.objects import DEFAULT_OBJECTS
+
+    assert "puck_d40x20" in DEFAULT_OBJECTS
+    assert "puck_d40x10" not in DEFAULT_OBJECTS
+    assert "cylinder_3cm" in DEFAULT_OBJECTS
+
+
+# --- The success predicate, side-on -------------------------------------------------
+
+
+def test_the_stall_clause_does_not_know_which_way_the_hand_points():
+    """Clause 4 is a jaw angle against a width. Nothing in it is a direction.
+
+    Checked by building the band for the side-grasped cylinder and for a
+    top-down object of the same width -- the cube -- and finding them equal.
+    """
+    side = GraspSuccessMonitor(CYLINDER)
+    top = GraspSuccessMonitor(CUBE)
+    assert side.stall_band == top.stall_band
+    assert CYLINDER.grasp_width_m == CUBE.grasp_width_m
+
+
+def test_the_in_hand_clause_measures_the_same_distance_side_on():
+    """Clause 3 is |object - TCP|, and a seated object sits at the same place.
+
+    The pad centre is ``(lateral, 0, TCP_TO_PAD_CENTRE)`` in the tool's own
+    frame whichever way the tool points, so the distance the bar compares
+    against is a property of the *hand*, not of the approach: 17.5 mm for a
+    30 mm grasp, either way, against a 60 mm bar.
+    """
+    joints, seated = lift_pose(CYLINDER, CYLINDER.contact_angle_rad)
+    monitor = hold(GraspSuccessMonitor(CYLINDER), joints, seated)
+    assert monitor.success
+    assert monitor.tcp_distance == pytest.approx(
+        math.hypot(expert_mod.pad_lateral_offset(CYLINDER), TCP_TO_PAD_CENTRE), abs=1e-6
+    )
+    assert monitor.tcp_distance == pytest.approx(0.0175, abs=1e-4)
+    assert monitor.tcp_distance < 0.35 * monitor.in_hand_radius
+
+
+def test_a_side_grasped_cylinder_clears_the_height_bar_from_its_own_spawn():
+    """Clause 1, side-on: it is lifted from 30 mm, and the bar is 80 mm.
+
+    The bar is the object's rest height plus 5 cm whichever way it was picked
+    up, and the side lift delivers ~94 mm of TCP rise -- so the margin is the
+    lift's, not the bar's.
+    """
+    monitor = GraspSuccessMonitor(CYLINDER)
+    assert monitor.spawn_z == 0.030
+    assert monitor.threshold_z == pytest.approx(0.080)
+    plan, _ = side_plan()
+    lifted_tcp_z = float(CHAIN.fk_tcp(plan.q_lift)[0][2])
+    assert lifted_tcp_z - expert_mod.grasp_height(CYLINDER) == pytest.approx(
+        plan.lift_rise, abs=1e-9
+    )
+    assert lifted_tcp_z > monitor.threshold_z + 0.03
+
+
+def test_a_side_attempt_that_never_grips_is_classified_the_same_way():
+    """classify_outcome is mode-agnostic: same clauses, same names."""
+    expert = ScriptedGraspExpert(CYLINDER, a_placement(CYLINDER))
+    run(expert, FakeArm())
+    monitor = GraspSuccessMonitor(CYLINDER)
+    hold(monitor, np.concatenate([expert.plan.q_lift, [0.05]]), np.array([0.4, 0.0, 0.03]))
+    assert classify_outcome(expert, monitor) == "no_grasp"
+
+
+# --- The top-down plan, bit for bit -------------------------------------------------
+
+GOLDEN_TOP_DOWN_PLANS = {
+    "cube_3cm": (
+        2.1984544613195234,
+        (
+            1.0216064975872534,
+            -0.5388804881491307,
+            0.9517017922116668,
+            1.1579750227323604,
+            0.12714553815510543,
+        ),
+        (
+            1.0216064975872534,
+            -0.6149584670171313,
+            0.7758126539563803,
+            1.4099421398556475,
+            0.12714553815510543,
+        ),
+        (
+            1.0216064975872534,
+            -0.7815003989298153,
+            0.6185497209910995,
+            1.0902300816172816,
+            0.12714553815510543,
+        ),
+    ),
+    "die_16mm": (
+        2.1984544613195234,
+        (
+            1.0173629789932903,
+            -0.43846882150721234,
+            0.9307881590022333,
+            1.0784769892998756,
+            0.12290201956114233,
+        ),
+        (
+            1.0173629789932903,
+            -0.5366720427039331,
+            0.7722675991449246,
+            1.335200770353905,
+            0.12290201956114233,
+        ),
+        (
+            1.0173629789932903,
+            -0.68790093553994,
+            0.6144094175553028,
+            1.0148511548867158,
+            0.12290201956114233,
+        ),
+    ),
+    "duplo_32x64": (
+        2.1984544613195234,
+        (
+            1.0221874833902813,
+            -0.5355466687512505,
+            0.9732575660017702,
+            1.1330854295443769,
+            0.12772652395813333,
+        ),
+        (
+            1.0221874833902813,
+            -0.6198091431471462,
+            0.8015485320925015,
+            1.3890569378495412,
+            0.12772652395813333,
+        ),
+        (
+            1.0221874833902813,
+            -0.7784652739782671,
+            0.640304906028293,
+            1.0653694057443903,
+            0.12772652395813333,
+        ),
+    ),
+}
+"""``(grasp_yaw, q_grasp, q_pregrasp, q_lift)`` recorded from ``plan_grasp`` at
+``draw_episode("grasp_cube_v2", 7)`` **before** side grasps existed.
+
+Three objects covering the three yaw-symmetry classes and both ends of the
+convergence-tolerance scale. Pinned to the last bit rather than to a tolerance:
+adding a second tool family to ``ik_solve`` and a second mode to the expert was
+allowed to add plans and forbidden to move them, because these joint angles are
+what the 200-attempt gate and every committed dataset were produced with, and a
+micron of drift here is a silently different dataset rather than a failing test.
+"""
+
+
+@pytest.mark.parametrize("name", list(GOLDEN_TOP_DOWN_PLANS))
+def test_the_top_down_plan_is_unchanged_to_the_last_bit(name):
+    expected_yaw, expected_grasp, expected_pregrasp, expected_lift = GOLDEN_TOP_DOWN_PLANS[name]
+    plan = plan_grasp(OBJECTS[name], draw_episode("grasp_cube_v2", 7))
+    assert plan.ok, plan.reason
+    assert plan.grasp_mode == "top"
+    assert plan.approach_azimuth is None
+    assert plan.grasp_yaw == expected_yaw
+    assert tuple(plan.q_grasp.tolist()) == expected_grasp
+    assert tuple(plan.q_pregrasp.tolist()) == expected_pregrasp
+    assert tuple(plan.q_lift.tolist()) == expected_lift
+
+
+def test_the_side_planner_never_returns_a_pose_the_arm_cannot_hold():
+    """Even nonsense placements come back clamped and finite, not as an exception.
+
+    The generator runs infeasible attempts on purpose (they are recorded as
+    ``ik_infeasible`` outcomes rather than skipped), so a plan for a placement
+    on top of the robot has to be a *plan*.
+    """
+    lower = np.array([specs.JOINT_LIMITS[n][0] for n in kinematics.ARM_JOINT_NAMES])
+    upper = np.array([specs.JOINT_LIMITS[n][1] for n in kinematics.ARM_JOINT_NAMES])
+    for placement in ((0.0, 0.0, 0.0), (0.039, 0.0, 0.0), (1.5, 0.0, 0.0), (-0.5, -0.5, 2.0)):
+        plan = plan_grasp(CYLINDER, placement)
+        assert not plan.ok and plan.reason.startswith("ik_")
+        for q in (plan.q_pregrasp, plan.q_grasp, plan.q_lift):
+            assert np.isfinite(q).all()
+            assert np.all(q >= lower - 1e-9) and np.all(q <= upper + 1e-9)

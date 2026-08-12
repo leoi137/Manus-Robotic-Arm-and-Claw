@@ -214,14 +214,15 @@ class TemporalEnsembler:
 # --- Region cells ----------------------------------------------------------------
 
 
-def cell_of(x: float, y: float) -> str:
+def cell_of(x: float, y: float, spec=None) -> str:
     """Report cell a placement falls in, e.g. ``"r1_az2"``.
 
     The same 3x6 grid ``scripts/gen_workspace_map.py`` reports the expert gate
     over, so the two breakdowns can be read side by side.
     """
-    from manus.kinematics import GRASP_REGION
+    from manus.randomize import placement_region
 
+    GRASP_REGION = placement_region(spec)  # noqa: N806 -- the object's own region
     radius, azimuth = GRASP_REGION.polar(x, y)
     azimuth = math.degrees(azimuth)
     low, high = GRASP_REGION.radius
@@ -231,10 +232,11 @@ def cell_of(x: float, y: float) -> str:
     return f"r{radius_bin}_az{azimuth_bin}"
 
 
-def cell_label(name: str) -> str:
+def cell_label(name: str, spec=None) -> str:
     """Human-readable bounds of a cell name from :func:`cell_of`."""
-    from manus.kinematics import GRASP_REGION
+    from manus.randomize import placement_region
 
+    GRASP_REGION = placement_region(spec)  # noqa: N806 -- the object's own region
     radius_bin, azimuth_bin = (
         int(part[1:]) if part[0] == "r" else int(part[2:]) for part in name.split("_")
     )
@@ -569,7 +571,7 @@ class EvalRunner:
             "episode": episode_index,
             "seed_index": seed_index,
             "draw": draw.to_dict(),
-            "cell": cell_of(draw.object_x, draw.object_y),
+            "cell": cell_of(draw.object_x, draw.object_y, self.spec),
             "success": bool(monitor.success),
             "outcome": outcome,
             "stop_reason": stop_reason,
@@ -673,6 +675,11 @@ def _num(value: Any, spec: str = ".1f") -> str:
 
 def write_report(run_dir: Path, run: dict[str, Any]) -> Path:
     """The human-readable half of the run's provenance."""
+    from manus.objects import OBJECTS
+
+    # The cell bounds are the object's own region, and a report can be rebuilt
+    # from a run.json for an object this process never loaded.
+    spec = OBJECTS.get(run.get("env", {}).get("object", ""))
     result = run["result_detail"]
     wilson = result["wilson95"]
     latency = run["latency"]
@@ -708,7 +715,7 @@ def write_report(run_dir: Path, run: dict[str, Any]) -> Path:
     ]
     for name, cell in result["cells"].items():
         lines.append(
-            f"| `{name}` | {cell_label(name)} | {cell['n']} | {cell['successes']} | "
+            f"| `{name}` | {cell_label(name, spec)} | {cell['n']} | {cell['successes']} | "
             f"{cell['rate']:.0%} |"
         )
 
@@ -859,7 +866,7 @@ def main(args: Any) -> int:  # noqa: PLR0915 - one linear run script
     started = time.time()
     for index in range(args.episodes):
         seed_index = args.seed_base + index
-        draw = draw_episode(args.namespace, seed_index)
+        draw = draw_episode(args.namespace, seed_index, spec)
         # Record on the schedule, plus whichever of success/failure we have yet
         # to see: a report with no failure video is a report you cannot debug.
         record = (args.video_every and index % args.video_every == 0) or len(have) < 2

@@ -82,21 +82,26 @@ args_cli = parser.parse_args()
 # --- Cells ---------------------------------------------------------------------
 
 
-def polar(x: float, y: float) -> tuple[float, float]:
-    """``(radius [m], azimuth [deg])`` of a world point about the pan axis."""
-    from manus.kinematics import GRASP_REGION
+def polar(x: float, y: float, spec=None) -> tuple[float, float]:
+    """``(radius [m], azimuth [deg])`` of a world point about `spec`'s region."""
+    from manus.randomize import placement_region
 
-    radius, azimuth = GRASP_REGION.polar(x, y)
+    radius, azimuth = placement_region(spec).polar(x, y)
     return radius, math.degrees(azimuth)
 
 
-def cell_of(x: float, y: float) -> str:
-    """Name of the report cell a placement falls in, e.g. ``"r1_az-2"``."""
-    from manus.kinematics import GRASP_REGION
+def cell_of(x: float, y: float, spec=None) -> str:
+    """Name of the report cell a placement falls in, e.g. ``"r1_az-2"``.
 
-    radius, azimuth = polar(x, y)
-    low, high = GRASP_REGION.radius
-    span = GRASP_REGION.azimuth_max_deg
+    Binned over the object's *own* placement region, so a side-grasped object's
+    cells span its annulus rather than falling off the end of the top-down one.
+    """
+    from manus.randomize import placement_region
+
+    region = placement_region(spec)
+    radius, azimuth = polar(x, y, spec)
+    low, high = region.radius
+    span = region.azimuth_max_deg
     radius_bin = min(RADIUS_BINS - 1, max(0, int((radius - low) / (high - low) * RADIUS_BINS)))
     azimuth_bin = min(
         AZIMUTH_BINS - 1, max(0, int((azimuth + span) / (2 * span) * AZIMUTH_BINS))
@@ -104,10 +109,11 @@ def cell_of(x: float, y: float) -> str:
     return f"r{radius_bin}_az{azimuth_bin}"
 
 
-def cell_label(name: str) -> str:
+def cell_label(name: str, spec=None) -> str:
     """Human-readable bounds of a cell name from :func:`cell_of`."""
-    from manus.kinematics import GRASP_REGION
+    from manus.randomize import placement_region
 
+    GRASP_REGION = placement_region(spec)  # noqa: N806 -- the object's own region
     radius_bin, azimuth_bin = (int(part[1:]) if part[0] == "r" else int(part[2:])
                                for part in name.split("_"))
     low, high = GRASP_REGION.radius
@@ -134,10 +140,14 @@ def sweep_region() -> dict:
     import numpy as np
 
     from manus.expert import plan_grasp
-    from manus.kinematics import GRASP_REGION
     from manus.objects import OBJECTS
+    from manus.randomize import placement_region
 
     spec = OBJECTS[args_cli.object]
+    # The object's own region: a side-grasped object is placed on a different
+    # annulus entirely, so mapping it over the top-down one would render a
+    # sector that is uniformly infeasible and say nothing.
+    GRASP_REGION = placement_region(spec)  # noqa: N806 -- shadows the module constant
     low, high = GRASP_REGION.radius
     span = GRASP_REGION.azimuth_max_deg
     # Edges rather than centres: the cells tile the sector, so the figure can
@@ -262,7 +272,7 @@ def draw_map(data: dict, path: Path) -> bool:
     outline_x = [*(pan_x + high * np.cos(sweep)), *(pan_x + low * np.cos(sweep[::-1]))]
     outline_y = [*(pan_y + high * np.sin(sweep)), *(pan_y + low * np.sin(sweep[::-1]))]
     axes.plot([*outline_x, outline_x[0]], [*outline_y, outline_y[0]], "k-", lw=1.4,
-              label="GRASP_REGION")
+              label=f"{data.get('object', 'object')} placement region")
 
     keepout_x = region["keepout_x_m"]
     axes.add_patch(
@@ -451,7 +461,7 @@ def write_report(done: dict[int, dict]) -> None:
         cell = by_cell[name]
         hits = sum(1 for record in cell if record["success"])
         lines.append(
-            f"| `{name}` | {cell_label(name)} | {len(cell)} | {hits} | "
+            f"| `{name}` | {cell_label(name, spec)} | {len(cell)} | {hits} | "
             f"{hits / len(cell) * 100:.0f}% |"
         )
 
@@ -605,7 +615,7 @@ def run_gate() -> int:
 
     started = time.time()
     for attempt in todo:
-        draw = draw_episode(GATE_NAMESPACE, attempt)
+        draw = draw_episode(GATE_NAMESPACE, attempt, spec)
         robot.write_joint_state_to_sim_index(
             position=home, velocity=torch.zeros_like(home), full_data=True
         )
@@ -646,14 +656,14 @@ def run_gate() -> int:
             )
             monitor.update(object_pos, measured)
 
-        radius, azimuth_deg = polar(draw.object_x, draw.object_y)
+        radius, azimuth_deg = polar(draw.object_x, draw.object_y, spec)
         record = {
             "attempt": attempt,
             "namespace": GATE_NAMESPACE,
             "object": spec.name,
             "success": bool(monitor.success),
             "outcome": classify_outcome(expert, monitor),
-            "cell": cell_of(draw.object_x, draw.object_y),
+            "cell": cell_of(draw.object_x, draw.object_y, spec),
             "radius": radius,
             "azimuth_deg": azimuth_deg,
             "peak_z": float(monitor.peak_z),

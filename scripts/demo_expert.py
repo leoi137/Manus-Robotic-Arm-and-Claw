@@ -157,7 +157,7 @@ from manus.expert import (
     classify_outcome,
 )
 from manus.objects import OBJECTS
-from manus.randomize import draw_episode
+from manus.randomize import draw_episode, placement_region
 from manus.task_scene import apply_randomization, grasp_scene_cfg
 
 PHYSICS_DT = 1.0 / 120.0
@@ -182,10 +182,37 @@ TUNING_PLACEMENTS: tuple[tuple[float, float], ...] = (
     (0.200, 100.0),  # far corner, +azimuth
     (0.200, -100.0),  # far corner, -azimuth
 )
-"""(radius [m], azimuth [deg]) about the pan axis: the Step 7 tuning grid."""
+"""(radius [m], azimuth [deg]) about the pan axis: the Step 7 tuning grid.
+
+Top-down radii, frozen: this is the grid the expert was tuned on. A side-mode
+object is swept over the corresponding points of its own annulus instead --
+:func:`tuning_placements`."""
 
 TUNING_YAWS_DEG: tuple[float, ...] = (0.0, 22.5, 45.0, 67.5)
 """Object yaws spanning one full 90 deg cube symmetry period."""
+
+
+def tuning_placements(spec) -> tuple[tuple[float, float], ...]:
+    """:data:`TUNING_PLACEMENTS`, mapped onto `spec`'s own placement region.
+
+    The grid is five points -- mid radius, both radial edges, both far corners --
+    and it means the same five things in either region. Top-down objects get the
+    literal Step 7 radii back (the map is the identity on
+    :data:`~manus.kinematics.GRASP_REGION`, which is the region they were
+    written in); a side object gets the same *fractions* of its own annulus, so
+    ``--tuning`` sweeps a reachable grid rather than five infeasible plans.
+    """
+    region = placement_region(spec)
+    low, high = kinematics.GRASP_REGION.radius
+    target_low, target_high = region.radius
+    span = region.azimuth_max_deg / kinematics.GRASP_REGION.azimuth_max_deg
+    return tuple(
+        (
+            target_low + (target_high - target_low) * (radius - low) / (high - low),
+            azimuth * span,
+        )
+        for radius, azimuth in TUNING_PLACEMENTS
+    )
 
 
 def polar_to_xy(radius: float, azimuth_deg: float) -> tuple[float, float]:
@@ -307,14 +334,16 @@ class AttemptRunner:
         rest_z = self.object_z()
 
         if verbose:
-            radius, azimuth = kinematics.GRASP_REGION.polar(draw.object_x, draw.object_y)
+            radius, azimuth = placement_region(self.spec).polar(draw.object_x, draw.object_y)
             print(
                 f"  placement r={radius:.3f} m az={math.degrees(azimuth):+.1f} deg "
                 f"yaw={math.degrees(draw.object_yaw):+.1f} deg  "
                 f"friction={draw.object_static_friction:.2f}  rest_z={rest_z * 1e3:.1f} mm"
             )
             print(
-                f"  plan: grasp_yaw={math.degrees(plan.grasp_yaw):+.1f} deg  "
+                f"  plan: mode={plan.grasp_mode}  "
+                f"{'roll' if plan.grasp_mode == 'side' else 'yaw'}"
+                f"={math.degrees(plan.grasp_yaw):+.1f} deg  "
                 f"lift_rise={plan.lift_rise * 1e3:.0f} mm  close_target={plan.close_target:.3f} rad"
                 + ("" if plan.ok else f"  INFEASIBLE: {plan.reason}")
             )
@@ -488,12 +517,14 @@ def main() -> int:
     # because that is what the summary has to record to be replayable.
     jobs: list[tuple[str, str, object]] = []
     if args_cli.tuning:
-        for radius, azimuth in TUNING_PLACEMENTS:
+        for radius, azimuth in tuning_placements(spec):
             x, y = polar_to_xy(radius, azimuth)
             for yaw_deg in TUNING_YAWS_DEG:
                 # One draw per grid slot, so lighting/friction/colour vary the
                 # way they will in the gate while the placement stays fixed.
-                base = draw_episode("expert_tuning", len(jobs))
+                # The placement is overwritten below, so the draw's own region
+                # does not matter -- only its lighting and friction are used.
+                base = draw_episode("expert_tuning", len(jobs), spec)
                 slot = f"r{radius:.3f}_az{azimuth:+.0f}_yaw{yaw_deg:+.1f}"
                 jobs.append((
                     slot,
@@ -509,7 +540,7 @@ def main() -> int:
             else [args_cli.attempt + index for index in range(args_cli.attempts)]
         )
         for attempt in indices:
-            draw = draw_episode(args_cli.namespace, attempt)
+            draw = draw_episode(args_cli.namespace, attempt, spec)
             if args_cli.pose is not None:
                 x, y, yaw = args_cli.pose
                 draw = dataclasses.replace(draw, object_x=x, object_y=y, object_yaw=yaw)

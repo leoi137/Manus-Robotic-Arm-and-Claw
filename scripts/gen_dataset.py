@@ -709,7 +709,7 @@ def main() -> int:
     frames_written = 0
     for position, attempt_index in enumerate(todo, start=1):
         seed = stable_hash64(args_cli.dataset, attempt_index)
-        draw = draw_episode(args_cli.dataset, attempt_index)
+        draw = draw_episode(args_cli.dataset, attempt_index, spec)
         result = runner.run(attempt_index, draw)
         episode: recorder.EpisodeRecorder = result["episode"]
 
@@ -767,7 +767,8 @@ def main() -> int:
     wall_clock = time.time() - started
     probe = (
         runner.probe_render(
-            draw_episode(args_cli.dataset, next_attempt_index(attempts)), args_cli.probe_render
+            draw_episode(args_cli.dataset, next_attempt_index(attempts), spec),
+            args_cli.probe_render,
         )
         if args_cli.probe_render
         else None
