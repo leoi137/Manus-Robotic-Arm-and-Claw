@@ -127,6 +127,17 @@ parser.add_argument("--chunk", type=int, default=50, help="attempts to run in th
 parser.add_argument("--object", default="cube_3cm", help="catalogue key of the object to grasp")
 parser.add_argument("--root", type=Path, default=REPO_ROOT, help="repository root holding datasets/")
 parser.add_argument(
+    "--scan",
+    action="store_true",
+    help=(
+        "generate with the SCAN search phase: every episode opens by sweeping "
+        "the workspace until the object is in the wrist camera's frustum. The "
+        "search starts at an end of the pan arc and crosses the whole "
+        "workspace, so it adds ~250 control steps (8 s) per episode on "
+        "average and up to ~460 -- roughly double a plain episode"
+    ),
+)
+parser.add_argument(
     "--manifest-only",
     action="store_true",
     help="rebuild manifest.json from the episodes on disk and exit (no GPU)",
@@ -696,7 +707,9 @@ def main() -> int:
 
     dataset_dir = args_cli.root / "datasets" / "raw" / args_cli.dataset
     spec = OBJECTS[args_cli.object]
-    config = ExpertConfig()
+    config = ExpertConfig(scan_phase=args_cli.scan)
+    if args_cli.scan:
+        print("SCAN phase on: episodes open with a search sweep")
 
     attempts = recorder.read_attempts(dataset_dir)
     todo, _ = plan_chunk(attempts)

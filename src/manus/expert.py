@@ -16,6 +16,20 @@ The loop the driver runs is::
 
 States, in order -- :data:`STATE_SEQUENCE`:
 
+``SCAN`` (**optional**, :attr:`ExpertConfig.scan_phase`, off by default)
+    The search. The arm swings to one *end* of shoulder_pan's travel
+    (:data:`SCAN_PAN_END_RAD`; which end comes from :func:`scan_start_end`, a
+    hash of the placement draw and nothing else) and then pans across the whole
+    workspace at :data:`SCAN_RATE_RAD` until the object is inside the wrist
+    camera's frustum (:func:`object_in_view`) for :data:`SCAN_CONFIRM_STEPS`
+    steps; an undetected sweep turns round at the far end and comes back once
+    (:data:`SCAN_REVERSE_LEGS`). Nothing about the search depends on where the
+    object is -- that is the point, see the section comment. Every pose in the
+    sweep is the PREGRASP pose with one joint moved, so the camera looks at the
+    table throughout. This state exists because
+    the wrist camera is the only camera: a demonstration that starts with the
+    object out of frame and walks straight at it asks the policy to invent the
+    object's pose, and Stage 1 scored 1.5% doing exactly that.
 ``PREGRASP``
     Tool vertical, jaws open, TCP at :func:`pregrasp_height` -- the fixed
     stand-off above the grasp point, or higher if that would put the fingers
@@ -139,6 +153,14 @@ __all__ = [
     "CONVERGE_TOL",
     "FREEZE_STATES",
     "JAWS_OPEN_STATES",
+    "SCAN",
+    "SCAN_BUDGET",
+    "SCAN_CONFIRM_STEPS",
+    "SCAN_ENTRY_RAMP",
+    "SCAN_PAN_END_RAD",
+    "SCAN_RATE_RAD",
+    "SCAN_REVERSE_LEGS",
+    "SCAN_VIEW_MARGIN",
     "SEAT",
     "SEAT_CONTACT_REF_STEP",
     "SEAT_CONTACT_STEPS",
@@ -166,7 +188,10 @@ __all__ = [
     "is_side_grasp",
     "jaw_depth",
     "joint_vector",
+    "object_in_view",
     "plan_grasp",
+    "scan_start_end",
+    "wrist_cam_tan_half_fov",
     "plan_lift",
     "pregrasp_height",
     "seat_ramp_steps",
@@ -213,6 +238,7 @@ ARM_UPPER: np.ndarray = np.array(
 
 # --- States -------------------------------------------------------------------
 
+SCAN = "SCAN"
 PREGRASP = "PREGRASP"
 DESCEND = "DESCEND"
 ADVANCE = "ADVANCE"
@@ -509,6 +535,192 @@ slides it -- before the watchdog could re-earn its threshold.
 """
 
 
+# --- SCAN: sweep the workspace until the wrist camera sees the object ---------
+# Stage 1's verdict in one sentence: the ACT policy scored ~1.5% because every
+# v2 demonstration starts with the object *already* out of the wrist camera's
+# frame and the expert walking straight at it from privileged state. The only
+# camera on this robot is the wrist one, so a policy imitating those episodes is
+# asked to infer a pose it has never been shown. SCAN is the fix: the
+# demonstration begins by sweeping shoulder_pan across the table until the
+# object is genuinely inside the camera frustum, and only then does the FSM do
+# what it has always done. The expert still uses the privileged object position
+# -- to *decide when the object is visible*, which is exactly the quantity a
+# camera would give it -- so the recorded behaviour is "sweep until seen, then
+# go" rather than "go".
+#
+# THE SEARCH MUST BE BLIND. The first cut of this state started the sweep at a
+# bearing offset *from the object* and turned towards it, which films a robot
+# that always guesses the right way round. That is unlearnable: at the instant
+# the direction is chosen the object is by construction out of frame, so the
+# policy has no input that predicts it, and imitating it can only produce a
+# coin flip that the demonstrations never show failing. Everything the sweep
+# does before the object is seen therefore depends on the placement draw only
+# through :func:`scan_start_end`'s hash -- a fair coin over the two ends of the
+# arc, decorrelated from the object's azimuth -- and the sweep covers the WHOLE
+# reachable arc rather than the short way home. The cost is episode length; the
+# gain is that a policy which learns "pan until you see it" reproduces the
+# demonstrations exactly.
+
+SCAN_RATE_RAD: float = 0.010
+"""Sweep speed of shoulder_pan through the search, radians per control step.
+
+0.3 rad/s at 30 Hz, i.e. 17 deg/s. Set by what a 30 Hz camera has to see: the
+object crosses the 77.3 deg horizontal frustum in ~4.5 s / 135 frames at this
+rate, so it is in frame for a hundred frames before the sweep stops rather than
+smearing past in a handful. Slower would only cost episode length; much faster
+and a policy would have to catch the object in a couple of frames.
+"""
+
+SCAN_PAN_END_RAD: float = 1.90
+"""Absolute shoulder_pan the sweep starts from and runs to, radians (+/-).
+
+The ends of the joint's own travel, 1.2 deg inside the +/-1.91986 rad stops so
+the command never sits on a limit. What has to hold is that panning from one
+end to the other passes *every* azimuth an object can be placed at, since the
+search is not allowed to know which way to look: the grasp pan of a placement
+in :data:`~manus.kinematics.GRASP_REGION` reaches +/-1.846 rad and of one in
+:data:`~manus.kinematics.SIDE_GRASP_REGION` +/-1.798 rad (swept over both
+annuli and three grasp yaws, ``tests/test_expert_logic.py`` re-derives it), so
+this end clears the worst case by 0.054 rad -- and the camera sees 38.7 deg to
+either side of its axis on top of that. One leg of the sweep is therefore a
+complete search of the workspace, and :data:`SCAN_REVERSE_LEGS` is a fallback
+rather than part of the plan.
+"""
+
+SCAN_VIEW_MARGIN: float = 0.55
+"""Fraction of the half-FOV the object must be inside before the sweep stops.
+
+The frustum test with this applied answers "properly in frame" rather than
+"just crossed the edge": at 0.55 the object has to be within 21 deg of the
+optical axis horizontally, so it stops with the object about halfway in from
+the leading edge and roughly a second of sweep still visible behind it.
+"""
+
+SCAN_CONFIRM_STEPS: int = 3
+"""Consecutive visible steps that end the sweep, so one frame cannot end it."""
+
+SCAN_ENTRY_RAMP: int = 80
+"""Steps spent swinging from wherever the arm starts to the scan-start pose.
+
+2.7 seconds. Longer than :attr:`~ExpertConfig.pregrasp_ramp` because the move
+is longer -- the pregrasp pose plus up to a full 109 deg of pan, now that the
+sweep starts at the end of the arc rather than a bearing near the object. At 80
+steps that worst case moves shoulder_pan 0.024 rad per step, the same entry
+speed the 60-step ramp gave the old (shorter) swing.
+"""
+
+SCAN_REVERSE_LEGS: int = 1
+"""Extra passes over the arc after the first one ends unseen.
+
+One, i.e. the sweep turns round at the far end and comes back. A single leg
+already crosses every reachable azimuth (:data:`SCAN_PAN_END_RAD`), so this is
+insurance against a detection missed at the edge of the frustum -- a placement
+whose bearing the arm happens to pass while the object sits just outside the
+margin -- rather than coverage the first leg lacks. More legs would only burn
+budget: if two passes miss it, the geometry is wrong and no third pass helps.
+"""
+
+SCAN_BUDGET: int = 900
+"""Step ceiling for SCAN: the entry ramp plus both legs of the arc.
+
+The arc is 2 * :data:`SCAN_PAN_END_RAD` = 3.80 rad, which at
+:data:`SCAN_RATE_RAD` is 380 steps a leg. 80 + 380 + 380 = 840, and the ceiling
+sits 60 steps above that so the sweep's own end-of-arc test is what stops it
+and the budget is only reached if something is stuck. A scan that times out
+still grasps, it simply did not film a detection.
+"""
+
+
+def wrist_cam_tan_half_fov() -> tuple[float, float]:
+    """``(tan(hFOV/2), tan(vFOV/2))`` of the wrist camera, from the mount specs.
+
+    USD's aperture and focal length share one scale, so only their ratio
+    matters: ``tan(hFOV/2) = aperture / (2 * focal)``, which at the shipped
+    numbers is the module's 77.3 deg. The sensor is 4:3 and square-pixelled, so
+    the vertical aperture is the horizontal one scaled by ``height / width``.
+    """
+    tan_h = specs.WRIST_CAM_APERTURE / (2.0 * specs.WRIST_CAM_FOCAL)
+    tan_v = tan_h * (specs.WRIST_CAM_HEIGHT / specs.WRIST_CAM_WIDTH)
+    return float(tan_h), float(tan_v)
+
+
+def object_in_view(
+    q: np.ndarray | Sequence[float],
+    object_xyz: np.ndarray | Sequence[float],
+    *,
+    margin: float = SCAN_VIEW_MARGIN,
+    chain: KinematicChain = _CHAIN,
+) -> bool:
+    """Whether `object_xyz` sits inside the wrist camera's frustum at arm pose `q`.
+
+    Geometry only -- no Isaac app, no pixels -- so the same predicate that ends
+    the sweep in sim can be unit-tested on the CPU.
+    :func:`~manus.kinematics.KinematicChain.wrist_camera_pose` returns the
+    rotation in the OpenGL convention, so its columns are the image right, the
+    image up, and *minus* the view direction; a point in front of the camera
+    therefore has a negative third camera-frame coordinate.
+
+    Args:
+        q: Arm pose, radians -- the first five entries of a measurement.
+        object_xyz: Object centre in the robot's own frame, metres.
+        margin: Fraction of the half-FOV the point must be inside; 1.0 is the
+            raw frustum edge and the default is :data:`SCAN_VIEW_MARGIN`.
+        chain: FK to use.
+
+    Returns:
+        Whether the point is in front of the camera and inside the (shrunk)
+        frustum in both axes.
+    """
+    arm = np.asarray(q, dtype=float).reshape(-1)[: kinematics.NUM_ARM_JOINTS]
+    position, rotation = chain.wrist_camera_pose(arm)
+    delta = np.asarray(object_xyz, dtype=float).reshape(3) - position
+    right = float(delta @ rotation[:, 0])
+    up = float(delta @ rotation[:, 1])
+    depth = -float(delta @ rotation[:, 2])
+    if depth <= 1e-6:
+        return False
+    tan_h, tan_v = wrist_cam_tan_half_fov()
+    return abs(right) <= margin * tan_h * depth and abs(up) <= margin * tan_v * depth
+
+
+def scan_start_end(placement: EpisodeDraw | Sequence[float]) -> float:
+    """Which end of the pan arc the sweep starts from: ``+1.0`` or ``-1.0``.
+
+    A fair coin on a hash of the placement draw -- deterministic, so an episode
+    replays exactly, and sim-free, so it needs no RNG plumbed through the
+    driver. It is a hash and *not* a bearing on purpose: the sweep's direction
+    is chosen while the object is out of frame, so anything the policy cannot
+    see must not enter it. Across a dataset both ends come up equally often and
+    neither correlates with the object's azimuth, which is what makes "start at
+    an end, pan until you see it" a rule a camera-only policy can actually
+    follow.
+
+    Multiply by :data:`SCAN_PAN_END_RAD` for the pan the sweep starts at; the
+    sweep then runs to ``-that``.
+    """
+    x, y, yaw = _placement(placement)
+    # A cheap, stable hash of the placement -- reproducible across processes,
+    # unlike hash(), and decorrelated from x, y and yaw individually.
+    seed = (
+        int(round(x * 1e6)) * 73856093
+        ^ int(round(y * 1e6)) * 19349663
+        ^ int(round(yaw * 1e6)) * 83492791
+    ) & 0xFFFFFFFFFFFFFFFF
+    key = _splitmix64(seed)
+    return 1.0 if (key >> 63) & 1 else -1.0
+
+
+def _splitmix64(value: int) -> int:
+    """One round of SplitMix64 -- a stable avalanche, so neighbouring
+    placements do not share a sweep direction the way a raw XOR of coordinates
+    does (measured: the raw key's low bit was constant over the whole region)."""
+    mask = 0xFFFFFFFFFFFFFFFF
+    value = (value + 0x9E3779B97F4A7C15) & mask
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+    return value ^ (value >> 31)
+
+
 @dataclass(frozen=True)
 class ExpertConfig:
     """Tunables of the FSM. Defaults are the tuned Step 7 values.
@@ -597,6 +809,18 @@ class ExpertConfig:
             default -- ``scripts/demo_expert.py --close-ramp`` is why it exists.
 
         lift_ramp: Steps spent retracting to the lift pose.
+        scan_phase: Prepend the :data:`SCAN` search state, so the episode
+            begins by sweeping the workspace until the wrist camera actually
+            sees the object. **Off by default**, which leaves every generator,
+            gate and dataset that predates it bit-for-bit unchanged.
+        scan_rate: Sweep speed of shoulder_pan through SCAN, radians per step
+            (:data:`SCAN_RATE_RAD`).
+        scan_entry_ramp: Steps spent swinging onto the scan-start pose -- the
+            end of the pan arc (:data:`SCAN_ENTRY_RAMP`).
+        scan_view_margin: Fraction of the half-FOV the object must be inside
+            before the sweep stops (:data:`SCAN_VIEW_MARGIN`).
+        scan_budget: Step ceiling for SCAN (:data:`SCAN_BUDGET`); expiry
+            proceeds to PREGRASP anyway and is recorded as a timeout.
         droop_gain: Integral gain folding measured joint error into the command.
             Zero disables droop compensation entirely.
         droop_engage: Per-joint error below which the integrator runs, radians --
@@ -632,6 +856,11 @@ class ExpertConfig:
     descend_ramp: int = 30
     close_ramp: int | None = None
     lift_ramp: int = 30
+    scan_phase: bool = False
+    scan_rate: float = SCAN_RATE_RAD
+    scan_entry_ramp: int = SCAN_ENTRY_RAMP
+    scan_view_margin: float = SCAN_VIEW_MARGIN
+    scan_budget: int = SCAN_BUDGET
     droop_gain: float = 0.12
     droop_engage: float = 0.20
     droop_leak: float = 0.97
@@ -893,6 +1122,8 @@ def state_budget(
     test or a sweep that pins the budget down still gets exactly what it asked
     for.
     """
+    if state == SCAN:
+        return config.scan_budget
     if state == CLOSE and spec is not None and spec.close_creep:
         return max(
             config.state_budget,
@@ -1288,19 +1519,24 @@ def seats(spec: ObjectSpec) -> bool:
     return spec.seat_close
 
 
-def state_sequence(spec: ObjectSpec) -> tuple[str, ...]:
+def state_sequence(spec: ObjectSpec, config: ExpertConfig = DEFAULT_CONFIG) -> tuple[str, ...]:
     """The FSM's state order for `spec`: the mode's, plus a SEAT if it asks.
 
     :data:`STATE_SEQUENCE` or :data:`SIDE_STATE_SEQUENCE` by
     :func:`is_side_grasp`, with :data:`SEAT` spliced in before CLOSE when
     :func:`seats` -- so the two shove-failing objects walk seven states and
     every other object walks the six it always did.
+
+    With :attr:`~ExpertConfig.scan_phase` set, :data:`SCAN` is prepended: the
+    search that has to be in the demonstration for a wrist-camera policy to
+    learn where the object is. The default config does not set it, so the
+    one-argument call every caller before Stage 1's verdict makes is unchanged.
     """
     base = SIDE_STATE_SEQUENCE if is_side_grasp(spec) else STATE_SEQUENCE
-    if not seats(spec):
-        return base
-    index = base.index(CLOSE)
-    return base[:index] + (SEAT,) + base[index:]
+    if seats(spec):
+        index = base.index(CLOSE)
+        base = base[:index] + (SEAT,) + base[index:]
+    return (SCAN, *base) if config.scan_phase else base
 
 
 def approach_state(spec: ObjectSpec) -> str:
@@ -2011,7 +2247,14 @@ class ScriptedGraspExpert:
     ) -> None:
         self.spec = spec
         self.config = config
-        self._sequence: tuple[str, ...] = state_sequence(spec)
+        self._sequence: tuple[str, ...] = state_sequence(spec, config)
+        self._scan_start_pan: float = 0.0
+        self._scan_pan: float = 0.0
+        self._scan_direction: float = 0.0
+        self._scan_legs: int = 0
+        self._scan_object: np.ndarray | None = None
+        self._scan_seen_steps: int = 0
+        self._scan_exit: tuple[str, int] | None = None
         self._plan: GraspPlan | None = None
         self._state: str = PREGRASP
         self._state_step: int = 0
@@ -2061,8 +2304,20 @@ class ScriptedGraspExpert:
                     : kinematics.NUM_ARM_JOINTS
                 ]
             self._plan = plan_grasp(self.spec, placement, start, self.config)
+            if self.config.scan_phase:
+                x, y, _ = _placement(placement)
+                # The object's *centre*, which is what has to be in frame --
+                # spawn_z is the body origin's resting height above the table.
+                self._scan_object = np.array([x, y, self.spec.spawn_z], dtype=float)
+                # The draw's coin, and nothing about (x, y): see scan_start_end.
+                self._scan_start_pan = SCAN_PAN_END_RAD * scan_start_end(placement)
 
-        self._state = PREGRASP
+        self._state = self._sequence[0]
+        self._scan_pan = self._scan_start_pan
+        self._scan_direction = -np.sign(self._scan_start_pan)
+        self._scan_legs = 0
+        self._scan_seen_steps = 0
+        self._scan_exit = None
         self._state_step = 0
         self._total_steps = 0
         self._entry_arm = None
@@ -2221,9 +2476,51 @@ class ScriptedGraspExpert:
 
     def _waypoint(self) -> np.ndarray | None:
         """Arm waypoint of the current state, or None if it does not move the arm."""
+        if self._state == SCAN:
+            return self._scan_waypoint()
         if self._state in ARM_STATES:
             return self.plan.waypoint(self._state)
         return None
+
+    # -- the search --------------------------------------------------------------
+
+    def _scan_waypoint(self, pan: float | None = None) -> np.ndarray:
+        """The scan pose at absolute shoulder_pan `pan`: PREGRASP, panned.
+
+        The sweep is a one-joint family built on the pose the grasp is about to
+        start from, which is what makes it both safe and continuous: every
+        member holds the tool vertical at the pregrasp height over the same
+        radius, so the camera looks at the table for the whole search and the
+        elbow never dips towards it. The pan is *absolute* rather than an
+        offset from the grasp's own pan -- the sweep's geometry is the joint's
+        travel, not the object's bearing -- and it is clamped to the joint
+        limits, which :data:`SCAN_PAN_END_RAD` already sits inside.
+        """
+        angle = self._scan_pan if pan is None else pan
+        q = self.plan.q_pregrasp.copy()
+        q[0] = float(np.clip(angle, ARM_LOWER[0], ARM_UPPER[0]))
+        return q
+
+    def _scan_visible(self, arm: np.ndarray) -> bool:
+        """Whether the object is in frame at the *measured* pose this step.
+
+        Measured, not commanded, because a drooping arm points the camera a few
+        milliradians off where it was told to -- and what the recorded video
+        shows is where the camera actually was.
+        """
+        if self._scan_object is None:
+            return False
+        return object_in_view(
+            arm, self._scan_object, margin=self.config.scan_view_margin
+        )
+
+    def _scan_swept(self) -> bool:
+        """Whether every allowed leg of the arc has been walked, unseen.
+
+        A leg ends at the far end of the travel; the first one to do so turns
+        round (:data:`SCAN_REVERSE_LEGS`) and the last one ends the search.
+        """
+        return self._scan_legs > SCAN_REVERSE_LEGS
 
     def _ramp(self) -> float:
         """Fraction of the current state's ramp already commanded, in [0, 1]."""
@@ -2251,6 +2548,24 @@ class ScriptedGraspExpert:
         if self._state == DONE:
             return None
         budget_spent = self._state_step >= state_budget(self._state, self.spec, self.config)
+        if self._state == SCAN:
+            # No convergence bar: the sweep is a *search*, and what ends it is
+            # the object being in frame. The entry ramp is excluded so a lucky
+            # glimpse while the arm is still swinging into the scan-start pose
+            # cannot end the search before it has started.
+            if self._state_step <= self.config.scan_entry_ramp:
+                return None
+            if self._scan_visible(arm):
+                self._scan_seen_steps += 1
+            else:
+                self._scan_seen_steps = 0
+            if self._scan_seen_steps >= SCAN_CONFIRM_STEPS:
+                self._scan_exit = ("seen", self._state_step)
+                return "seen"
+            if budget_spent or self._scan_swept():
+                self._scan_exit = ("timeout", self._state_step)
+                return "timeout"
+            return None
         if self._state == HOLD:
             return "elapsed" if self._state_step >= self.config.hold_steps else None
         if self._state == SEAT and self._seat_contact(arm):
@@ -2338,7 +2653,30 @@ class ScriptedGraspExpert:
         )
         config = self.config
 
-        if self._state in ARM_STATES:
+        if self._state == SCAN:
+            ramp = max(1, config.scan_entry_ramp)
+            if self._state_step < ramp:
+                # The entry: swing onto the end of the arc the draw's coin
+                # picked, without starting the sweep yet.
+                waypoint = self._scan_waypoint(self._scan_start_pan)
+                beta = (self._state_step + 1) / ramp
+                arm_command = self._entry_arm + beta * (waypoint - self._entry_arm)
+            else:
+                # The sweep: shoulder_pan walks across the whole arc at the scan
+                # rate, everything else held. At the far end the leg is counted
+                # and the direction flips; _scan_swept ends the state once the
+                # allowed legs are spent.
+                self._scan_pan += config.scan_rate * self._scan_direction
+                if abs(self._scan_pan) >= SCAN_PAN_END_RAD:
+                    self._scan_pan = float(
+                        np.clip(self._scan_pan, -SCAN_PAN_END_RAD, SCAN_PAN_END_RAD)
+                    )
+                    self._scan_legs += 1
+                    self._scan_direction = -self._scan_direction
+                waypoint = self._scan_waypoint()
+                self._update_bias(arm, waypoint, 1.0)
+                arm_command = waypoint + self._bias
+        elif self._state in ARM_STATES:
             waypoint = self.plan.waypoint(self._state)
             self._update_bias(arm, waypoint, alpha)
             arm_command = self._entry_arm + alpha * (waypoint - self._entry_arm) + self._bias
@@ -2348,10 +2686,17 @@ class ScriptedGraspExpert:
                 self._frozen_arm if self._frozen_arm is not None else self._last_arm_command
             )
 
-        if self._state == PREGRASP:
-            gripper_command = self._entry_gripper + alpha * (
-                config.gripper_open - self._entry_gripper
+        if self._state in (SCAN, PREGRASP):
+            # SCAN opens the jaws over its entry ramp and then searches with the
+            # hand already open, so PREGRASP inherits an open hand and the
+            # policy never sees the jaws move during the search.
+            span = max(
+                1,
+                config.scan_entry_ramp if self._state == SCAN else config.pregrasp_ramp,
             )
+            gripper_command = self._entry_gripper + min(
+                1.0, (self._state_step + 1) / span
+            ) * (config.gripper_open - self._entry_gripper)
         elif self._state in JAWS_OPEN_STATES:
             gripper_command = config.gripper_open
         elif self._state == CLOSE:
@@ -2429,6 +2774,11 @@ class ScriptedGraspExpert:
             "seat_gap": self.config.seat_gap if seats(self.spec) else None,
             "seat_stroke": seat_stroke(self.config) if seats(self.spec) else None,
             "seat_ramp": seat_ramp_steps(self.config) if seats(self.spec) else None,
+            "scan_phase": self.config.scan_phase,
+            "scan_start_pan": self._scan_start_pan if self.config.scan_phase else None,
+            "scan_legs": self._scan_legs if self.config.scan_phase else None,
+            "scan_exit": None if self._scan_exit is None else self._scan_exit[0],
+            "scan_steps": None if self._scan_exit is None else self._scan_exit[1],
             "seat_exit": None if self._seat_exit is None else self._seat_exit[0],
             "seat_excess": None if self._seat_exit is None else self._seat_exit[1],
             "state": self._state,

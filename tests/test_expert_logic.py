@@ -2039,7 +2039,11 @@ def test_the_demo_driver_names_its_artefacts_after_the_object():
     assert 'f"{args_cli.object}_demo.json"' in source
     assert 'f"{args_cli.object}_tuning.json"' in source
     assert 'f"{args_cli.object}_{slot}"' in source
-    assert 'f"{args_cli.label or name}.mp4"' in source
+    # The suffix is what separates the wrist take from the optional
+    # third-person one (--tp-video); without it the second write would
+    # overwrite the first whenever --label is given, which is exactly when both
+    # are wanted.
+    assert 'f"{args_cli.label or name}{suffix}.mp4"' in source
     # ... and nothing writes the old fixed names any more.
     assert '"demo.json"' not in source
     assert '"tuning.json"' not in source
@@ -3571,3 +3575,174 @@ def test_the_side_planner_never_returns_a_pose_the_arm_cannot_hold():
         for q in (plan.q_pregrasp, plan.q_grasp, plan.q_lift):
             assert np.isfinite(q).all()
             assert np.all(q >= lower - 1e-9) and np.all(q <= upper + 1e-9)
+
+
+# --- The scan phase -------------------------------------------------------------
+
+
+def test_the_scan_phase_is_off_unless_asked_for():
+    """Every generator that predates Stage 1's verdict walks the old sequence."""
+    assert expert_mod.SCAN not in expert_mod.state_sequence(CUBE)
+    assert expert_mod.SCAN not in expert_mod.state_sequence(CYLINDER)
+    assert not ExpertConfig().scan_phase
+    plain = ScriptedGraspExpert(CUBE, a_placement(CUBE))
+    assert expert_mod.SCAN not in [state for state, _ in run(plain, FakeArm(droop=0.02))]
+
+
+def test_the_scan_sweeps_from_the_end_of_the_arc_until_the_object_is_in_frame():
+    """The behaviour the policy has to imitate, measured rather than asserted.
+
+    Over the demo namespace's own draws: the sweep starts at an *end* of
+    shoulder_pan's travel with the object outside the raw frustum, the pan
+    joint actually travels, and the state ends because the object was seen --
+    not because the budget ran out.
+    """
+    from manus.expert import SCAN, SCAN_PAN_END_RAD, object_in_view
+    from manus.randomize import draw_episode
+
+    for index in range(12):
+        draw = draw_episode("expert_demo", index, CUBE)
+        expert = ScriptedGraspExpert(CUBE, draw, config=ExpertConfig(scan_phase=True))
+        centre = np.array([draw.object_x, draw.object_y, CUBE.spawn_z])
+        poses = [q for state, q in run(expert, FakeArm(droop=0.02)) if state == SCAN]
+        pans = [q[0] for q in poses]
+        telemetry = expert.telemetry()
+
+        assert abs(telemetry["scan_start_pan"]) == SCAN_PAN_END_RAD, index
+        assert not object_in_view(poses[0][:ARM], centre, margin=1.0), index
+        # The sweep reaches the end of the arc it starts from, and moves off it.
+        assert max(abs(pan) for pan in pans) == pytest.approx(
+            SCAN_PAN_END_RAD, abs=0.05
+        ), index
+        assert max(pans) - min(pans) > 0.1, index  # a sweep, not a stare
+        assert telemetry["scan_exit"] == "seen", index
+        assert telemetry["scan_legs"] == 0, index  # seen on the first leg
+        assert object_in_view(poses[-1][:ARM], centre), index
+        # ... and the grasp that follows is the one the FSM always ran.
+        assert [report.state for report in expert.reports][1:] == list(
+            expert_mod.state_sequence(CUBE)[:-1]
+        )
+
+
+def test_the_sweep_direction_carries_no_information_about_the_object():
+    """The point of the rewrite: the search is one a blind policy can imitate.
+
+    The first cut started the sweep offset *from the object* and turned towards
+    it, so a demonstration that always guesses right taught a coin flip the
+    policy cannot make -- at the moment the direction is chosen the object is
+    out of frame by construction. So: which end the sweep starts from must be a
+    fair coin, uncorrelated with the object's azimuth (both signs of it, and
+    both halves of the region, draw both ends at nearly even odds), and the
+    start pose itself must be the *same* pan whatever the placement.
+    """
+    from manus.expert import SCAN_PAN_END_RAD, scan_start_end
+    from manus.randomize import draw_episode
+
+    draws = [draw_episode("scan_direction_audit", index, CUBE) for index in range(400)]
+    ends = [scan_start_end(draw) for draw in draws]
+    assert set(ends) == {-1.0, 1.0}
+    # A fair coin overall: ~4 sigma of 400 flips is 40.
+    assert abs(sum(ends)) < 40
+
+    # ... and independent of the object's side of the workspace, which is the
+    # correlation that made the old sweep unlearnable.
+    for side in (-1.0, 1.0):
+        same = [end for end, draw in zip(ends, draws) if math.copysign(1.0, draw.object_y) == side]
+        assert len(same) > 50
+        assert abs(sum(same)) < 0.35 * len(same)
+
+    # The start pose is an end of the joint's travel and nothing else.
+    for draw in draws[:40]:
+        expert = ScriptedGraspExpert(CUBE, draw, config=ExpertConfig(scan_phase=True))
+        start = expert.telemetry()["scan_start_pan"]
+        assert abs(start) == SCAN_PAN_END_RAD
+        assert start == SCAN_PAN_END_RAD * scan_start_end(draw)
+
+
+def test_one_leg_of_the_sweep_covers_every_azimuth_the_task_can_place_at():
+    """The arc has to be a whole search, since it may not aim at the object.
+
+    Both regions, swept over radius and grasp yaw: every plan the pipeline can
+    make grasps at a pan strictly inside the sweep's endpoints, so panning from
+    one end to the other passes the object's own bearing whichever end it
+    started at. :data:`~manus.expert.SCAN_REVERSE_LEGS` is then a fallback, and
+    the budget has to cover the entry ramp plus every leg.
+    """
+    from manus.expert import (
+        SCAN_BUDGET,
+        SCAN_ENTRY_RAMP,
+        SCAN_PAN_END_RAD,
+        SCAN_RATE_RAD,
+        SCAN_REVERSE_LEGS,
+        plan_grasp,
+    )
+
+    lower, upper = specs.JOINT_LIMITS["shoulder_pan"]
+    assert lower < -SCAN_PAN_END_RAD and SCAN_PAN_END_RAD < upper
+    for spec in (CUBE, CYLINDER):
+        region = placement_region(spec)
+        worst = 0.0
+        for azimuth_deg in np.linspace(-region.azimuth_max_deg, region.azimuth_max_deg, 41):
+            azimuth = math.radians(azimuth_deg)
+            for radius in np.linspace(*region.radius, 5):
+                x = region.pan_axis_xy[0] + radius * math.cos(azimuth)
+                y = region.pan_axis_xy[1] + radius * math.sin(azimuth)
+                if not region.contains(x, y):
+                    continue
+                for yaw in (0.0, 0.7, 1.4):
+                    plan = plan_grasp(spec, (x, y, yaw))
+                    if plan.ok:
+                        worst = max(worst, abs(float(plan.q_pregrasp[0])))
+        assert 0.0 < worst < SCAN_PAN_END_RAD, spec.name
+
+    leg_steps = 2 * SCAN_PAN_END_RAD / SCAN_RATE_RAD
+    assert SCAN_BUDGET > SCAN_ENTRY_RAMP + (1 + SCAN_REVERSE_LEGS) * leg_steps
+
+
+def test_an_undetected_sweep_turns_round_at_the_far_end_and_comes_back():
+    """The fallback leg, forced by a visibility test that never fires.
+
+    With the object hidden the sweep must not stop at the far stop: it reverses
+    once, walks the arc back, and only then hands over to PREGRASP with the
+    timeout recorded.
+    """
+    from manus.expert import SCAN, SCAN_PAN_END_RAD, SCAN_REVERSE_LEGS
+
+    expert = ScriptedGraspExpert(
+        CUBE, a_placement(CUBE), config=ExpertConfig(scan_phase=True)
+    )
+    expert._scan_object = np.array([0.0, 0.0, 50.0])  # never in frame
+    pans = [q[0] for state, q in run(expert, FakeArm(droop=0.02)) if state == SCAN]
+    telemetry = expert.telemetry()
+
+    assert telemetry["scan_exit"] == "timeout"
+    assert telemetry["scan_legs"] == SCAN_REVERSE_LEGS + 1
+    assert max(pans) == pytest.approx(SCAN_PAN_END_RAD, abs=0.05)
+    assert min(pans) == pytest.approx(-SCAN_PAN_END_RAD, abs=0.05)
+    # It came home: the last pose is back at the end it started from.
+    assert pans[-1] == pytest.approx(telemetry["scan_start_pan"], abs=0.05)
+    assert telemetry["scan_steps"] < expert_mod.SCAN_BUDGET
+    # ... and the grasp still happens.
+    assert [report.state for report in expert.reports][1:] == list(
+        expert_mod.state_sequence(CUBE)[:-1]
+    )
+
+
+def test_the_view_test_agrees_with_the_camera_it_is_modelling():
+    """``object_in_view`` is the mount's own frustum, not a hand-tuned cone."""
+    from manus.expert import object_in_view, wrist_cam_tan_half_fov
+
+    tan_h, tan_v = wrist_cam_tan_half_fov()
+    assert math.degrees(2 * math.atan(tan_h)) == pytest.approx(77.3, abs=0.1)
+    assert tan_v / tan_h == pytest.approx(specs.WRIST_CAM_HEIGHT / specs.WRIST_CAM_WIDTH)
+
+    q = np.zeros(ARM)
+    position, rotation = kinematics.KinematicChain().wrist_camera_pose(q)
+    forward = -rotation[:, 2]
+    on_axis = position + 0.15 * forward
+    assert object_in_view(q, on_axis, margin=1.0)
+    assert object_in_view(q, on_axis, margin=0.1)
+    # Just outside the horizontal edge, and behind the camera.
+    edge = on_axis + rotation[:, 0] * (1.05 * tan_h * 0.15)
+    assert not object_in_view(q, edge, margin=1.0)
+    assert not object_in_view(q, position - 0.15 * forward, margin=1.0)

@@ -65,6 +65,22 @@ parser.add_argument("--object", default="cube_3cm", help="catalogue key of the o
 parser.add_argument("--tuning", action="store_true", help="run the 5 placements x 4 yaws grid")
 parser.add_argument("--video", action="store_true", help="record the wrist POV to an mp4")
 parser.add_argument(
+    "--scan",
+    action="store_true",
+    help=(
+        "run the SCAN search phase first: sweep the workspace until the object "
+        "is inside the wrist camera's frustum, then grasp as usual"
+    ),
+)
+parser.add_argument(
+    "--tp-video",
+    action="store_true",
+    help=(
+        "also record a fixed third-person view of the whole scene to "
+        "<label>_tp.mp4 (implies --video)"
+    ),
+)
+parser.add_argument(
     "--pose",
     type=float,
     nargs=3,
@@ -152,6 +168,8 @@ args_cli = parser.parse_args()
 # initialise unless the app renders sensors -- so require it rather than making
 # the caller remember --enable_cameras.
 args_cli.enable_cameras = True
+if args_cli.tp_video:
+    args_cli.video = True
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -189,6 +207,21 @@ MAX_CONTROL_STEPS = 1200
 
 VIDEO_FPS = 30
 """Playback rate: one frame per control step, so video is real time."""
+
+TP_CAM_EYE: tuple[float, float, float] = (0.82, 0.0, 0.42)
+"""Where the optional third-person camera stands, metres (world frame).
+
+Dead in front of the base and above it, looking back down the region's axis of
+symmetry. The view is chosen for the *sweep*: SCAN is a 55-80 deg swing of
+shoulder_pan, which is an azimuth change about the base, so a camera on that
+axis renders the whole search as left-right motion across the frame. An oblique
+view (tried first, at (0.62, -0.42, 0.38)) foreshortens exactly that motion and
+makes a 100-step sweep look like the arm standing still.
+"""
+
+TP_CAM_TARGET: tuple[float, float, float] = (0.06, 0.0, 0.08)
+"""What it looks at: just in front of the base, a little above the table -- the
+arm and the whole annulus it sweeps, rather than one placement."""
 
 TUNING_PLACEMENTS: tuple[tuple[float, float], ...] = (
     (0.165, 0.0),  # mid radius, straight ahead
@@ -267,6 +300,14 @@ class AttemptRunner:
         self.robot = scene["robot"]
         self.object = scene["object"]
         self.camera = scene["wrist_cam"]
+        # Optional fixed third-person camera; only present when --tp-video put
+        # one in the scene cfg, so every other run pays nothing for it.
+        self.tp_camera = scene.sensors.get("tp_cam")
+        if self.tp_camera is not None:
+            self.tp_camera.set_world_poses_from_view(
+                eyes=torch.tensor([TP_CAM_EYE], dtype=torch.float32),
+                targets=torch.tensor([TP_CAM_TARGET], dtype=torch.float32),
+            )
         self.dt = sim.get_physics_dt()
         self.device = self.robot.data.joint_pos.torch.device
         assert self.robot.joint_names == list(specs.JOINT_NAMES), (
@@ -358,6 +399,7 @@ class AttemptRunner:
         plan = expert.reset(draw, q_current=measured)
         monitor = GraspSuccessMonitor(self.spec)
         frames: list[np.ndarray] = []
+        tp_frames: list[np.ndarray] = []
         rest_z = self.object_z()
 
         if verbose:
@@ -431,6 +473,20 @@ class AttemptRunner:
                 # Sensors refresh on update(), not on step(); without this the
                 # camera would hand back the same frame all episode.
                 self.camera.update(self.dt * DECIMATION)
+                if self.tp_camera is not None:
+                    self.tp_camera.update(self.dt * DECIMATION)
+                    tp_frames.append(
+                        annotate(
+                            self.tp_camera.data.output["rgb"].torch[0, ..., :3]
+                            .to(torch.uint8)
+                            .cpu()
+                            .numpy(),
+                            [
+                                f"{expert.state}  step {expert.state_step}",
+                                f"object z {self.object_z() * 1e3:6.1f} mm",
+                            ],
+                        )
+                    )
                 frames.append(
                     annotate(
                         self.camera.data.output["rgb"].torch[0, ..., :3]
@@ -493,9 +549,11 @@ class AttemptRunner:
             )
         if record and frames:
             result["video"] = self.write_video(frames, video_name or name)
+        if record and tp_frames:
+            result["tp_video"] = self.write_video(tp_frames, video_name or name, suffix="_tp")
         return result
 
-    def write_video(self, frames: list[np.ndarray], name: str) -> str:
+    def write_video(self, frames: list[np.ndarray], name: str, suffix: str = "") -> str:
         """Write the captured wrist frames to an mp4 and return its path.
 
         ``--label`` still wins outright, which is what pins the one-file-per-
@@ -505,7 +563,10 @@ class AttemptRunner:
 
         out_dir = Path(args_cli.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"{args_cli.label or name}.mp4"
+        # The suffix rides *outside* the --label override on purpose: without
+        # it the third-person take would overwrite the wrist take whenever a
+        # label is given, which is exactly when both are wanted.
+        path = out_dir / f"{args_cli.label or name}{suffix}.mp4"
         iio.imwrite(path, np.stack(frames), fps=VIDEO_FPS)
         print(f"  video: {len(frames)} frames -> {path}")
         return str(path)
@@ -568,6 +629,12 @@ def main() -> int:
     if args_cli.close_ramp is not None:
         config = dataclasses.replace(config, close_ramp=args_cli.close_ramp)
         print(f"OVERRIDE close_ramp = {config.close_ramp}")
+    if args_cli.scan:
+        config = dataclasses.replace(config, scan_phase=True)
+        print(
+            f"SCAN phase on: sweep at {config.scan_rate:.3f} rad/step, "
+            f"entry ramp {config.scan_entry_ramp}, view margin {config.scan_view_margin}"
+        )
     if args_cli.no_seat:
         # Per spec, like every other object property: the FSM reads seat_close
         # off the spec, so clearing it is exactly "the run this object had
@@ -585,7 +652,27 @@ def main() -> int:
     sim = sim_utils.SimulationContext(
         sim_utils.SimulationCfg(dt=PHYSICS_DT, device=args_cli.device)
     )
-    scene = InteractiveScene(grasp_scene_cfg(args_cli.object, num_envs=1, env_spacing=2.0))
+    scene_cfg = grasp_scene_cfg(args_cli.object, num_envs=1, env_spacing=2.0)
+    if args_cli.tp_video:
+        # Attached to the *instance*, not the class: a third-person view is a
+        # filming aid, and every dataset run must keep paying for exactly one
+        # camera. InteractiveScene builds its entities from the cfg's __dict__,
+        # so an instance attribute is all it takes.
+        from isaaclab.sensors import CameraCfg
+
+        scene_cfg.tp_cam = CameraCfg(
+            prim_path="/World/tp_cam",
+            update_period=0.0,
+            width=640,
+            height=480,
+            data_types=["rgb"],
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=18.0,
+                horizontal_aperture=specs.WRIST_CAM_APERTURE,
+                clipping_range=(0.05, 50.0),
+            ),
+        )
+    scene = InteractiveScene(scene_cfg)
     sim.reset()
     runner = AttemptRunner(sim, scene, spec, config)
 
