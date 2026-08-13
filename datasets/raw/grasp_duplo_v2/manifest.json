@@ -264,68 +264,33 @@
   },
   "verify_result": {
     "verifier_version": 1,
-    "stage": "raw",
+    "stage": "lerobot",
     "passed": true,
-    "checked_at": "2026-08-12T19:31:21Z",
+    "checked_at": "2026-08-13T01:53:48Z",
     "numpy": {
-      "running": "2.3.1",
+      "running": "2.2.6",
       "recorded": "2.3.1"
     },
     "checks": [
       {
-        "name": "ledger_has_successes",
+        "name": "lerobot_dataset_loads",
         "passed": true,
-        "detail": "1000 success rows"
+        "detail": "datasets/lerobot/grasp_duplo_v2 as 'manus/grasp_duplo_v2'"
       },
       {
-        "name": "episode_loads",
+        "name": "lerobot_episode_count_matches",
         "passed": true,
-        "detail": "1000 episodes"
+        "detail": "1000 episodes vs 1000 successes"
       },
       {
-        "name": "array_lengths_agree",
+        "name": "lerobot_frame_count_matches",
         "passed": true,
-        "detail": "1000 episodes"
+        "detail": "241636 frames vs 241636 recorded"
       },
       {
-        "name": "arrays_finite",
+        "name": "lerobot_frame_matches_raw",
         "passed": true,
-        "detail": "1000 episodes"
-      },
-      {
-        "name": "timestamps_monotone",
-        "passed": true,
-        "detail": "1000 episodes"
-      },
-      {
-        "name": "timestep_matches_control_hz",
-        "passed": true,
-        "detail": "1000 episodes"
-      },
-      {
-        "name": "frame_count_in_range",
-        "passed": true,
-        "detail": "1000 episodes"
-      },
-      {
-        "name": "no_stalled_frames",
-        "passed": true,
-        "detail": "1000 episodes"
-      },
-      {
-        "name": "frame_statistics_informative",
-        "passed": true,
-        "detail": "1000 episodes"
-      },
-      {
-        "name": "dataset_id_recomputes",
-        "passed": true,
-        "detail": "4ca437e0808a from disk vs 4ca437e0808a in the manifest"
-      },
-      {
-        "name": "manifest_counts_match",
-        "passed": true,
-        "detail": "{'attempts': 1001, 'successes': 1000, 'failures': 1, 'frames': 241636} from disk vs {'attempts': 1001, 'successes': 1000, 'failures': 1, 'frames': 241636} in the manifest"
+        "detail": "attempt 0 frame 120 (observation.images.wrist): mean abs diff 1.51, tolerance 3.0"
       }
     ]
   }
