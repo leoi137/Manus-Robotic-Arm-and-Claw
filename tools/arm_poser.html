@@ -771,6 +771,13 @@ const state = {
   // stay exactly what the user set.
   close: {shove:0, tilt:0, pushDir:[1,0,0], tipAxis:[0,1,0], tipPivot:[0,0,0],
           mu:NOMINAL_FRICTION, trace:null, verdict:null, entryAngle:null},
+  // GRIP: a CLAMPED close attaches the object rigidly to the hand.  `M` is the
+  // object's frame expressed IN THE TCP FRAME at the instant it was clamped, so
+  // the object rides the arm exactly (objectFrame() = FK(TCP) @ M) and lifts off
+  // the table with it.  `angle` is the gripper angle it was clamped at, and
+  // `openAt` the angle at which the jaws are wider than the object again --
+  // raising the gripper slider past that releases it.
+  hold: {on:false, M:null, angle:0, openAt:0},
 };
 
 function objSpec(){ return OBJECTS[state.obj.name]; }
@@ -800,7 +807,23 @@ function closeXform(){
 
 // Object pose: rotation Rz(yaw)@Ry(tiltY)@Rx(tiltX) about its own centre,
 // then whatever the CLOSE simulation has pushed it to.
+// Inverse of a rigid (rotation+translation) 4x4: R^T, -R^T t.
+function invRigid(m){
+  const o=M4.ident();
+  o[0]=m[0];o[1]=m[4];o[2]=m[8];
+  o[4]=m[1];o[5]=m[5];o[6]=m[9];
+  o[8]=m[2];o[9]=m[6];o[10]=m[10];
+  const t=[m[12],m[13],m[14]];
+  o[12]=-(o[0]*t[0]+o[4]*t[1]+o[8]*t[2]);
+  o[13]=-(o[1]*t[0]+o[5]*t[1]+o[9]*t[2]);
+  o[14]=-(o[2]*t[0]+o[6]*t[1]+o[10]*t[2]);
+  return o;
+}
 function objectFrame(){
+  // Held: the placement sliders and the close-sim displacement are both already
+  // baked into hold.M -- the object is a rigid child of the TCP and nothing but
+  // the arm pose moves it.
+  if(state.hold.on) return M4.mul(fk(qArm()).gripper_frame_link, state.hold.M);
   const o=state.obj, sp=objSpec();
   const R = M4.mul(M4.mul(M4.rotZ(o.yaw), M4.rotY(o.tiltY)), M4.rotX(o.tiltX));
   const z = restingZ() + o.z_extra;
@@ -1276,6 +1299,43 @@ function simulateClose(){
   return verdict;
 }
 
+/* --- grip: a CLAMPED close attaches the object to the hand ---------------- */
+// Attach: freeze the object's CURRENT world frame into the TCP frame.  Only a
+// CLAMPED verdict may do this -- a TIPPED/SHOVED close leaves the object free,
+// exactly where the failure left it.
+function attachHold(){
+  const v = state.close.verdict;
+  if(!v || v.kind !== "CLAMPED" || state.hold.on) return;
+  const T = fk(qArm()).gripper_frame_link;
+  state.hold.M = M4.mul(invRigid(T), objectFrame());
+  state.hold.on = true;
+  state.hold.angle = state.q.gripper;
+  // The jaws are wider than the object again above its contact angle; that is
+  // the "release gap".  A hair of hysteresis so the clamp angle itself, which
+  // sits at or just past contact, cannot immediately re-open.
+  state.hold.openAt = Math.max(contactAngleFor(objSpec().width), state.q.gripper) + 0.01;
+}
+// Detach and write the object's world pose back into the placement sliders, so
+// what you see does not jump.  `drop` = let gravity take it: it lands upright on
+// the table under wherever it was let go (straight down, no bounce).
+function releaseHold(drop){
+  if(!state.hold.on) return;
+  const F = objectFrame();                       // still the held frame
+  const o = state.obj;
+  state.hold.on = false; state.hold.M = null;
+  // the object's own displacement is baked into the frame we just read
+  const cl = state.close; cl.shove = 0; cl.tilt = 0;
+  o.x = F[12]; o.y = F[13];
+  o.yaw = Math.atan2(F[1], F[0]);                // keep its heading
+  o.tiltX = 0; o.tiltY = 0;                      // it lands the right way up
+  o.z_extra = drop ? 0 : Math.max(0, F[14] - restingZ());
+}
+// Called after anything that can change the gripper angle: opening the jaws past
+// the object's width is what lets go.
+function releaseIfOpened(){
+  if(state.hold.on && state.q.gripper > state.hold.openAt) releaseHold(true);
+}
+
 /* --- playback: an rAF chain that exists only while it is animating -------- */
 let closeAnim = null;
 const CLOSE_ANIM_MS = 1500;
@@ -1292,16 +1352,44 @@ function playClose(animate){
   // click hit exactly this path and repainted nothing.
   if(!tr || !tr.length){ mark(); return; }
   if(closeAnim){ cancelAnimationFrame(closeAnim); closeAnim = null; }
-  if(!animate){ applyCloseFrame(tr[tr.length-1]); mark(); return; }
-  const t0 = performance.now();
+  if(!animate){ applyCloseFrame(tr[tr.length-1]); attachHold(); mark(); return; }
+  // t0 must be the clock the FRAMES are stamped with, not the clock the click is
+  // stamped with.  A rAF callback carries the START time of the frame it belongs
+  // to, and a click is dispatched during input processing of a frame that has
+  // already started -- so the first callback's `now` is routinely a millisecond
+  // or two BEHIND performance.now() as read here (measured: -2.0 ms in Chrome
+  // 151).  That made u negative, Math.round(u*(len-1)) a NEGATIVE index, and
+  // tr[-1] undefined: applyCloseFrame threw inside the rAF callback, where the
+  // button's try/catch cannot see it.  The chain died on its second frame with
+  // closeAnim still set, so the jaws froze at the entry angle and every later
+  // click cancelled a dead id and threw again -- i.e. CLOSE did nothing, forever.
+  // (Invisible under --virtual-time-budget, whose timestamps only ever advance.)
+  // Two belts: seed t0 from the first frame's own timestamp, and clamp u.
+  let t0 = null;
   (function frame(now){
-    const u = Math.min(1, (now - t0)/CLOSE_ANIM_MS);
-    applyCloseFrame(tr[Math.min(tr.length-1, Math.round(u*(tr.length-1)))]);
-    render();
-    closeAnim = (u < 1) ? requestAnimationFrame(frame) : null;
+    try{
+      if(t0 === null || now < t0) t0 = now;
+      const u = clamp((now - t0)/CLOSE_ANIM_MS, 0, 1);
+      const i = clamp(Math.round(u*(tr.length-1)), 0, tr.length-1);
+      applyCloseFrame(tr[i]);
+      if(u >= 1) attachHold();          // the grip exists only once the jaws are shut
+      render();
+      closeAnim = (u < 1) ? requestAnimationFrame(frame) : null;
+    }catch(err){
+      // never leave the animation half-played and silent
+      closeAnim = null;
+      console.error("CLOSE animation failed", err);
+      applyCloseFrame(tr[tr.length-1]);
+      attachHold();
+      mark();
+    }
   })(performance.now());
 }
 function runClose(animate){
+  // Re-simulating means simulating the geometry as it stands, so an object that
+  // is currently held goes back to being a placed object first -- in place, at
+  // the height it is at (no drop: nothing has been opened).
+  releaseHold(false);
   simulateClose();
   playClose(animate !== false);
   return state.close.verdict;
@@ -1317,6 +1405,7 @@ function clearClose(){
 // ...and additionally reopen the jaws to where CLOSE was entered (the button).
 function resetClose(){
   const back = state.close.entryAngle;
+  releaseHold(true);              // the jaws reopen: whatever was held drops
   clearClose();
   if(back !== null && back !== undefined) state.q.gripper = back;
   mark();
@@ -1359,7 +1448,9 @@ function buildJointUI(){
   for(const name of JOINT_NAMES){
     const [lo,hi]=JOINT_LIMITS[name];
     jointSyncers.push(slider(host,name,name,lo,hi,0.001,
-      ()=>state.q[name],(v)=>{clearClose(); state.q[name]=v;},
+      ()=>state.q[name],(v)=>{clearClose(); state.q[name]=v;
+        // opening the gripper slider past the object's width lets it go
+        if(name === "gripper") releaseIfOpened();},
       `${lo.toFixed(4)} .. ${hi.toFixed(4)} rad  (${deg(lo).toFixed(1)}..${deg(hi).toFixed(1)}°)`));
   }
 }
@@ -1372,7 +1463,7 @@ function buildObjUI(){
   }
   sel.value=state.obj.name;
   sel.addEventListener("change",()=>{
-    clearClose();
+    releaseHold(false); clearClose();
     state.obj.name=sel.value;
     const sp=objSpec();
     const [r0,r1]=REGIONS[sp.mode];
@@ -1386,14 +1477,14 @@ function buildObjCtl(){
   const host=$("#objCtl"); host.innerHTML=""; objSyncers.length=0;
   $("#objSel").value = state.obj.name;      // keep the dropdown honest
   const o=state.obj, S=(...a)=>objSyncers.push(slider(host,...a));
-  S("x","x (m)",-0.60,0.60,0.001,()=>o.x,v=>{clearClose(); o.x=v;},"table x, metres, base_link frame");
-  S("y","y (m)",-0.60,0.60,0.001,()=>o.y,v=>{clearClose(); o.y=v;},"table y, metres");
-  S("yaw","yaw (rad)",-Math.PI,Math.PI,0.005,()=>o.yaw,v=>{clearClose(); o.yaw=v;},"about world +Z");
-  S("tiltX","tilt X (rad)",-Math.PI/2,Math.PI/2,0.005,()=>o.tiltX,v=>{clearClose(); o.tiltX=v;},
+  S("x","x (m)",-0.60,0.60,0.001,()=>state.hold.on?objectFrame()[12]:o.x,v=>{releaseHold(false); clearClose(); o.x=v;},"table x, metres, base_link frame");
+  S("y","y (m)",-0.60,0.60,0.001,()=>state.hold.on?objectFrame()[13]:o.y,v=>{releaseHold(false); clearClose(); o.y=v;},"table y, metres");
+  S("yaw","yaw (rad)",-Math.PI,Math.PI,0.005,()=>o.yaw,v=>{releaseHold(false); clearClose(); o.yaw=v;},"about world +Z");
+  S("tiltX","tilt X (rad)",-Math.PI/2,Math.PI/2,0.005,()=>o.tiltX,v=>{releaseHold(false); clearClose(); o.tiltX=v;},
     "about object local +X — lays a standing cylinder down");
-  S("tiltY","tilt Y (rad)",-Math.PI/2,Math.PI/2,0.005,()=>o.tiltY,v=>{clearClose(); o.tiltY=v;},
+  S("tiltY","tilt Y (rad)",-Math.PI/2,Math.PI/2,0.005,()=>o.tiltY,v=>{releaseHold(false); clearClose(); o.tiltY=v;},
     "about object local +Y");
-  S("lift","lift (m)",0,0.20,0.001,()=>o.z_extra,v=>{clearClose(); o.z_extra=v;},
+  S("lift","lift (m)",0,0.20,0.001,()=>state.hold.on?Math.max(0,objectFrame()[14]-restingZ()):o.z_extra,v=>{releaseHold(false); clearClose(); o.z_extra=v;},
     "extra height above resting contact (0 = on the table)");
   const sp=objSpec();
   const dims = sp.shape==="sphere"
@@ -1426,12 +1517,23 @@ function buildCloseUI(){
 function closeVerdictPanel(){
   const v = state.close.verdict, host=$("#closeVerdict");
   if(!v){ host.innerHTML =
-    `<span class="badge b-mid">NOT RUN</span><br>`+
+    (state.hold.on
+      ? `<span class="badge b-ok">IN HAND</span><br>`+
+        `<span style="color:var(--dim)">the object is clamped to the gripper and `+
+        `moves with it. Open the gripper slider past `+
+        `${state.hold.openAt.toFixed(3)} rad (or Reset / reopen) to drop it.</span>`
+      : `<span class="badge b-mid">NOT RUN</span><br>`+
     `<span style="color:var(--dim)">Pose the hand around the object, then CLOSE. `+
     `The moving jaw always arrives first — the static face stands `+
-    `${(JAW_CLEARANCE*1000).toFixed(1)} mm off by design.</span>`;
+    `${(JAW_CLEARANCE*1000).toFixed(1)} mm off by design.</span>`);
     return; }
-  const badge = `<span class="badge ${v.cls}">${v.title}</span>`;
+  const badge = `<span class="badge ${v.cls}">${v.title}</span>`+
+    (state.hold.on
+      ? ` <span class="badge b-ok">IN HAND</span><br><span style="color:var(--dim)">`+
+        `the object is clamped to the gripper: move any joint and it travels with `+
+        `the hand. Open the gripper slider past `+
+        `${state.hold.openAt.toFixed(3)} rad (or Reset / reopen) to drop it.</span>`
+      : ``);
   const num = [];
   if(Number.isFinite(v.F_tip))
     num.push(`F_tip ${v.F_tip.toFixed(3)} N (r ${(v.rBase*1000).toFixed(1)} mm / h `+
@@ -1522,7 +1624,15 @@ function copy(text,what){
 // centre height (resting contact + lift), so a lifted object does not silently
 // export as one sitting on the table.
 function objPlacement(){
-  const o=state.obj, rest=restingZ();
+  const o=state.obj;
+  if(state.hold.on){                 // held: read the real world frame off the TCP
+    const F = objectFrame();
+    return {name:o.name, held_in_gripper:true,
+      x:+F[12].toFixed(6), y:+F[13].toFixed(6), z:+F[14].toFixed(6),
+      resting_z:+restingZ().toFixed(6), lift:+Math.max(0,F[14]-restingZ()).toFixed(6),
+      yaw:+Math.atan2(F[1],F[0]).toFixed(6), tiltX:0, tiltY:0};
+  }
+  const rest=restingZ();
   return {
     name: o.name,
     x:+o.x.toFixed(6), y:+o.y.toFixed(6), z:+(rest+o.z_extra).toFixed(6),
@@ -1690,8 +1800,8 @@ function mark(){ if(!dirty){ dirty=true; requestAnimationFrame(render); } }
 })();
 
 /* buttons */
-$("#bZero").onclick=()=>{ clearClose(); for(const n of JOINT_NAMES) state.q[n]=0; mark(); };
-$("#bOpen").onclick=()=>{ clearClose(); state.q.gripper=GRIPPER_OPEN; mark(); };
+$("#bZero").onclick=()=>{ releaseHold(true); clearClose(); for(const n of JOINT_NAMES) state.q[n]=0; mark(); };
+$("#bOpen").onclick=()=>{ releaseHold(true); clearClose(); state.q.gripper=GRIPPER_OPEN; mark(); };
 // A top-down HOVER, not a grasp: pitch sum = PITCH_SUM_VERTICAL so the approach
 // axis points straight down, TCP at z = +75 mm (fingertips +69 mm, i.e. ~39 mm
 // over a 30 mm cube) and TCP radius 165.5 mm about the pan axis -- the middle of
@@ -1700,13 +1810,13 @@ $("#bOpen").onclick=()=>{ clearClose(); state.q.gripper=GRIPPER_OPEN; mark(); };
 // with the fingertips at -21.7 mm and the object 52 mm off the hand.
 // wrist_flex = pi/2 - lift - elbow = 1.5458 rad, 0.11 rad clear of its stop.
 $("#bTop").onclick=()=>{
-  clearClose();
+  releaseHold(true); clearClose();
   Object.assign(state.q,{shoulder_pan:0,shoulder_lift:-0.175,elbow_flex:0.200,
     wrist_flex:Math.PI/2+0.175-0.200, wrist_roll:0, gripper:GRIPPER_OPEN});
   // put the object directly under the TCP so the hover reads as a hover
   const tcp = graspCheck().tcp;
   state.obj.x=tcp[0]; state.obj.y=tcp[1]; state.obj.z_extra=0; mark(); };
-$("#bSide").onclick=()=>{  clearClose();  // side family: pitch sum = 0, level jaws
+$("#bSide").onclick=()=>{  releaseHold(true); clearClose();  // side family: pitch sum = 0, level jaws
   Object.assign(state.q,{shoulder_pan:0,shoulder_lift:-0.30,elbow_flex:0.55,
     wrist_flex:-0.25, wrist_roll:-1.5222, gripper:GRIPPER_OPEN});
   // mid SIDE_GRASP_REGION (0.352-0.422 m about the pan axis), not 0.350, which
