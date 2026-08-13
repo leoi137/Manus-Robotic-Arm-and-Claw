@@ -225,7 +225,7 @@
 
 <div id="side">
   <h1>SO-101 Arm Poser</h1>
-  <div class="sub">Exact URDF kinematics &middot; metres &middot; radians &middot; base_link frame &middot; <b>v7</b></div>
+  <div class="sub">Exact URDF kinematics &middot; metres &middot; radians &middot; base_link frame &middot; <b>v8</b></div>
 
   <h2>Close simulation</h2>
   <div class="btns">
@@ -1276,6 +1276,40 @@ function simulateClose(){
   verdict.F_tip = F_tip; verdict.F_slide = F_slide; verdict.mech = mech;
   verdict.hPush = hPush; verdict.rBase = rBase; verdict.disp = dispTotal;
   verdict.firstA = firstA; verdict.log = log;
+
+  /* ---- the jaws ALWAYS move ---------------------------------------------
+   * NOTHING IN HAND and an entry-time TABLE STRIKE both break out of the loop
+   * above before `put` has recorded a single frame, so `trace` came back
+   * EMPTY -- and an empty trace is the one input playClose cannot animate.
+   * That, not any browser, is what made the button look dead: the default
+   * pose holds nothing, so every click took this path and the gripper never
+   * moved.  Repainting the verdict badge was never enough; the user is
+   * watching the hand, not the sidebar.
+   * Refusing to move was not a physics result either.  "Nothing in hand"
+   * means nothing is between the faces, and nothing between the faces is
+   * nothing to stop the servo: the honest thing to draw is the free closure
+   * it actually performs.  The verdict is untouched -- it reports what the
+   * close did to the OBJECT, and doing nothing to the object is still the
+   * right answer.
+   * End angle: fully shut when the hand is empty; at the object's contact
+   * angle for a table strike, where the object IS in hand and closing past
+   * contact would drive the jaws through it.
+   */
+  if(!trace.length){
+    const stop = (verdict.kind === "EMPTY")
+      ? GRIPPER_CLOSED
+      : Math.max(GRIPPER_CLOSED, contactAngleFor(sp.width));
+    const FREE = 60;
+    for(let k = 0; k <= FREE; k++)
+      trace.push({a: entry + (stop - entry)*k/FREE, shove:0, tilt:0,
+                  note: k ? null : "free"});
+    log.push(`the jaws are unobstructed: they close freely from `+
+             `${entry.toFixed(3)} to ${stop.toFixed(3)} rad`+
+             (verdict.kind === "EMPTY"
+               ? ` (GRIPPER_CLOSED)`
+               : ` (contact angle for a ${(sp.width*1000).toFixed(1)} mm object)`)+
+             ` — the verdict above is about the object, not about the jaws`);
+  }
 
   /* ---- consequence frames: purely so the failure is VISIBLE ------------- */
   const last = trace.length ? trace[trace.length-1] : {a:target,shove,tilt};
