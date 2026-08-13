@@ -26,10 +26,16 @@ All were generated on a rented Vast.ai GPU (RTX 5080) and verified 4/4 at the
 lerobot stage. The raw `.npz` episodes (12 GB, master copies for re-conversion)
 still live only on the instance — sync before terminating it.
 
-Two catalogue objects remain **failed/experimental**: `cylinder_3cm` (standing)
-and `puck_d40x10`. The automated expert shoves them instead of clamping (the
-moving jaw contacts first and pushes; the cylinder tips at 0.29 N vs 0.64 N
-slide resistance, the puck squirts out). They are excluded from the sweep.
+Three catalogue objects remain **failed/experimental** (`objects.py` is the
+truth here): `cylinder_3cm` (standing), `puck_d40x10` and `puck_d40x20` — the
+three cylinders. Contact probing (Aug 2026, `runs/contact_probe/probe.json`)
+found the real failure: analytic cylinder prims become PhysX "custom geometry",
+which generates no narrowphase contacts against the jaws' SDF colliders — the
+fixed pad was a ghost the object slid straight through before being flung by a
+late deep-penetration catch. Cylinders now spawn as mesh prims with convex-hull
+colliders (`ObjectSpec.make_spawn_cfg`), and all three pass their attempt-0
+probes/filmed demos (`runs/expert_demo/{cylinder_3cm,puck_d40x10,puck_d40x20}_0000.mp4`).
+They stay excluded from the sweep until the ≥200-attempt expert gate re-runs.
 
 ## Stage 1 — ACT baseline (diagnostic, do first)
 

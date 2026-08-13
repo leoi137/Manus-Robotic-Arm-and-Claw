@@ -529,6 +529,16 @@ OBJECTS: dict[str, ObjectSpec] = {
     # tilted even 3 deg is wider than the closing gap, so the jaws lever it out.
     # See manus.expert.close_command.
     #
+    # GRASPED since the mesh-collider fix (2026-08-13). Every CLOSE failure
+    # above was measured through the analytic-cylinder bug (see make_spawn_cfg):
+    # the fixed pad generated no contacts at all, so the push really was
+    # one-sided -- the seat put the object against a pad the solver could not
+    # feel. With a live pad the same attempt-0 draw probes and films as a hold
+    # (runs/contact_probe/meshcyl.json, runs/expert_demo/cylinder_3cm_0000.mp4:
+    # fixed jaw loads on-pad at 29.78 mm gap vs 30.0 mesh, CLOSE moves the
+    # object 0.22 mm / 0.03 deg, held 60/30). ``experimental`` stays set until
+    # the >=200-attempt gate re-runs.
+    #
     # Its height is what makes it the side case rather than the puck: the hand's
     # own housing hangs 27.8 mm below the tool axis (manus.expert.SIDE_JAW_DEPTH),
     # so a side grasp is only defined on something tall enough to be taken well
@@ -550,7 +560,7 @@ OBJECTS: dict[str, ObjectSpec] = {
         grasp_mode="side",
         close_creep=True,
         seat_close=True,
-        experimental=True,  # fails at CLOSE: seating-shove energy dump (see fix-crew notes)
+        experimental=True,  # attempt-0 demo grasps since the mesh-collider fix; pending gate re-run
     ),
     # A 16 mm acrylic die (~1200 kg/m^3): the smallest thing in the catalogue,
     # and the object the arm's own convergence residual is worst for -- 5.9 mm
@@ -607,6 +617,13 @@ OBJECTS: dict[str, ObjectSpec] = {
     # purchase on the rim falls from 7 mm to 3 mm (measured off the meshes in
     # tests/test_expert_logic.py). Left in the catalogue, and tip_clearance_m is
     # exposed so the band can be swept in sim, but out of DEFAULT_OBJECTS.
+    #
+    # GRASPED since the mesh-collider fix (2026-08-13): the punt was measured
+    # through the analytic-cylinder bug (see make_spawn_cfg). With live
+    # colliders the attempt-0 filmed demo holds it 58/30 with a 4.4 mm /
+    # 3.9 deg nudge at CLOSE (runs/expert_demo/puck_d40x10_0000.mp4) -- the
+    # edge-drag is still visible, just no longer fatal. ``experimental`` stays
+    # set until the >=200-attempt gate re-runs.
     "puck_d40x10": ObjectSpec(
         name="puck_d40x10",
         shape="cylinder",
@@ -617,7 +634,7 @@ OBJECTS: dict[str, ObjectSpec] = {
         spawn_z=0.005,
         close_target_rad=close_target_for_width(0.040),
         yaw_symmetry="free",
-        experimental=True,
+        experimental=True,  # attempt-0 demo grasps since the mesh-collider fix; pending gate re-run
     ),
     # The 10 mm puck's respec: same 40 mm disc, twice as thick (~1200 kg/m^3,
     # 30 g). The width, and so the close target and the contact angle, are
@@ -639,6 +656,14 @@ OBJECTS: dict[str, ObjectSpec] = {
     # a fix -- the best of them holds the full success predicate for 6
     # consecutive steps against the 30 it needs, where the Step 23 preview held
     # 0 (``runs/object_previews/puck_d40x20_fixed.mp4``).
+    #
+    # GRASPED since the mesh-collider fix (2026-08-13): the climb-and-ride was
+    # measured through the analytic-cylinder bug (see make_spawn_cfg). With
+    # live colliders the attempt-0 filmed demo holds it 58/30, CLOSE moving it
+    # 0.29 mm / 0.30 deg (runs/expert_demo/puck_d40x20_0000.mp4). The two
+    # changes below were tuned against the broken contacts and are kept as-is
+    # -- they measure no worse now -- but re-judge them at the gate.
+    # ``experimental`` stays set until the >=200-attempt gate re-runs.
     #
     # THE GRASP IS RAISED 4.1 mm OFF ITS OWN CENTRE, and tip_clearance_m is how,
     # because the bar is this object's alone. Centred, the Step 23 preview was
@@ -676,7 +701,7 @@ OBJECTS: dict[str, ObjectSpec] = {
         tip_clearance_m=0.01176,
         close_creep=True,
         seat_close=True,
-        experimental=True,  # fails at CLOSE: seating-shove energy dump (see fix-crew notes)
+        experimental=True,  # attempt-0 demo grasps since the mesh-collider fix; pending gate re-run
     ),
     # A regulation ping-pong ball: 40 mm, 2.7 g, hollow (~80 kg/m^3). Kept at
     # its real mass deliberately -- it is the catalogue's slip-and-roll case,
