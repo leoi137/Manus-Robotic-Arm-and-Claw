@@ -225,7 +225,7 @@
 
 <div id="side">
   <h1>SO-101 Arm Poser</h1>
-  <div class="sub">Exact URDF kinematics &middot; metres &middot; radians &middot; base_link frame &middot; <b>v8</b></div>
+  <div class="sub">Exact URDF kinematics &middot; metres &middot; radians &middot; base_link frame &middot; <b>v9</b></div>
 
   <h2>Close simulation</h2>
   <div class="btns">
@@ -1315,16 +1315,59 @@ function simulateClose(){
   const last = trace.length ? trace[trace.length-1] : {a:target,shove,tilt};
   if(verdict.kind === "TIPPED" || verdict.kind === "SHOVED"){
     const K = 40;
+    // These frames are an ILLUSTRATION, not simulation -- but an illustration
+    // that draws the object INSIDE a jaw is worse than no illustration: it
+    // reads as the tool being broken.  The old version cranked tilt to
+    // TOPPLE_RAD+0.6 about the far base edge with no geometry check at all,
+    // and that edge sits AGAINST the static face -- so leaning the top toward
+    // the static face swept the whole body straight through the one plate that
+    // never moves.  That is the "it falls through the steady jaw" report.
+    // The geometry is cheap: staticGap is signed and linear in `shove` (a
+    // metre of shove spends a metre of gap), so one correction per step puts
+    // the object back in contact instead of inside.  That correction IS the
+    // topple: the top cannot pass the plate, so it slides down the plate while
+    // the base swings out.
+    const SKIN = 1e-4;                       // 0.1 mm — kiss the plate, never enter it
+    // The MOVING face is already pressed INTO the object at the decided frame:
+    // `pen = -movingGap` above is precisely how this model measures the push
+    // (blocked jaw travel x 3.4 N/mm = force).  So the bar for that face is not
+    // "no overlap" -- it is "no DEEPER than the press the verdict was decided
+    // at".  Measuring it against zero instead jams the topple on frame one.
+    state.q.gripper = last.a; cl.shove = last.shove; cl.tilt = last.tilt;
+    const baseMoving = Math.min(0, graspCheck().movingGap);
+    let jammed = false, drawn = 0;
     for(let k = 1; k <= K; k++){
-      if(verdict.kind === "TIPPED" && mech !== "rake")
-        trace.push({a:last.a, shove:last.shove, tilt:last.tilt + (TOPPLE_RAD+0.6-last.tilt)*k/K,
-                    note:"consequence"});
-      else
-        trace.push({a:last.a, shove:last.shove + 0.045*k/K,
-                    tilt:last.tilt + (mech==="rake" ? 0.25*k/K : 0), note:"consequence"});
+      const tipping = (verdict.kind === "TIPPED" && mech !== "rake");
+      const tGoal = tipping ? last.tilt + (TOPPLE_RAD + 0.6 - last.tilt)*k/K
+                            : last.tilt + (mech === "rake" ? 0.25*k/K : 0);
+      const sGoal = tipping ? last.shove : last.shove + 0.045*k/K;
+      state.q.gripper = last.a; cl.tilt = tGoal; cl.shove = sGoal;
+      let g = graspCheck(), s = sGoal;
+      // A face only blocks where the finger actually IS: an object that has
+      // left the pads sideways is past the plate, not against it, and must
+      // stay free to keep going.
+      if(g.yOverlap > 0 && g.padOverlap > 0){
+        if(g.staticGap < SKIN){                        // would cross the static plate
+          s = sGoal + (g.staticGap - SKIN);            // slide back along -pushDir
+          cl.shove = s; g = graspCheck();
+        }
+        // ...and if backing off has put it inside the MOVING face instead, it
+        // is wedged between the two plates with nowhere left to go.  Drawing
+        // it deeper into either one would be the same lie, so stop here.
+        if(g.movingGap < baseMoving - SKIN){ jammed = true; break; }
+      }
+      trace.push({a:last.a, shove:s, tilt:tGoal, note:"consequence"});
+      drawn++;
     }
-    log.push(`(the last ${K} frames are the CONSEQUENCE, drawn so the failure is `+
-             `visible — the verdict is decided at ${last.a.toFixed(3)} rad)`);
+    log.push(drawn === 0
+      ? `(no CONSEQUENCE frames: at ${last.a.toFixed(3)} rad the object is already `+
+        `wedged between the two faces — every further degree of lean would be `+
+        `inside a jaw, so there is nothing honest left to draw)`
+      : `(the last ${drawn} frames are the CONSEQUENCE, drawn so the failure is `+
+        `visible — the verdict is decided at ${last.a.toFixed(3)} rad. The object `+
+        `is kept OUT of the static face and never pressed deeper into the moving `+
+        `one, so what you see is the topple the plates actually allow`+
+        (jammed ? `, stopping where the two faces wedge it` : ``)+`)`);
   }
 
   // restore: the simulation must not be a side effect of being run
