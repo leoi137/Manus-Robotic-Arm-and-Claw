@@ -5,9 +5,10 @@ Do not edit by hand — regenerate it.
 
 | Dataset | Objects | Attempts | Successes | Frames | Success rate | LeRobot | Dataset id | Git | Created | Preview |
 |---|---|---|---|---|---|---|---|---|---|---|
-| `grasp_cube_v2` | cube_3cm | 1000 | 1000 | 198070 | 100.0% | — | `f6578292089a` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_cube_v2.gif) |
-| `grasp_die_v2` | die_16mm | 1050 | 1000 | 296102 | 95.2% | — | `0d1fb55fcdce` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_die_v2.gif) |
-| `grasp_domino_v2` | domino_20x40 | 1000 | 1000 | 244437 | 100.0% | — | `30771db8b374` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_domino_v2.gif) |
-| `grasp_duplo_v2` | duplo_32x64 | 1001 | 1000 | 241636 | 99.9% | — | `4ca437e0808a` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_duplo_v2.gif) |
+| `grasp_cube_v2` | cube_3cm | 1000 | 1000 | 198070 | 100.0% | yes | `f6578292089a` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_cube_v2.gif) |
+| `grasp_die_v2` | die_16mm | 1050 | 1000 | 296102 | 95.2% | yes | `0d1fb55fcdce` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_die_v2.gif) |
+| `grasp_domino_v2` | domino_20x40 | 1000 | 1000 | 244437 | 100.0% | yes | `30771db8b374` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_domino_v2.gif) |
+| `grasp_duplo_v2` | duplo_32x64 | 1001 | 1000 | 241636 | 99.9% | yes | `4ca437e0808a` | `91a7499`* | 2026-08-12 | [gif](../media/datasets/grasp_duplo_v2.gif) |
+| `grasp_pingpong_v2` | pingpong_40mm | 1181 | 1000 | 294398 | 84.7% | — | `655e63e8b5a6` | `91a7499`* | 2026-08-13 | [gif](../media/datasets/grasp_pingpong_v2.gif) |
 
 `Git` is the commit the dataset was generated at; a trailing `*` marks a dirty tree.
