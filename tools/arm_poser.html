@@ -1,0 +1,1818 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SO-101 Arm Poser</title>
+<!--
+================================================================================
+ SO-101 ARM POSER  --  manual grasp-pose finder for the two objects the
+ automated IK expert cannot clamp (cylinder_3cm, puck_d40x10).
+
+ Self-contained: no CDN, no external fetch, hand-rolled WebGL renderer,
+ render-on-interaction only (no animation loop).
+
+ SOURCES OF TRUTH (transcribed verbatim, do not "improve" these numbers):
+   assets/so101/urdf/so101_new_calib.urdf   joint origins / rpy / axes / limits
+   src/manus/kinematics.py                  FK convention, ARM_JOINTS table, TCP
+   src/manus/specs.py                       JOINT_NAMES order, JOINT_LIMITS
+   src/manus/objects.py                     object catalogue, jaw-gap model
+   src/manus/expert.py                      jaw geometry (faces, tips, pads)
+   src/manus/control.py                     GRIPPER_OPEN=1.5, GRIPPER_CLOSED=0.0
+
+ JOINT ORDER (specs.JOINT_NAMES, Feetech bus motor-ID order 1..6):
+   0 shoulder_pan   1 shoulder_lift   2 elbow_flex
+   3 wrist_flex     4 wrist_roll      5 gripper
+ The arm "q" vector consumed by manus.kinematics.KinematicChain.fk is the
+ first FIVE of those; `gripper` is off-chain (it drives moving_jaw_so101_v1_link
+ off gripper_link) and takes no slot in q.
+
+ CONVENTIONS:
+   * Every angle is RADIANS. Zero pose = every joint 0.0 (specs.HOME_POSE).
+   * Every length is METRES.
+   * Each joint contributes its fixed URDF <origin xyz rpy> (rpy is fixed-axis
+     roll/pitch/yaw applied as Rz@Ry@Rx) followed by a rotation of the joint
+     angle about the CHILD frame's local +Z.  All six revolute joints in the
+     URDF carry an explicit <axis xyz="0 0 1"/>, so +Z is unconditional.
+   * Poses are expressed in base_link coordinates; the sim's world frame is
+     base_link with the table at z = 0.  base_link +X points "forward" into the
+     workspace, +Z is up.
+   * TCP = gripper_frame_link (fixed joint off gripper_link).  Its +Z is the
+     APPROACH axis, pointing OUT of the jaws; its +X is the jaw closing axis.
+   * gripper joint OPENS with increasing angle.  GRIPPER_OPEN = 1.5 rad,
+     GRIPPER_CLOSED = 0.0 rad; URDF travel is [-0.174533, 1.74533].
+
+ JAW MODEL (objects.py / expert.py, all mesh-measured):
+   gap(angle) = 0.0155 m + 0.0727 m/rad * angle        (JAW_WIDTH_PER_RAD)
+   contact_angle(w) = 0.189 + (w - 0.030) / 0.0727     (MEASURED_STALL_30MM_RAD)
+   close_target(w)  = contact_angle(w) - squeeze   (SQUEEZE_RAD = 0.139, but
+                      die_16mm ships LIGHT_SQUEEZE_RAD = 0.10 -> -0.104 rad)
+   Static jaw inner face lies on TCP-frame x = 0 (JAW_FIXED_FACE_X); the moving
+   jaw face is at x = -gap.  Fingertips are 6.3 mm PAST the TCP along +Z
+   (JAW_TIP_Z); the pads' centre is 4 mm behind the TCP (TCP_TO_PAD_CENTRE).
+
+ RENDERING APPROXIMATIONS (documented, deliberate -- no meshes are loaded):
+   * Links are drawn as BEAMS from each link's own origin to the origin of the
+     joint carrying its child, so every drawn length is a URDF number; only the
+     cross-sections are eyeballed.  Servo bodies are boxes at the URDF visual
+     origins of the sts3215 meshes, oriented by their own rpy.
+   * The moving jaw SWINGS about the URDF `gripper` joint (origin
+     (0.0202, 0.0188, -0.0234) on gripper_link, axis +Z after a 90 deg roll,
+     i.e. the TCP frame's -Y).  Its crank radius (77.0 mm) and phase are pinned
+     to two measured numbers -- gap(0) = 15.5 mm and 30.0 mm at the measured
+     0.189 rad contact angle -- and the swing then independently reproduces
+     40.6 mm at the puck's 0.327 rad contact angle (spec: 40) and a fingertip
+     56.8 mm behind the TCP at GRIPPER_OPEN (expert.py measured: 57).
+     Do NOT go back to translating the finger by gap(angle): the linear fit is
+     only claimed over the band that engages a resting object, and extrapolated
+     to GRIPPER_OPEN it asks for a 125 mm finger, longer than the forearm.
+   * The HUD shows the swept gap AND the sim's linear fit side by side; they
+     agree to ~1.5 mm across the engaging band.
+
+ CLOSE SIMULATION (section 8b) -- quasi-static, and it exists to reproduce ONE
+ documented failure mode, not to be a physics engine:
+
+   The static jaw face never moves (TCP x = 0) and the approach deliberately
+   leaves the object expert.JAW_CLEARANCE = 2 mm clear of it, so the MOVING jaw
+   always reaches the object first and pushes it ONE-SIDED across that gap.  Per
+   step the pushed object either
+     (a) SLIDES along the table          resisted by  mu * m * g
+     (b) TIPS about its far base edge    resisted by  m * g * r_base / h_push
+     (c) reaches the static face and is CLAMPED,
+   and the mechanism is whichever of (a)/(b) needs the smaller force.
+
+ PHYSICS CONSTANTS (transcribed, with their source lines):
+   objects.py:41   NOMINAL_FRICTION = 1.0        object surface friction, mu
+   randomize.py:91 FRICTION_RANGE = (0.8, 1.2)   the per-episode draw; the mu
+                                                 slider sweeps it
+   objects.py:475+ mass_kg per object            m
+   specs.py:40     STS3215_KP = 17.8             jaw servo stiffness ->
+                   kp / JAW_WIDTH_PER_RAD^2 = 3.37 N/mm of blocked jaw travel
+                   (expert.py: "3.4 N/mm, everywhere")
+   g = 9.81 m/s^2
+ Worked check, expert.py:826-827 -- "a one-sided push at a 40 mm contact height
+ needs 0.29 N to tip a 30 mm cylinder and 0.64 N to slide it, so the tip is what
+ happens *at any speed*": this tool computes
+   F_tip   = 0.080*9.81*0.015/0.040 = 0.294 N   (exactly the documented 0.29 N)
+   F_slide = mu*0.080*9.81           = 0.785 N at the nominal mu = 1.0,
+                                       0.628 N at the draw's low end mu = 0.8.
+ The documented 0.64 N sits between those two; the ORDERING -- tip before slide,
+ by a factor of 2+ at every mu in the draw -- is what the failure rests on and it
+ reproduces at every mu in FRICTION_RANGE.  The tool prints both numbers; it does
+ not fudge mu to land on 0.64.
+
+ The two other documented mechanisms, also modelled:
+   * EDGE RAKE (objects.py:588-592, puck_d40x10): the moving finger meets the
+     object "within 1.4 mm of the puck's top face" and is still descending
+     (12.5 mm of ridge drop per radian in this tool's swing model, 16 mm in the
+     mesh measurement), so it rakes the top edge and drags the object down and
+     in instead of pushing its wall.  Fail: SHOVED (edge rake).
+   * LEVERED OUT (objects.py:511-512): "a cylinder tilted even 3 deg is wider
+     than the closing gap, so the jaws lever it out".  Emergent here, not
+     hard-coded -- the tilted support width is recomputed every step and the
+     verdict fires when it exceeds the current jaw gap.
+   * SPHERES ROLL: rolling resistance ~ 0, so a one-sided push moves the ball
+     at any force; it is only caught if the approach already trapped it against
+     the static face.
+
+ VERIFIED (headless Chrome + a diff against the repo's own code):
+   * FK matches manus.kinematics.KinematicChain.fk to 8.5e-8 over all six chain
+     links at the zero pose and two random poses.
+   * The CLOSE simulation reproduces all four documented outcomes from the
+     poses manus.expert.plan_grasp() itself returns (headless, ?close=1):
+       cylinder_3cm at the expert pose  -> TIPPED, F_tip 0.294 N vs F_slide
+         0.785 N (mu 1.0), the push reaching 0.294 N after 0.087 mm of blocked
+         jaw travel -- expert.py's own "0.29 N is only 0.086 mm of blocked jaw
+         travel" -- and levered out at 1.88 deg, 32.0 mm across a 31.4 mm gap.
+       the same pose with the object already on the static pad -> CLAMPED at
+         0.1877 rad, which is MEASURED_STALL_30MM_RAD (0.189) to 1.3 mrad.
+       puck_d40x10 at the expert pose -> SHOVED (edge rake): first contact
+         0.3 mm ABOVE its 10 mm top face with 4.7 mm of pad on the rim.
+       puck_d40x10 seated with 2.5 mm tips -> CLAMPED at 0.3188 rad, 7.0 mm of
+         pad overlap.
+     The four DEFAULT_OBJECTS (cube, die, domino, duplo) all CLAMP from their
+     own plan_grasp poses, and pingpong_40mm rolls out unless it starts against
+     the static pad -- i.e. the model's success/failure split is the
+     catalogue's own.
+   * Loading the expert's own plan_grasp() solutions for cylinder_3cm and
+     puck_d40x10 reproduces its tcp_grasp to the displayed precision, a 2.0 mm
+     static-face gap (= expert.JAW_CLEARANCE), 5.0 mm of fingertip clearance on
+     the puck (= expert.MIN_TIP_CLEARANCE) and 4.7 mm of pad overlap on its
+     10 mm rim (objects.py: "the pads reach only the top 5.0 mm").
+
+ Author: tooling for the Manus sim-to-real pipeline.
+================================================================================
+-->
+<style>
+  :root{
+    --bg:#0e1116; --panel:#151a22; --panel2:#1b222c; --line:#2a3340;
+    --fg:#dfe6ef; --dim:#8894a5; --accent:#4da3ff; --ok:#3ddc84; --warn:#ffb347;
+    --bad:#ff6b6b; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:13px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    display:flex;overflow:hidden}
+
+  #side{width:330px;min-width:330px;height:100vh;overflow-y:auto;
+    background:var(--panel);border-right:1px solid var(--line);padding:12px 12px 40px}
+  #side::-webkit-scrollbar{width:9px}
+  #side::-webkit-scrollbar-thumb{background:#2c3644;border-radius:5px}
+
+  h1{font-size:14px;margin:0 0 2px;letter-spacing:.06em;text-transform:uppercase}
+  .sub{color:var(--dim);font-size:11px;margin-bottom:12px}
+  h2{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);
+     margin:16px 0 8px;border-bottom:1px solid var(--line);padding-bottom:5px}
+
+  .row{display:grid;grid-template-columns:88px 1fr 62px;gap:7px;align-items:center;
+       margin-bottom:6px}
+  .row label{font-size:11px;color:var(--fg);font-family:var(--mono);white-space:nowrap}
+  .row .lim{grid-column:1/-1;font-size:10px;color:var(--dim);font-family:var(--mono);
+            margin:-4px 0 4px;text-align:right}
+  input[type=range]{width:100%;height:18px;-webkit-appearance:none;background:transparent}
+  input[type=range]::-webkit-slider-runnable-track{height:4px;background:#2b3542;border-radius:2px}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;
+    margin-top:-4.5px;border-radius:50%;background:var(--accent);cursor:pointer}
+  input[type=range]::-moz-range-track{height:4px;background:#2b3542;border-radius:2px}
+  input[type=range]::-moz-range-thumb{width:13px;height:13px;border:0;border-radius:50%;
+    background:var(--accent);cursor:pointer}
+  input[type=number],select{background:var(--panel2);color:var(--fg);
+    border:1px solid var(--line);border-radius:4px;padding:3px 5px;
+    font-family:var(--mono);font-size:11px;width:100%}
+  input[type=number]:focus,select:focus{outline:1px solid var(--accent);border-color:var(--accent)}
+
+  button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+    border-radius:4px;padding:5px 9px;font-size:11px;cursor:pointer;font-family:inherit}
+  button:hover{border-color:var(--accent);color:#fff}
+  .btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+
+  button.big{flex:1 1 100%;padding:9px 10px;font-size:12.5px;font-weight:700;
+    letter-spacing:.08em;background:#1d3550;border-color:#2f5f92;color:#cfe4ff}
+  button.big:hover{background:#24476b;border-color:var(--accent)}
+  #closeVerdict{margin-top:8px;font-family:var(--mono);font-size:10.5px;line-height:1.6}
+
+  #stage{flex:1;position:relative;min-width:0}
+  canvas{display:block;position:absolute;inset:0;width:100%;height:100%}
+  #labels{pointer-events:none}
+  /* The PiP is NOT its own canvas -- it is a scissored viewport inside #gl (one
+     WebGL context only).  This is just its chrome.  NB: `inset` must not appear
+     after right/top, the shorthand would reset them. */
+  #pipframe{position:absolute;left:auto;bottom:auto;right:14px;top:14px;
+    width:236px;height:177px;border:1px solid var(--line);border-radius:5px;
+    box-shadow:0 4px 18px rgba(0,0,0,.55);pointer-events:none}
+  #piplab{position:absolute;right:18px;top:18px;font:10px var(--mono);color:var(--dim);
+    letter-spacing:.08em;pointer-events:none}
+
+  #hud{position:absolute;left:14px;bottom:14px;background:rgba(21,26,34,.93);
+    border:1px solid var(--line);border-radius:6px;padding:10px 12px;
+    font-family:var(--mono);font-size:11px;min-width:352px;
+    backdrop-filter:blur(6px)}
+  #hud table{border-collapse:collapse;width:100%}
+  #hud td{padding:1px 8px 1px 0;white-space:nowrap}
+  #hud td.n{text-align:right;color:#cfe4ff}
+  #hud .hdr{color:var(--dim);font-size:10px;letter-spacing:.09em;text-transform:uppercase}
+  #grasp{margin-top:8px;padding-top:7px;border-top:1px solid var(--line)}
+  .badge{display:inline-block;padding:1px 7px;border-radius:3px;font-size:10px;
+    letter-spacing:.06em;font-weight:600}
+  .b-ok{background:rgba(61,220,132,.16);color:var(--ok);border:1px solid rgba(61,220,132,.4)}
+  .b-no{background:rgba(255,107,107,.14);color:var(--bad);border:1px solid rgba(255,107,107,.36)}
+  .b-mid{background:rgba(255,179,71,.14);color:var(--warn);border:1px solid rgba(255,179,71,.4)}
+  #help{position:absolute;left:14px;top:14px;font:10px var(--mono);color:var(--dim);
+    line-height:1.6;pointer-events:none}
+  .note{font-size:10.5px;color:var(--dim);margin-top:6px;line-height:1.5}
+  #toast{position:absolute;left:50%;bottom:26px;transform:translateX(-50%);
+    background:var(--accent);color:#06101c;padding:6px 14px;border-radius:4px;
+    font-size:11px;font-weight:600;opacity:0;transition:opacity .18s;pointer-events:none}
+</style>
+
+<div id="side">
+  <h1>SO-101 Arm Poser</h1>
+  <div class="sub">Exact URDF kinematics &middot; metres &middot; radians &middot; base_link frame</div>
+
+  <h2>Close simulation</h2>
+  <div class="btns">
+    <button id="bClose" class="big">▶ CLOSE GRIPPER</button>
+    <button id="bReopen">Reset / reopen</button>
+  </div>
+  <div id="closeCtl"></div>
+  <div id="closeVerdict"></div>
+
+  <h2>Joints &mdash; sim order</h2>
+  <div id="joints"></div>
+
+  <h2>Object</h2>
+  <div class="row"><label>preset</label>
+    <select id="objSel" style="grid-column:2/-1"></select></div>
+  <div id="objCtl"></div>
+  <div class="note" id="objNote"></div>
+
+  <h2>Pose presets</h2>
+  <div class="btns">
+    <button id="bZero">All zero</button>
+    <button id="bOpen">Jaws open (1.5)</button>
+    <button id="bTop">Top-down seed</button>
+    <button id="bSide">Side seed</button>
+    <button id="bExpCyl">Expert grasp — cylinder</button>
+    <button id="bExpPuck">Expert grasp — puck</button>
+    <button id="bPuckSeat">Puck — seated, deep tips</button>
+  </div>
+
+  <h2>Export</h2>
+  <div class="btns">
+    <button id="bJson">Copy JSON</button>
+    <button id="bPy">Copy Python dict</button>
+    <button id="bQ">Copy q array</button>
+  </div>
+  <div class="note">
+    <code>q</code> = first five joints, the vector
+    <code>KinematicChain.fk(q)</code> takes. <code>gripper</code> is off-chain.
+  </div>
+
+  <h2>View</h2>
+  <div class="btns">
+    <button data-view="iso">Iso</button>
+    <button data-view="front">Front +X</button>
+    <button data-view="side">Side +Y</button>
+    <button data-view="top">Top</button>
+    <button id="bFit">Recentre</button>
+  </div>
+</div>
+
+<div id="stage">
+  <canvas id="gl"></canvas>
+  <canvas id="labels"></canvas>
+  <div id="pipframe"></div>
+  <div id="piplab">IDEALIZED TCP POV<br>not the sim's wrist cam</div>
+  <div id="help">drag&nbsp;=&nbsp;orbit &nbsp; shift/right-drag&nbsp;=&nbsp;pan &nbsp; wheel&nbsp;=&nbsp;zoom</div>
+  <div id="hud"></div>
+  <div id="toast">copied</div>
+</div>
+
+<script>
+"use strict";
+/* ========================================================================== *
+ * 1. Ground truth, transcribed from the repo.                                *
+ * ========================================================================== */
+
+// specs.JOINT_NAMES  (Feetech bus motor-ID order 1..6)
+const JOINT_NAMES = ["shoulder_pan","shoulder_lift","elbow_flex",
+                     "wrist_flex","wrist_roll","gripper"];
+
+// specs.JOINT_LIMITS -- straight from the URDF <limit> tags, radians.
+const JOINT_LIMITS = {
+  shoulder_pan : [-1.91986, 1.91986],
+  shoulder_lift: [-1.74533, 1.74533],
+  elbow_flex   : [-1.69,    1.69   ],
+  wrist_flex   : [-1.65806, 1.65806],
+  wrist_roll   : [-2.74385, 2.84121],
+  gripper      : [-0.174533,1.74533],
+};
+
+// kinematics.ARM_JOINTS + TCP_JOINT.  xyz metres, rpy radians (fixed axis).
+// Every revolute axis is the child frame's local +Z.
+const CHAIN = [
+  {name:"shoulder_pan",  child:"shoulder_link",
+   xyz:[ 0.0388353, -8.97657e-09,  0.0624],  rpy:[ 3.14159, 4.18253e-17, -3.14159], rev:true},
+  {name:"shoulder_lift", child:"upper_arm_link",
+   xyz:[-0.0303992,  -0.0182778,  -0.0542],  rpy:[-1.5708, -1.5708, 0.0],           rev:true},
+  {name:"elbow_flex",    child:"lower_arm_link",
+   xyz:[-0.11257,    -0.028,       1.73763e-16], rpy:[-3.63608e-16, 8.74301e-16, 1.5708], rev:true},
+  {name:"wrist_flex",    child:"wrist_link",
+   xyz:[-0.1349,      0.0052,      3.62355e-17], rpy:[4.02456e-15, 8.67362e-16, -1.5708], rev:true},
+  {name:"wrist_roll",    child:"gripper_link",
+   xyz:[ 5.55112e-17,-0.0611,      0.0181],  rpy:[ 1.5708, 0.0486795, 3.14159],     rev:true},
+  {name:"gripper_frame_joint", child:"gripper_frame_link",
+   xyz:[-0.0079,     -0.000218121,-0.0981274], rpy:[0.0, 3.14159, 0.0],             rev:false},
+];
+
+// objects.py jaw model (all mesh-measured / sim-measured).
+const JAW_WIDTH_PER_RAD   = 0.0727;   // m per rad
+const JAW_GAP_INTERCEPT   = 0.0155;   // m at angle 0
+const MEASURED_STALL_30MM = 0.189;    // rad
+const REFERENCE_WIDTH_M   = 0.030;    // m
+const SQUEEZE_RAD         = 0.189 - 0.05;     // 0.139
+// objects.py LIGHT_SQUEEZE_RAD -- the squeeze the die_16mm actually ships with.
+// It moves that object's close target from -0.143 rad (0.032 off the jaw's hard
+// stop) to -0.104 (0.071 off it).
+const LIGHT_SQUEEZE_RAD   = 0.10;
+const GRIPPER_OPEN = 1.5, GRIPPER_CLOSED = 0.0;   // control.py
+
+// expert.py / kinematics.py hand geometry, TCP frame, metres.
+const JAW_FIXED_FACE_X   = 0.0;      // static jaw inner face plane, TCP x
+const JAW_TIP_Z          = 0.0063;   // fingertips this far PAST the TCP along +Z
+const TCP_TO_PAD_CENTRE  = 0.004;    // pad centre this far BEHIND the TCP (-Z)
+const MOVING_JAW_DEEPEST_Z = 0.00806;
+const JAW_CLEARANCE      = 0.002;
+const MIN_TIP_CLEARANCE  = 0.005;
+const JAW_PARALLEL_REACH = 0.020;
+const FINGER_BACK_Z      = -0.044;   // fingers ~50 mm long
+const FINGER_THICK       = 0.010;
+const FINGER_HALF_Y      = 0.0105;
+const PAD_BAND_HALF      = 0.010;    // pads span roughly +/-10 mm about their centre
+
+// --- Moving jaw: it SWINGS, it does not slide -----------------------------
+// URDF joint "gripper": origin xyz (0.0202, 0.0188, -0.0234) rpy (1.5708,0,0)
+// on gripper_link, axis local +Z -- which after that roll is the gripper link's
+// -Y, i.e. the TCP frame's -Y.  So the finger rotates in the TCP's x-z plane
+// about a pivot 28 mm to the -x side of the static face and 75 mm behind the
+// TCP.  Drawing it as a translation by gap(angle) was flatly wrong: the linear
+// gap fit is only claimed "over the band that engages a resting object", and
+// extrapolated to GRIPPER_OPEN it asks for a 125 mm-long finger.
+const GRIPPER_JOINT_XYZ = [0.0202, 0.0188, -0.0234];      // in gripper_link
+const TCP_JOINT_XYZ     = [-0.0079, -0.000218121, -0.0981274];
+// gripper_link -> TCP is a pi turn about +Y, i.e. diag(-1, 1, -1).
+const JAW_PIVOT = [
+  -(GRIPPER_JOINT_XYZ[0] - TCP_JOINT_XYZ[0]),
+   (GRIPPER_JOINT_XYZ[1] - TCP_JOINT_XYZ[1]),
+  -(GRIPPER_JOINT_XYZ[2] - TCP_JOINT_XYZ[2]),
+];
+// Crank radius + phase of the finger's inner face about that pivot, pinned to
+// the two numbers the sim actually measures: the face stands gap(0) = 15.5 mm
+// off the static face at angle 0, and 30.0 mm off it at the measured 30 mm
+// contact angle of 0.189 rad.  Everything else about the swing then follows
+// from the URDF pivot -- and it checks out: at GRIPPER_OPEN the fingertip lands
+// ~55 mm BEHIND the TCP, which is the "57 mm" expert.py measured off the mesh.
+const JAW_CRANK = (function(){
+  const A = MEASURED_STALL_30MM;
+  const u = -JAW_GAP_INTERCEPT   - JAW_PIVOT[0];          // r*sin(phase)
+  const wc = -REFERENCE_WIDTH_M  - JAW_PIVOT[0];          // r*sin(phase - A)
+  const c = (u*Math.cos(A) - wc)/Math.sin(A);             // r*cos(phase)
+  return {r: Math.hypot(u,c), phase: Math.atan2(u,c)};
+})();
+// Where the moving pad's face actually is, in TCP coordinates, at angle `a`.
+function jawFacePoint(a){
+  const p = JAW_CRANK.phase - a, r = JAW_CRANK.r;
+  return [JAW_PIVOT[0] + r*Math.sin(p), 0, JAW_PIVOT[2] + r*Math.cos(p)];
+}
+
+const gapForAngle     = a => JAW_GAP_INTERCEPT + JAW_WIDTH_PER_RAD * a;
+const angleForGap     = g => (g - JAW_GAP_INTERCEPT) / JAW_WIDTH_PER_RAD;
+const contactAngleFor = w => MEASURED_STALL_30MM + (w - REFERENCE_WIDTH_M) / JAW_WIDTH_PER_RAD;
+const closeTargetFor  = (w,sq=SQUEEZE_RAD) => contactAngleFor(w) - sq;
+
+// objects.py catalogue.  The two targets first; the rest for reference.
+const OBJECTS = {
+  cylinder_3cm: {shape:"cylinder", radius:0.015, height:0.060, mass:0.080,
+    width:0.030, spawnZ:0.030, mode:"side", experimental:true,
+    note:"SIDE grasp, taken at 40 mm 'cup' height. Fails at CLOSE: a one-sided "+
+         "push at 40 mm tips a 30 mm cylinder before it slides (0.29 N vs 0.64 N), "+
+         "and a cylinder tilted even 3 deg is wider than the closing gap."},
+  puck_d40x10: {shape:"cylinder", radius:0.020, height:0.010, mass:0.015,
+    width:0.040, spawnZ:0.005, mode:"top", experimental:true,
+    note:"Widest grasp in the catalogue. Too short to centre the pads on, so the "+
+         "grasp is raised to keep the tips off the table and only the top ~5 mm of "+
+         "rim is held; the still-descending moving jaw hits the top edge first and "+
+         "drags it down and in."},
+  cube_3cm:    {shape:"cuboid", he:[0.015,0.015,0.015], mass:0.06, width:0.030, spawnZ:0.015, mode:"top", note:"Primary task object."},
+  die_16mm:    {shape:"cuboid", he:[0.008,0.008,0.008], mass:0.005, width:0.016, spawnZ:0.008, mode:"top",
+    squeeze:LIGHT_SQUEEZE_RAD,
+    note:"Lightest with corners; ships close_target_for_width(0.016, squeeze="+
+         "LIGHT_SQUEEZE_RAD), i.e. -0.104 rad, not the catalogue default -0.143."},
+  domino_20x40:{shape:"cuboid", he:[0.010,0.020,0.0075], mass:0.02, width:0.020, spawnZ:0.0075, mode:"top", note:"Jaws close along local x = the 20 mm axis."},
+  puck_d40x20: {shape:"cylinder", radius:0.020, height:0.020, mass:0.030, width:0.040, spawnZ:0.010, mode:"top",
+    experimental:true, tipClearance:0.01176,
+    note:"The 10 mm puck's respec, 20 mm rim. Ships tip_clearance_m = 11.76 mm, "+
+         "NOT the catalogue's 5 mm floor: that is the height at which the moving "+
+         "finger's deepest sweep (8.06 mm below the TCP) lands exactly at the "+
+         "puck's 10 mm centre of mass instead of reaching under it and levering "+
+         "the rim up. The pads still hold 8.2 mm of rim there."},
+  pingpong_40mm: {shape:"sphere", radius:0.020, mass:0.0027, width:0.040, spawnZ:0.020, mode:"top",
+    note:"Regulation ball, kept at its real 2.7 g: the catalogue's slip-and-roll "+
+         "case, and the only object whose contact with a flat pad is a point "+
+         "rather than a face."},
+  duplo_32x64: {shape:"cuboid", he:[0.0159,0.0319,0.012], mass:0.02, width:0.0318, spawnZ:0.012, mode:"top", note:"Studs up."},
+};
+// Per-object overrides of the two catalogue defaults the poser reports.
+const extentZ          = sp => (sp.shape==='cuboid' ? 2*sp.he[2]
+                              : sp.shape==='cylinder' ? sp.height : 2*sp.radius);
+const squeezeFor       = sp => (sp.squeeze === undefined ? SQUEEZE_RAD : sp.squeeze);
+const tipClearanceFor  = sp => (sp.tipClearance === undefined ? MIN_TIP_CLEARANCE : sp.tipClearance);
+
+/* --- CLOSE-simulation physics constants (see the header) ------------------ */
+const G_ACCEL         = 9.81;    // m/s^2
+const NOMINAL_FRICTION= 1.0;     // objects.py:41
+const FRICTION_RANGE  = [0.8,1.2];   // randomize.py:91, the per-episode draw
+const STS3215_KP      = 17.8;    // specs.py:40, position-servo stiffness
+// expert.py close_command(): "by virtual work through the jaw's own rate, a
+// blocked gap of g stands the pads on kp * g / rate^2 newtons" = 3.4 N/mm.
+const JAW_STIFFNESS_N_PER_M = STS3215_KP / (JAW_WIDTH_PER_RAD*JAW_WIDTH_PER_RAD);
+// objects.py:591 -- on the thin puck "the first contact stays within 1.4 mm of
+// the puck's top face": a moving face that arrives that close to (or above) the
+// top rakes the edge instead of pushing the wall.
+const EDGE_RAKE_M     = 0.0015;
+// objects.py:511-512 -- "a cylinder tilted even 3 deg is wider than the closing
+// gap, so the jaws lever it out".  The bar an object that arrived at the static
+// face LEANING is judged against; the same fact is also caught emergently
+// mid-push, by comparing the tilted support width with the live jaw gap.
+const TILT_LEVER_RAD  = 3.0*Math.PI/180;
+// ...and the gate on it.  A push above an object's centre of mass tips ANY of
+// these objects before it slides them (r/h < mu at mu = 1.0 for most of the
+// catalogue), but tipping is only FATAL for an object that is taller than the
+// jaws are wide apart: there the lean adds height*sin(tilt) to the width faster
+// than the closing pads can swallow it, which is the cylinder's documented
+// failure.  A squat object (cube, die, domino, duplo, puck) rocks by the same
+// couple of degrees and is then righted by the pads, because its contact couple
+// acts over a height SMALLER than its width -- which is exactly the split the
+// catalogue's own success/failure record has: the 60x30 cylinder is the only
+// leverable one, and it is the only one that fails this way.
+const leverable = sp => extentZ(sp) > sp.width + 1e-9;
+// A tip this far past vertical is a topple, not a lean -- only a display cap.
+const TOPPLE_RAD      = 0.44;
+
+// kinematics.GRASP_REGION / SIDE_GRASP_REGION -- drawn on the table as guides.
+const PAN_AXIS_XY = [0.0388353, 0.0];
+const REGIONS = {top:[0.111,0.220], side:[0.352,0.422]};
+const REGION_AZ_DEG = 105.0;
+
+/* ========================================================================== *
+ * 2. Small linear-algebra kit (column-major 4x4, WebGL order).               *
+ * ========================================================================== */
+const M4 = {
+  ident: () => new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]),
+  mul(a,b){ const o=new Float32Array(16);
+    for(let c=0;c<4;c++) for(let r=0;r<4;r++){ let s=0;
+      for(let k=0;k<4;k++) s+=a[k*4+r]*b[c*4+k]; o[c*4+r]=s; }
+    return o; },
+  trans(x,y,z){ const m=M4.ident(); m[12]=x;m[13]=y;m[14]=z; return m; },
+  scale(x,y,z){ const m=M4.ident(); m[0]=x;m[5]=y;m[10]=z; return m; },
+  rotZ(a){ const c=Math.cos(a),s=Math.sin(a),m=M4.ident(); m[0]=c;m[1]=s;m[4]=-s;m[5]=c; return m; },
+  rotX(a){ const c=Math.cos(a),s=Math.sin(a),m=M4.ident(); m[5]=c;m[6]=s;m[9]=-s;m[10]=c; return m; },
+  rotY(a){ const c=Math.cos(a),s=Math.sin(a),m=M4.ident(); m[0]=c;m[2]=-s;m[8]=s;m[10]=c; return m; },
+  // URDF fixed-axis rpy: R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
+  fromRPY(rpy){ return M4.mul(M4.mul(M4.rotZ(rpy[2]),M4.rotY(rpy[1])),M4.rotX(rpy[0])); },
+  origin(xyz,rpy){ const m=M4.fromRPY(rpy); m[12]=xyz[0];m[13]=xyz[1];m[14]=xyz[2]; return m; },
+  xform(m,v){ return [ m[0]*v[0]+m[4]*v[1]+m[8]*v[2]+m[12],
+                       m[1]*v[0]+m[5]*v[1]+m[9]*v[2]+m[13],
+                       m[2]*v[0]+m[6]*v[1]+m[10]*v[2]+m[14] ]; },
+  axis(m,i){ return [m[i*4],m[i*4+1],m[i*4+2]]; },
+  perspective(fovy,aspect,n,f){ const t=1/Math.tan(fovy/2), o=new Float32Array(16);
+    o[0]=t/aspect; o[5]=t; o[10]=(f+n)/(n-f); o[11]=-1; o[14]=2*f*n/(n-f); return o; },
+  lookAt(eye,tgt,up){
+    const z=norm(sub(eye,tgt)); let x=cross(up,z);
+    if(len(x)<1e-9) x=cross([0,1,0],z);
+    x=norm(x); const y=cross(z,x);
+    return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0,
+      -dot(x,eye),-dot(y,eye),-dot(z,eye),1]); },
+  // inverse-transpose of the upper-left 3x3, as a mat3 for normals
+  normalMat(m){
+    const a=m[0],b=m[1],c=m[2], d=m[4],e=m[5],f=m[6], g=m[8],h=m[9],i=m[10];
+    const A=e*i-f*h, B=f*g-d*i, C=d*h-e*g;
+    let det=a*A+b*B+c*C; if(Math.abs(det)<1e-20) det=1e-20;
+    const id=1/det;
+    return new Float32Array([A*id,B*id,C*id,
+      (c*h-b*i)*id,(a*i-c*g)*id,(b*g-a*h)*id,
+      (b*f-c*e)*id,(c*d-a*f)*id,(a*e-b*d)*id]); },
+};
+const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const add=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]];
+const mul=(a,s)=>[a[0]*s,a[1]*s,a[2]*s];
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const len=a=>Math.hypot(a[0],a[1],a[2]);
+const norm=a=>{const l=len(a)||1; return [a[0]/l,a[1]/l,a[2]/l];};
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const deg=r=>r*180/Math.PI;
+
+/* ========================================================================== *
+ * 3. Forward kinematics -- identical walk to KinematicChain.fk.              *
+ * ========================================================================== */
+const ORIGINS = CHAIN.map(j => M4.origin(j.xyz, j.rpy));
+
+function fk(q){                       // q = 5 arm angles, radians
+  const poses = {base_link: M4.ident()};
+  let pose = M4.ident(), k = 0;
+  for(let i=0;i<CHAIN.length;i++){
+    pose = M4.mul(pose, ORIGINS[i]);
+    if(CHAIN[i].rev) pose = M4.mul(pose, M4.rotZ(q[k++]));
+    poses[CHAIN[i].child] = pose;
+  }
+  return poses;
+}
+
+/* ========================================================================== *
+ * 4. WebGL renderer -- two programs (lit solids, plain lines).               *
+ * ========================================================================== */
+function makeGL(canvas){
+  const gl = canvas.getContext("webgl",{antialias:true,alpha:false,depth:true});
+  if(!gl){ document.body.innerHTML =
+    "<p style='padding:24px;font:14px monospace;color:#ff6b6b'>WebGL unavailable.</p>";
+    throw new Error("no webgl"); }
+
+  function sh(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src);
+    gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s; }
+  function prog(vs,fs){ const p=gl.createProgram();
+    gl.attachShader(p,sh(gl.VERTEX_SHADER,vs)); gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));
+    gl.linkProgram(p);
+    if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    return p; }
+
+  const solid = prog(`
+    attribute vec3 aPos; attribute vec3 aNrm;
+    uniform mat4 uVP, uM; uniform mat3 uN;
+    varying vec3 vN; varying vec3 vW;
+    void main(){ vec4 w = uM*vec4(aPos,1.0); vW=w.xyz; vN=normalize(uN*aNrm);
+                 gl_Position = uVP*w; }`, `
+    precision mediump float;
+    varying vec3 vN; varying vec3 vW;
+    uniform vec3 uColor; uniform float uAlpha;
+    void main(){
+      vec3 n = normalize(vN);
+      float key  = max(dot(n, normalize(vec3(0.45,0.30,0.84))), 0.0);
+      float fill = max(dot(n, normalize(vec3(-0.6,-0.4,0.25))), 0.0);
+      float rim  = pow(1.0 - abs(n.z), 2.0)*0.10;
+      vec3 c = uColor*(0.30 + 0.72*key + 0.20*fill) + rim;
+      gl_FragColor = vec4(c, uAlpha);
+    }`);
+  const line = prog(`
+    attribute vec3 aPos; attribute vec3 aCol;
+    uniform mat4 uVP; varying vec3 vC;
+    void main(){ vC=aCol; gl_Position=uVP*vec4(aPos,1.0); }`, `
+    precision mediump float; varying vec3 vC;
+    void main(){ gl_FragColor=vec4(vC,1.0); }`);
+
+  const S = {p:solid, aPos:gl.getAttribLocation(solid,"aPos"),
+    aNrm:gl.getAttribLocation(solid,"aNrm"), uVP:gl.getUniformLocation(solid,"uVP"),
+    uM:gl.getUniformLocation(solid,"uM"), uN:gl.getUniformLocation(solid,"uN"),
+    uColor:gl.getUniformLocation(solid,"uColor"), uAlpha:gl.getUniformLocation(solid,"uAlpha")};
+  const L = {p:line, aPos:gl.getAttribLocation(line,"aPos"),
+    aCol:gl.getAttribLocation(line,"aCol"), uVP:gl.getUniformLocation(line,"uVP")};
+
+  /* --- geometry ------------------------------------------------------- */
+  function buf(arr){ const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(arr),gl.STATIC_DRAW); return b; }
+
+  // unit cube centred on origin, edge 1
+  const cubeData=[]; {
+    const F=[[[0,0,1],[[-.5,-.5,.5],[.5,-.5,.5],[.5,.5,.5],[-.5,.5,.5]]],
+             [[0,0,-1],[[.5,-.5,-.5],[-.5,-.5,-.5],[-.5,.5,-.5],[.5,.5,-.5]]],
+             [[1,0,0],[[.5,-.5,.5],[.5,-.5,-.5],[.5,.5,-.5],[.5,.5,.5]]],
+             [[-1,0,0],[[-.5,-.5,-.5],[-.5,-.5,.5],[-.5,.5,.5],[-.5,.5,-.5]]],
+             [[0,1,0],[[-.5,.5,.5],[.5,.5,.5],[.5,.5,-.5],[-.5,.5,-.5]]],
+             [[0,-1,0],[[-.5,-.5,-.5],[.5,-.5,-.5],[.5,-.5,.5],[-.5,-.5,.5]]]];
+    for(const [n,v] of F) for(const i of [0,1,2,0,2,3]) cubeData.push(...v[i],...n);
+  }
+  const cubeBuf=buf(cubeData), cubeN=cubeData.length/6;
+
+  // unit cylinder: radius 1, height 1, axis +Z, centred
+  const cylData=[]; { const SEG=28;
+    for(let i=0;i<SEG;i++){
+      const a0=2*Math.PI*i/SEG, a1=2*Math.PI*(i+1)/SEG;
+      const c0=Math.cos(a0),s0=Math.sin(a0),c1=Math.cos(a1),s1=Math.sin(a1);
+      cylData.push(c0,s0,-.5,c0,s0,0, c1,s1,-.5,c1,s1,0, c1,s1,.5,c1,s1,0);
+      cylData.push(c0,s0,-.5,c0,s0,0, c1,s1,.5,c1,s1,0, c0,s0,.5,c0,s0,0);
+      cylData.push(0,0,.5,0,0,1, c0,s0,.5,0,0,1, c1,s1,.5,0,0,1);
+      cylData.push(0,0,-.5,0,0,-1, c1,s1,-.5,0,0,-1, c0,s0,-.5,0,0,-1);
+    } }
+  const cylBuf=buf(cylData), cylN=cylData.length/6;
+
+  // unit sphere: radius 1, centred.  Normals are the positions.
+  const sphData=[]; { const RG=16, SG=28;
+    const P=(i,j)=>{ const t=Math.PI*i/RG, a=2*Math.PI*j/SG;
+      return [Math.sin(t)*Math.cos(a), Math.sin(t)*Math.sin(a), Math.cos(t)]; };
+    for(let i=0;i<RG;i++) for(let j=0;j<SG;j++){
+      const a=P(i,j), b=P(i,j+1), c=P(i+1,j+1), d=P(i+1,j);
+      for(const v of [a,c,b, a,d,c]) sphData.push(...v,...v);
+    } }
+  const sphBuf=buf(sphData), sphN=sphData.length/6;
+
+  let VP = M4.ident();
+  const api = {
+    gl, canvas,
+    // `rect` is {x,y,w,h} in device pixels, y measured from the BOTTOM edge of
+    // the drawing buffer (GL convention).  Scissored so a sub-viewport clears
+    // only its own box -- this is how the PiP shares the main context.
+    begin(vp,rect,clear){
+      VP = vp;
+      gl.viewport(rect.x,rect.y,rect.w,rect.h);
+      gl.enable(gl.SCISSOR_TEST); gl.scissor(rect.x,rect.y,rect.w,rect.h);
+      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+      gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+      gl.clearColor(clear[0],clear[1],clear[2],1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    },
+    end(){ gl.disable(gl.SCISSOR_TEST); },
+    shape(kind,model,color,alpha){
+      const b = kind==="cyl"?cylBuf:kind==="sph"?sphBuf:cubeBuf;
+      const n = kind==="cyl"?cylN  :kind==="sph"?sphN  :cubeN;
+      gl.useProgram(S.p);
+      gl.bindBuffer(gl.ARRAY_BUFFER,b);
+      gl.enableVertexAttribArray(S.aPos); gl.vertexAttribPointer(S.aPos,3,gl.FLOAT,false,24,0);
+      gl.enableVertexAttribArray(S.aNrm); gl.vertexAttribPointer(S.aNrm,3,gl.FLOAT,false,24,12);
+      gl.uniformMatrix4fv(S.uVP,false,VP);
+      gl.uniformMatrix4fv(S.uM,false,model);
+      gl.uniformMatrix3fv(S.uN,false,M4.normalMat(model));
+      gl.uniform3fv(S.uColor,color); gl.uniform1f(S.uAlpha,alpha===undefined?1:alpha);
+      gl.drawArrays(gl.TRIANGLES,0,n);
+    },
+    lines(data){          // flat [x,y,z,r,g,b, ...] pairs of vertices
+      if(!data.length) return;
+      const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b);
+      gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(data),gl.STREAM_DRAW);
+      gl.useProgram(L.p);
+      gl.enableVertexAttribArray(L.aPos); gl.vertexAttribPointer(L.aPos,3,gl.FLOAT,false,24,0);
+      gl.enableVertexAttribArray(L.aCol); gl.vertexAttribPointer(L.aCol,3,gl.FLOAT,false,24,12);
+      gl.uniformMatrix4fv(L.uVP,false,VP);
+      gl.drawArrays(gl.LINES,0,data.length/6);
+      gl.deleteBuffer(b);
+    },
+  };
+  return api;
+}
+
+// box helper: model matrix for an axis-aligned box in some frame
+function boxM(frame,centre,size){
+  return M4.mul(M4.mul(frame, M4.trans(centre[0],centre[1],centre[2])),
+                M4.scale(size[0],size[1],size[2]));
+}
+
+/* ========================================================================== *
+ * 5. Link skins -- boxes approximating the STL visuals (kinematics exact).   *
+ * ========================================================================== */
+// Every structural box is a BEAM from a link's own origin to the origin of the
+// joint that carries its child -- i.e. its length is a URDF number, not a
+// guess.  Only the cross-sections are eyeballed.  Servo bodies are drawn at
+// the URDF visual origins of the sts3215 meshes, oriented by their own rpy.
+const PLASTIC=[0.85,0.68,0.12], SERVO=[0.13,0.13,0.14], METAL=[0.30,0.32,0.36];
+const MOTOR = [0.0452,0.0350,0.0247];       // STS3215 body, datasheet mm
+
+function beamM(frame,a,b,w,t){
+  const d = sub(b,a), L = Math.max(len(d),1e-6), z = norm(d);
+  const upRef = Math.abs(z[2])>0.9 ? [1,0,0] : [0,0,1];
+  const x = norm(cross(upRef,z)), y = cross(z,x);
+  const R = new Float32Array([x[0],x[1],x[2],0, y[0],y[1],y[2],0, z[0],z[1],z[2],0,
+    (a[0]+b[0])/2,(a[1]+b[1])/2,(a[2]+b[2])/2,1]);
+  return M4.mul(M4.mul(frame,R), M4.scale(w,t,L));
+}
+const J = n => CHAIN.find(j=>j.name===n).xyz;      // child-joint offset, link frame
+
+const SKIN = {
+  base_link: [
+    {kind:"box", c:[0.006,0,0.011], s:[0.098,0.078,0.022], col:METAL},
+    {kind:"beam", a:[0.0388353,0,0.018], b:J("shoulder_pan"), w:0.044, t:0.044, col:PLASTIC},
+    {kind:"servo", o:[0.0263353,0,0.0437], rpy:[0,0,0]},
+  ],
+  shoulder_link: [
+    {kind:"beam", a:[0,0,0], b:J("shoulder_lift"), w:0.040, t:0.040, col:PLASTIC},
+    {kind:"servo", o:[-0.0303992,0.000422241,-0.0417], rpy:[1.5708,1.5708,0]},
+  ],
+  upper_arm_link: [
+    {kind:"beam", a:[0,0,0.0182], b:[J("elbow_flex")[0],J("elbow_flex")[1],0.0182],
+     w:0.031, t:0.029, col:PLASTIC},
+    {kind:"servo", o:[-0.11257,-0.0155,0.0187], rpy:[-3.14159,0,-1.5708]},
+  ],
+  lower_arm_link: [
+    {kind:"beam", a:[0,0,0.0182], b:[J("wrist_flex")[0],J("wrist_flex")[1],0.0182],
+     w:0.031, t:0.029, col:PLASTIC},
+    {kind:"servo", o:[-0.1224,0.0052,0.0187], rpy:[-3.14159,0,-3.14159]},
+  ],
+  wrist_link: [
+    {kind:"beam", a:[0,0,0.0181], b:J("wrist_roll"), w:0.034, t:0.031, col:PLASTIC},
+    {kind:"servo", o:[0,-0.0424,0.0306], rpy:[1.5708,1.5708,0]},
+  ],
+  // Housing only: it stops where the fingers start (the fingers are drawn in
+  // the TCP frame below, and the TCP sits at gripper_link z = -0.0981).
+  gripper_link: [
+    {kind:"beam", a:[0,0,-0.004], b:[-0.0045,-0.0001,-0.0540], w:0.036, t:0.034, col:PLASTIC},
+    {kind:"servo", o:[0.0077,0.0001,-0.0234], rpy:[-1.5708,0,0]},
+  ],
+};
+
+function drawSkin(R, poses, skip){
+  for(const [link,parts] of Object.entries(SKIN)){
+    if(skip && skip.includes(link)) continue;
+    const F = poses[link];
+    for(const p of parts){
+      if(p.kind==="beam") R.shape("box", beamM(F,p.a,p.b,p.w,p.t), p.col, 1);
+      else if(p.kind==="servo")
+        R.shape("box", M4.mul(F, M4.mul(M4.origin(p.o,p.rpy),
+                       M4.scale(MOTOR[0],MOTOR[1],MOTOR[2]))), SERVO, 1);
+      else R.shape("box", boxM(F,p.c,p.s), p.col, 1);
+    }
+  }
+}
+
+/* ========================================================================== *
+ * 6. State                                                                   *
+ * ========================================================================== */
+// Opens on the side-grasp family over cylinder_3cm -- the case this tool exists
+// for -- rather than on the zero pose, which points the arm at nothing.
+const state = {
+  q: {shoulder_pan:0, shoulder_lift:-0.30, elbow_flex:0.55,
+      wrist_flex:-0.25, wrist_roll:-1.5222, gripper:1.5},
+  // 0.4258 = pan axis + 0.387, the middle of SIDE_GRASP_REGION (0.352-0.422).
+  obj: {name:"cylinder_3cm", x:0.4258, y:0.0, z_extra:0.0, yaw:0, tiltX:0, tiltY:0},
+  cam: {az:-0.95, el:0.34, dist:0.80, target:[0.22,0,0.07]},
+  // What the CLOSE simulation has done to the object so far.  `shove` is metres
+  // along `pushDir` (the frozen horizontal projection of the TCP's +x, the
+  // closing axis); `tilt` is radians about `tipAxis` through `tipPivot`, the
+  // object's far base edge.  Both are applied in WORLD space on top of the
+  // posed object frame, so the arm pose and the object's own placement sliders
+  // stay exactly what the user set.
+  close: {shove:0, tilt:0, pushDir:[1,0,0], tipAxis:[0,1,0], tipPivot:[0,0,0],
+          mu:NOMINAL_FRICTION, trace:null, verdict:null, entryAngle:null},
+};
+
+function objSpec(){ return OBJECTS[state.obj.name]; }
+
+// Rotation of `ang` about a unit `axis` through the origin, column-major.
+function rotAxisM(axis, ang){
+  const [x,y,z]=norm(axis), c=Math.cos(ang), s=Math.sin(ang), t=1-c, m=M4.ident();
+  m[0]=t*x*x+c;   m[1]=t*x*y+s*z; m[2]=t*x*z-s*y;
+  m[4]=t*x*y-s*z; m[5]=t*y*y+c;   m[6]=t*y*z+s*x;
+  m[8]=t*x*z+s*y; m[9]=t*y*z-s*x; m[10]=t*z*z+c;
+  return m;
+}
+// The CLOSE simulation's world-space displacement of the object: the slide
+// first, then the tip about the base edge recorded when tipping started.
+function closeXform(){
+  const cl=state.close;
+  if(!cl.shove && !cl.tilt) return null;
+  const d=mul(cl.pushDir, cl.shove);
+  let M = M4.trans(d[0],d[1],d[2]);
+  if(cl.tilt){
+    const p=cl.tipPivot;
+    M = M4.mul(M4.mul(M4.mul(M4.trans(p[0],p[1],p[2]), rotAxisM(cl.tipAxis, cl.tilt)),
+                      M4.trans(-p[0],-p[1],-p[2])), M);
+  }
+  return M;
+}
+
+// Object pose: rotation Rz(yaw)@Ry(tiltY)@Rx(tiltX) about its own centre,
+// then whatever the CLOSE simulation has pushed it to.
+function objectFrame(){
+  const o=state.obj, sp=objSpec();
+  const R = M4.mul(M4.mul(M4.rotZ(o.yaw), M4.rotY(o.tiltY)), M4.rotX(o.tiltX));
+  const z = restingZ() + o.z_extra;
+  const T = M4.trans(o.x, o.y, z);
+  const F = M4.mul(T, R);
+  const C = closeXform();
+  return C ? M4.mul(C, F) : F;
+}
+// Height of the object's own centre so its lowest point touches the table,
+// for the current tilt.  Exact for a cuboid (support function of the box) and
+// for a cylinder (support function of a disc-swept segment).
+function restingZ(){
+  const sp=objSpec(), o=state.obj;
+  const R = M4.mul(M4.mul(M4.rotZ(o.yaw), M4.rotY(o.tiltY)), M4.rotX(o.tiltX));
+  // world -Z expressed in the object's local frame = -(3rd row of R^T ... )
+  const zx=R[2], zy=R[6], zz=R[10];       // world +Z components of local x,y,z axes
+  if(sp.shape==="sphere") return sp.radius;      // orientation-free
+  if(sp.shape==="cuboid"){
+    return sp.he[0]*Math.abs(zx)+sp.he[1]*Math.abs(zy)+sp.he[2]*Math.abs(zz);
+  }
+  // cylinder, axis local +Z
+  const axial = 0.5*sp.height*Math.abs(zz);
+  const radial = sp.radius*Math.hypot(zx,zy);
+  return axial + radial;
+}
+
+/* ========================================================================== *
+ * 7. Scene assembly                                                          *
+ * ========================================================================== */
+function gridLines(){
+  const L=[], EXT=0.60, STEP=0.05;
+  const minor=[0.145,0.175,0.215], major=[0.24,0.29,0.35];
+  for(let i=-Math.round(EXT/STEP); i<=Math.round(EXT/STEP); i++){
+    const v=i*STEP, c = (Math.abs(i)%2===0)?major:minor;
+    if(i===0) continue;
+    L.push(-EXT,v,0,...c,  EXT,v,0,...c);
+    L.push(v,-EXT,0,...c,  v,EXT,0,...c);
+  }
+  // world axes
+  L.push(0,0,0, 0.75,0.22,0.22,  0.18,0,0, 0.75,0.22,0.22);   // +X red
+  L.push(0,0,0, 0.25,0.72,0.30,  0,0.18,0, 0.25,0.72,0.30);   // +Y green
+  L.push(0,0,0, 0.30,0.50,0.95,  0,0,0.18, 0.30,0.50,0.95);   // +Z blue
+  L.push(-EXT,0,0,0.30,0.34,0.40, EXT,0,0,0.30,0.34,0.40);
+  L.push(0,-EXT,0,0.30,0.34,0.40, 0,EXT,0,0.30,0.34,0.40);
+
+  // grasp-region annuli about the pan axis
+  const sp=objSpec();
+  for(const [mode,[r0,r1]] of Object.entries(REGIONS)){
+    const c = mode===sp.mode ? [0.30,0.62,0.95] : [0.22,0.30,0.38];
+    for(const r of [r0,r1]){
+      const N=96, A=REGION_AZ_DEG*Math.PI/180;
+      for(let i=0;i<N;i++){
+        const a0=-A+2*A*i/N, a1=-A+2*A*(i+1)/N;
+        L.push(PAN_AXIS_XY[0]+r*Math.cos(a0), PAN_AXIS_XY[1]+r*Math.sin(a0), 0.0005, ...c,
+               PAN_AXIS_XY[0]+r*Math.cos(a1), PAN_AXIS_XY[1]+r*Math.sin(a1), 0.0005, ...c);
+      }
+    }
+  }
+  return L;
+}
+
+function drawScene(R, vp, rect, clear, opts){
+  R.begin(vp,rect,clear);
+  const poses = fk(qArm());
+  R.lines(gridLines());
+
+  // arm links.  The POV camera sits inside the hand's own housing, so that
+  // link is left out of the inset the way a real wrist cam sees past its mount.
+  drawSkin(R, poses, (opts && opts.pov) ? ["gripper_link"] : null);
+
+  // jaws, in the TCP frame
+  const T = poses.gripper_frame_link;
+  const gc = graspCheck();
+  const staticCol = gc.staticTouch ? [0.25,0.85,0.50] : [0.85,0.68,0.12];
+  const movingCol = gc.movingTouch ? [0.25,0.85,0.50] : [0.90,0.76,0.22];
+  const fz = 0.5*(JAW_TIP_Z + FINGER_BACK_Z), fh = JAW_TIP_Z - FINGER_BACK_Z;
+  // static finger: fixed, its inner face on TCP x = JAW_FIXED_FACE_X
+  R.shape("box", boxM(T,[ FINGER_THICK/2, 0, fz],[FINGER_THICK,2*FINGER_HALF_Y,fh]),
+          staticCol, 1);
+  // moving finger: rigid body swinging about the URDF gripper joint
+  const phi = JAW_CRANK.phase - state.q.gripper;
+  const jawM = M4.mul(M4.mul(M4.mul(T, M4.trans(JAW_PIVOT[0],0,JAW_PIVOT[2])), M4.rotY(phi)),
+                      M4.mul(M4.trans(-FINGER_THICK/2, 0, JAW_CRANK.r - 0.021),
+                             M4.scale(FINGER_THICK, 2*FINGER_HALF_Y, 0.058)));
+  R.shape("box", jawM, movingCol, 1);
+  // pad band marker on the static face
+  R.shape("box", boxM(T,[0.0005,0,-TCP_TO_PAD_CENTRE],[0.001,2*FINGER_HALF_Y,2*PAD_BAND_HALF]),
+          gc.contact?[0.30,1.0,0.55]:[0.55,0.60,0.68], 0.9);
+
+  // the object
+  const sp=objSpec(), F=objectFrame();
+  const col = gc.contact ? [0.35,0.85,0.45] : [0.80,0.28,0.22];
+  if(sp.shape==="sphere")
+    R.shape("sph", M4.mul(F, M4.scale(sp.radius,sp.radius,sp.radius)), col, 1);
+  else if(sp.shape==="cylinder")
+    R.shape("cyl", M4.mul(F, M4.scale(sp.radius,sp.radius,sp.height)), col, 1);
+  else
+    R.shape("box", M4.mul(F, M4.scale(2*sp.he[0],2*sp.he[1],2*sp.he[2])), col, 1);
+
+  // TCP triad + approach ray
+  if(!opts || !opts.pov){
+    const o = M4.xform(T,[0,0,0]);
+    const ax=M4.axis(T,0), ay=M4.axis(T,1), az=M4.axis(T,2);
+    const seg=[];
+    const put=(d,c,l)=>{const e=add(o,mul(d,l)); seg.push(...o,...c, ...e,...c);};
+    put(ax,[1.0,0.35,0.35],0.035);   // +X  jaw closing axis
+    put(ay,[0.35,1.0,0.45],0.035);   // +Y
+    put(az,[0.40,0.65,1.0],0.070);   // +Z  approach
+    R.lines(seg);
+  }
+  R.end();
+}
+
+/* ========================================================================== *
+ * 8. Grasp check                                                             *
+ * ========================================================================== */
+function qArm(){ return JOINT_NAMES.slice(0,5).map(n=>state.q[n]); }
+
+function graspCheck(){
+  const poses = fk(qArm());
+  const T = poses.gripper_frame_link;
+  const sp = objSpec();
+  // Gap from the SWUNG face (what is drawn, and what reproduces the mesh
+  // measurements at 30 mm, 40 mm and full open).  The sim's own linear fit is
+  // reported alongside it; the two agree to <1.5 mm over the engaging band and
+  // diverge only where the fit was never claimed to hold.
+  const movingFaceX = jawFacePoint(state.q.gripper)[0];
+  const gap = -movingFaceX;
+  const gapFit = gapForAngle(state.q.gripper);
+
+  // object centre in TCP coordinates: invert the rigid TCP frame
+  const o = M4.xform(T,[0,0,0]);
+  const ax=M4.axis(T,0), ay=M4.axis(T,1), az=M4.axis(T,2);
+  const F = objectFrame();
+  const cW = M4.xform(F,[0,0,0]);
+  const d = sub(cW,o);
+  const c = [dot(d,ax), dot(d,ay), dot(d,az)];
+
+  // half-extent of the object along the TCP's own x (the closing axis) and z
+  const objAx = [M4.axis(F,0), M4.axis(F,1), M4.axis(F,2)];
+  function support(dir){                          // half-width along a unit dir
+    if(sp.shape==="sphere") return sp.radius;     // support of a ball, any dir
+    const l = objAx.map(a=>dot(a,dir));           // dir in object-local coords
+    if(sp.shape==="cuboid")
+      return sp.he[0]*Math.abs(l[0])+sp.he[1]*Math.abs(l[1])+sp.he[2]*Math.abs(l[2]);
+    return sp.radius*Math.hypot(l[0],l[1]) + 0.5*sp.height*Math.abs(l[2]);
+  }
+  const halfX = support(ax);          // effective width the jaws must span / 2
+  const halfY = support(ay);
+  const halfZ = support(az);
+
+  const TOL = 0.0005;                                        // 0.5 mm
+  // static face plane at x = JAW_FIXED_FACE_X (= 0); object nearest surface:
+  const staticGap = JAW_FIXED_FACE_X - (c[0] + halfX);       // >0 = clear of it
+  const movingGap = (c[0] - halfX) - movingFaceX;            // >0 = clear of it
+  // A face only *touches* if the object is actually in the hand: its centre
+  // between the two faces and within the fingers' own width in y.  Without
+  // this an object 200 mm away reads as "touching", because it is trivially
+  // on the far side of the static face's infinite plane.
+  const inSpan = c[0] < JAW_FIXED_FACE_X + 0.002 && c[0] > movingFaceX - 0.002;
+
+  // pads must actually be over the object along the approach axis.  This is
+  // computed BEFORE the touch predicates because it gates them: the two face
+  // planes and the fingers' y span are both unbounded along +/-Z, so without
+  // it an object hovering 30 mm ahead of the fingertips -- or 80 mm behind the
+  // TCP, inside the wrist -- lands between the two face planes and reads as
+  // "IN HAND" / "ONE FACE ONLY", and paints the fingers green.
+  const padCentreZ = -TCP_TO_PAD_CENTRE;
+  const padLo = padCentreZ - PAD_BAND_HALF;     // -14.0 mm, behind the TCP
+  const padHi = padCentreZ + PAD_BAND_HALF;     //  +6.0 mm, level with the tips
+  const padOverlap = Math.min(c[2]+halfZ, padHi) - Math.max(c[2]-halfZ, padLo);
+
+  // ...and within the fingers' own width in y.  Signed overlap, not a centre
+  // test, so an object offset off the pads reads as leaving them.
+  const yOverlap = Math.min(c[1]+halfY, FINGER_HALF_Y)
+                 - Math.max(c[1]-halfY, -FINGER_HALF_Y);
+  const inY    = yOverlap > 0;
+  const inZ    = padOverlap > 0;
+  const inHand = inSpan && inY && inZ;
+  const staticTouch = inHand && Math.abs(staticGap) <= TOL;
+  const movingTouch = inHand && Math.abs(movingGap) <= TOL;
+  const overlap = inHand && (staticGap < -TOL || movingGap < -TOL);
+
+  // fingertip / table clearance: tips sit JAW_TIP_Z past the TCP along +Z
+  const tipW = add(o, mul(az, JAW_TIP_Z));
+  const tipClear = tipW[2];
+
+  // The MOVING face's reference point -- the ridge the swung finger actually
+  // presents to the object -- in world coordinates.  This is the point the
+  // one-sided push is applied at, so its height above the table is the lever
+  // arm the tipping check uses, and its height against the object's own top
+  // face is the edge-rake check (see the header).
+  const fp = jawFacePoint(state.q.gripper);
+  const ridgeW = add(add(o, mul(ax, fp[0])), mul(az, fp[2]));
+  const objTopZ = cW[2] + support([0,0,1]);
+  const objBotZ = cW[2] - support([0,0,-1]);
+
+  return {
+    sup: support, centreW: cW, ridgeW, objTopZ, objBotZ, ax, ay, az,
+    gap, gapFit, width:2*halfX, clearance: gap - 2*halfX,
+    c, halfX, halfY, halfZ, staticGap, movingGap, staticTouch, movingTouch,
+    padOverlap, yOverlap, tipClear, tipMin: tipClearanceFor(sp), inHand, overlap, movingFaceX,
+    // The verdict was already z-gated; the y bar is now real pad purchase
+    // (4 mm of shared width) rather than the fingers' outer edge grazing the
+    // object's outer edge.
+    contact: staticTouch && movingTouch && padOverlap > 0.001
+             && yOverlap > 0.004 && tipClear > 0,
+    contactAngle: contactAngleFor(2*halfX),
+    closeTarget: closeTargetFor(2*halfX, squeezeFor(sp)),
+    tcp: o, approach: az,
+  };
+}
+
+/* ========================================================================== *
+ * 8b. CLOSE simulation -- quasi-static one-sided-push model.                  *
+ *                                                                            *
+ * The whole point (expert.py, the SEAT write-up): the static face does not     *
+ * move and the approach leaves the object JAW_CLEARANCE = 2 mm clear of it, so *
+ * the MOVING jaw always arrives first and has to shove the object across that  *
+ * gap unreacted.  Per step the object either slides, tips, or reaches the      *
+ * static face and is clamped.  Nothing here is dynamic: the jaw is a position  *
+ * servo whose force grows with blocked travel (3.4 N/mm), so "at what force"   *
+ * decides the MECHANISM and the geometry decides the OUTCOME -- which is       *
+ * exactly why expert.py says "there is no jaw speed at which a one-sided push  *
+ * is gentle".                                                                  *
+ * ========================================================================== */
+function pushFrame(){                       // frozen at the moment CLOSE starts
+  const T = fk(qArm()).gripper_frame_link;
+  const ax = M4.axis(T,0);                  // TCP +x = the closing axis
+  let h = [ax[0],ax[1],0];
+  if(len(h) < 1e-6) h = [1,0,0];            // degenerate: closing axis vertical
+  const pushDir = norm(h);                  // object is pushed toward +x = the static face
+  // Rotation that leans the object's top in +pushDir: omega = zhat x pushDir.
+  return {pushDir, tipAxis: norm(cross([0,0,1], pushDir))};
+}
+
+// One full closure, simulated to completion before anything is animated.
+// Returns {trace, verdict}; `trace` is the thing the animation replays and the
+// thing the HUD logs, so what is drawn and what is reported cannot disagree.
+function simulateClose(){
+  const sp = objSpec(), cl = state.close;
+  const saveGrip = state.q.gripper;
+  const saveShove = cl.shove, saveTilt = cl.tilt;
+  const entry = state.q.gripper;
+  const target = closeTargetFor(sp.width, squeezeFor(sp));
+  const {pushDir, tipAxis} = pushFrame();
+  cl.pushDir = pushDir; cl.tipAxis = tipAxis;
+  cl.shove = 0; cl.tilt = 0;
+
+  const m = sp.mass, W = m*G_ACCEL;
+  const F_slide = cl.mu * W;                       // mu * m * g
+  const N = 600, trace = [], log = [];
+  let shove = 0, tilt = 0, verdict = null, firstA = null, mech = null;
+  let F_tip = NaN, hPush = NaN, rBase = NaN, dispTotal = 0;
+
+  const put = (a, note) => trace.push({a, shove, tilt, note:note||null});
+
+  for(let i = 0; i <= N; i++){
+    const a = entry + (target - entry) * i / N;
+    state.q.gripper = a; cl.shove = shove; cl.tilt = tilt;
+    const g = graspCheck();
+
+    if(i === 0){
+      if(!g.inHand){
+        verdict = {kind:"EMPTY", cls:"b-no", title:"NOTHING IN HAND",
+          why:"the object is not between the two faces / not over the pads at "+
+              "the start of CLOSE, so closing does nothing to it."};
+        log.push(`entry ${a.toFixed(3)} rad — object not in hand, nothing to close on`);
+        break;
+      }
+      if(g.tipClear <= 0){
+        verdict = {kind:"TABLE", cls:"b-no", title:"TABLE STRIKE",
+          why:`the fingertips are ${(g.tipClear*1000).toFixed(1)} mm above the table `+
+              `(bar for this object: ${(g.tipMin*1000).toFixed(1)} mm) — the hand is `+
+              `standing on the work surface before the jaws move.`};
+        log.push(`entry ${a.toFixed(3)} rad — fingertip z ${(g.tipClear*1000).toFixed(1)} mm`);
+        break;
+      }
+      log.push(`entry ${a.toFixed(3)} rad · gap ${(g.gap*1000).toFixed(1)} mm · `+
+               `static-face gap ${(g.staticGap*1000).toFixed(2)} mm `+
+               `(JAW_CLEARANCE = ${(JAW_CLEARANCE*1000).toFixed(1)} mm by design)`);
+      put(a);
+      continue;
+    }
+
+    if(g.tipClear <= 0 && !verdict){
+      verdict = {kind:"TABLE", cls:"b-no", title:"TABLE STRIKE",
+        why:"the fingertips reach the table before the jaws reach the object."};
+      log.push(`${a.toFixed(3)} rad — fingertip z ${(g.tipClear*1000).toFixed(1)} mm, table strike`);
+      put(a,"table"); break;
+    }
+
+    const pen = -g.movingGap;                 // >0: the moving face has run into the object
+    if(pen <= 0){ put(a); continue; }
+
+    /* ---- first contact: the moving face, always, by design ---------------- */
+    if(firstA === null){
+      firstA = a;
+      hPush = Math.max(1e-4, g.ridgeW[2] - g.objBotZ);   // lever arm above the base
+      rBase = g.sup(pushDir);                            // base half-width along the push
+      F_tip = W * rBase / hPush;
+      log.push(`first contact at ${a.toFixed(3)} rad — MOVING face only `+
+               `(static face still ${(g.staticGap*1000).toFixed(2)} mm away)`);
+      log.push(`  contact ridge ${(g.ridgeW[2]*1000).toFixed(1)} mm above the table, `+
+               `object top ${(g.objTopZ*1000).toFixed(1)} mm, pad overlap `+
+               `${(g.padOverlap*1000).toFixed(1)} mm`);
+
+      // EDGE RAKE -- the finger meets the top edge, not the wall, and is still
+      // descending as it closes (objects.py:588-592).
+      if(sp.shape !== "sphere" && g.ridgeW[2] > g.objTopZ - EDGE_RAKE_M){
+        mech = "rake";
+        log.push(`  ridge is within ${EDGE_RAKE_M*1000} mm of (or above) the top face: `+
+                 `the finger rakes the edge and drags the object down and in`);
+        verdict = {kind:"SHOVED", cls:"b-no", title:"SHOVED — EDGE RAKE",
+          why:`first contact lands ${((g.ridgeW[2]-g.objTopZ)*1000).toFixed(1)} mm `+
+              `relative to the object's top face, so the still-descending moving `+
+              `finger rakes the top edge instead of pushing the wall — objects.py's `+
+              `"drags it down and in", with only ${(g.padOverlap*1000).toFixed(1)} mm `+
+              `of pad on the rim.`};
+      }
+      // SPHERE -- rolling resistance ~ 0, so any push moves it.
+      else if(sp.shape === "sphere"){
+        mech = "roll";
+        log.push(`  sphere: rolling resistance ~ 0 N against F_slide = `+
+                 `${F_slide.toFixed(3)} N — a one-sided push moves it at any force`);
+        if(g.staticGap > 0.0005){
+          verdict = {kind:"SHOVED", cls:"b-no", title:"SHOVED — BALL ROLLS OUT",
+            why:`the approach left ${(g.staticGap*1000).toFixed(2)} mm between the ball `+
+                `and the static face, and a ball resists a one-sided push with nothing `+
+                `but its own inertia — it rolls out of the pads before the static face `+
+                `can catch it. It is only caught if the approach traps it (static gap 0).`};
+        }
+      }
+      else {
+        mech = (F_tip < F_slide) ? "tip" : "slide";
+        log.push(`  F_tip = m·g·r/h = ${m.toFixed(3)}·${G_ACCEL}·`+
+                 `${(rBase*1000).toFixed(1)}/${(hPush*1000).toFixed(1)} = `+
+                 `${F_tip.toFixed(3)} N   vs   F_slide = μ·m·g = ${cl.mu.toFixed(2)}·`+
+                 `${W.toFixed(3)} = ${F_slide.toFixed(3)} N`);
+        log.push(`  → the push ${mech === "tip" ? "TIPS" : "SLIDES"} it first `+
+                 `(${Math.min(F_tip,F_slide).toFixed(3)} N reached after `+
+                 `${(Math.min(F_tip,F_slide)/JAW_STIFFNESS_N_PER_M*1000).toFixed(3)} mm `+
+                 `of blocked jaw travel at ${(JAW_STIFFNESS_N_PER_M/1000).toFixed(2)} N/mm)`);
+      }
+      if(verdict){ put(a, verdict.kind); break; }
+    }
+
+    /* ---- can the static face catch it before it has to move? -------------- */
+    if(pen >= g.staticGap - 1e-9){
+      // It reaches the static face this step: both faces now bear on it.
+      shove += (mech === "tip") ? 0 : Math.max(0, g.staticGap);
+      if(mech === "tip") tilt += Math.max(0, g.staticGap)/hPush;
+      cl.shove = shove; cl.tilt = tilt; state.q.gripper = a;
+      const gc = graspCheck();
+      dispTotal = Math.abs(shove) + Math.abs(tilt)*hPush;
+      const pads = gc.padOverlap > 0.001 && gc.yOverlap > 0.004 && gc.tipClear > 0;
+      // Captured, but LEANING: objects.py:511-512 -- "a cylinder tilted even
+      // 3 deg is wider than the closing gap, so the jaws lever it out".  An
+      // object the push tipped on its way to the static face is not clamped by
+      // arriving there; the pads close on a wedge.
+      if(tilt >= TILT_LEVER_RAD && leverable(sp)){
+        log.push(`  ...but it arrived leaning ${deg(tilt).toFixed(2)}°, past the 3° at `+
+                 `which it is wider than the closing gap`);
+        verdict = {kind:"TIPPED", cls:"b-no", title:"TIPPED", tilt,
+          why:`the push tipped it (${F_tip.toFixed(3)} N against ${F_slide.toFixed(3)} N to `+
+              `slide) and it reached the static face already leaning `+
+              `${deg(tilt).toFixed(2)}° — past the 3° at which a 30 mm cylinder is wider `+
+              `than the closing gap, so the jaws lever it out rather than clamp it.`};
+        put(a,"TIPPED"); break;
+      }
+      log.push(`${a.toFixed(3)} rad — object reaches the STATIC face after `+
+               `${(dispTotal*1000).toFixed(2)} mm of one-sided travel; both faces bear`);
+      log.push(`  pad overlap ${(gc.padOverlap*1000).toFixed(1)} mm · y overlap `+
+               `${(gc.yOverlap*1000).toFixed(1)} mm · fingertip z `+
+               `${(gc.tipClear*1000).toFixed(1)} mm`);
+      if(tilt > 1e-4)
+        log.push(`  it rocked ${deg(tilt).toFixed(2)}° on the way in`+
+                 (leverable(sp)
+                   ? `, inside the 3° bar`
+                   : `; at ${(extentZ(sp)*1000).toFixed(1)} mm tall against a `+
+                     `${(sp.width*1000).toFixed(1)} mm grasp width it is not leverable — `+
+                     `the closing pads right it`));
+      verdict = pads
+        ? {kind:"CLAMPED", cls:"b-ok", title:"CLAMPED", closeAngle:a,
+           why:`both pads bear on the object at ${a.toFixed(4)} rad, `+
+               `${(gc.padOverlap*1000).toFixed(1)} mm of pad overlap. The catalogue `+
+               `close target is ${target.toFixed(3)} rad, i.e. the servo is then `+
+               `commanded ${(a-target).toFixed(3)} rad past contact (squeeze).`}
+        : {kind:"SHOVED", cls:"b-no", title:"SHOVED — PADS OFF",
+           why:`the object did reach the static face, but the pads have only `+
+               `${(gc.padOverlap*1000).toFixed(1)} mm of overlap and `+
+               `${(gc.yOverlap*1000).toFixed(1)} mm of width on it — a pinch at the `+
+               `edge of the pads, not a grip.`};
+      put(a, verdict.kind);
+      break;
+    }
+
+    /* ---- otherwise it moves, by its own cheapest mechanism ---------------- */
+    if(mech === "tip"){
+      if(!tilt){                                   // record the far base edge, once
+        cl.tipPivot = [g.centreW[0] + pushDir[0]*rBase,
+                       g.centreW[1] + pushDir[1]*rBase, 0];
+      }
+      tilt += pen/hPush;
+    } else {
+      shove += pen;                                // slide, or roll
+    }
+    dispTotal += pen;
+    cl.shove = shove; cl.tilt = tilt;
+    const gc = graspCheck();
+
+    // LEVERED OUT: objects.py -- "a cylinder tilted even 3 deg is wider than the
+    // closing gap, so the jaws lever it out".  Emergent, not hard-coded.
+    if(tilt > 0 && leverable(sp) && gc.width > gc.gap && gc.staticGap > 0){
+      log.push(`${a.toFixed(3)} rad — tilted ${deg(tilt).toFixed(2)}°, its width across `+
+               `the jaws is now ${(gc.width*1000).toFixed(1)} mm against a `+
+               `${(gc.gap*1000).toFixed(1)} mm gap`);
+      verdict = {kind:"TIPPED", cls:"b-no", title:"TIPPED", tilt,
+        why:`the one-sided push needed only ${F_tip.toFixed(3)} N to tip it about its `+
+            `far base edge but ${F_slide.toFixed(3)} N to slide it, so it leaned instead `+
+            `of moving. At ${deg(tilt).toFixed(2)}° it is ${(gc.width*1000).toFixed(1)} mm `+
+            `across the closing axis against a ${(gc.gap*1000).toFixed(1)} mm gap — the `+
+            `jaws lever it out.`};
+      put(a, "TIPPED"); break;
+    }
+    if(tilt > TOPPLE_RAD){
+      verdict = {kind:"TIPPED", cls:"b-no", title:"TIPPED", tilt,
+        why:`toppled: ${deg(tilt).toFixed(1)}° about its far base edge under a `+
+            `${F_tip.toFixed(3)} N one-sided push.`};
+      put(a,"TIPPED"); break;
+    }
+    if(!gc.inHand){
+      verdict = {kind:"SHOVED", cls:"b-no", title:"SHOVED OUT OF THE HAND",
+        why:`the push moved it ${(dispTotal*1000).toFixed(1)} mm and it left the pads `+
+            `before the static face could react it.`};
+      put(a,"SHOVED"); break;
+    }
+    put(a);
+  }
+
+  if(!verdict){
+    const gc = graspCheck();
+    verdict = {kind:"SHOVED", cls:"b-no", title:"NO CONTACT",
+      why:`the jaws ran to the catalogue close target ${target.toFixed(3)} rad `+
+          `without ever reaching the object (gap ${(gc.gap*1000).toFixed(1)} mm vs `+
+          `width ${(gc.width*1000).toFixed(1)} mm) — a closure on an empty hand.`};
+    log.push(`${target.toFixed(3)} rad — target reached, jaws never touched the object`);
+  }
+  verdict.target = target; verdict.entry = entry;
+  verdict.F_tip = F_tip; verdict.F_slide = F_slide; verdict.mech = mech;
+  verdict.hPush = hPush; verdict.rBase = rBase; verdict.disp = dispTotal;
+  verdict.firstA = firstA; verdict.log = log;
+
+  /* ---- consequence frames: purely so the failure is VISIBLE ------------- */
+  const last = trace.length ? trace[trace.length-1] : {a:target,shove,tilt};
+  if(verdict.kind === "TIPPED" || verdict.kind === "SHOVED"){
+    const K = 40;
+    for(let k = 1; k <= K; k++){
+      if(verdict.kind === "TIPPED" && mech !== "rake")
+        trace.push({a:last.a, shove:last.shove, tilt:last.tilt + (TOPPLE_RAD+0.6-last.tilt)*k/K,
+                    note:"consequence"});
+      else
+        trace.push({a:last.a, shove:last.shove + 0.045*k/K,
+                    tilt:last.tilt + (mech==="rake" ? 0.25*k/K : 0), note:"consequence"});
+    }
+    log.push(`(the last ${K} frames are the CONSEQUENCE, drawn so the failure is `+
+             `visible — the verdict is decided at ${last.a.toFixed(3)} rad)`);
+  }
+
+  // restore: the simulation must not be a side effect of being run
+  state.q.gripper = saveGrip; cl.shove = saveShove; cl.tilt = saveTilt;
+  cl.trace = trace; cl.verdict = verdict; cl.entryAngle = entry;
+  return verdict;
+}
+
+/* --- playback: an rAF chain that exists only while it is animating -------- */
+let closeAnim = null;
+const CLOSE_ANIM_MS = 1500;
+function applyCloseFrame(f){
+  state.q.gripper = f.a; state.close.shove = f.shove; state.close.tilt = f.tilt;
+}
+function playClose(animate){
+  const tr = state.close.trace;
+  if(!tr || !tr.length) return;
+  if(closeAnim){ cancelAnimationFrame(closeAnim); closeAnim = null; }
+  if(!animate){ applyCloseFrame(tr[tr.length-1]); mark(); return; }
+  const t0 = performance.now();
+  (function frame(now){
+    const u = Math.min(1, (now - t0)/CLOSE_ANIM_MS);
+    applyCloseFrame(tr[Math.min(tr.length-1, Math.round(u*(tr.length-1)))]);
+    render();
+    closeAnim = (u < 1) ? requestAnimationFrame(frame) : null;
+  })(performance.now());
+}
+function runClose(animate){
+  simulateClose();
+  playClose(animate !== false);
+  return state.close.verdict;
+}
+// Drop the simulation and put the object back where the user placed it, WITHOUT
+// touching the pose (what every pose/placement slider does -- a shove computed
+// for a hand that has since moved is a lie).
+function clearClose(){
+  if(closeAnim){ cancelAnimationFrame(closeAnim); closeAnim = null; }
+  const cl = state.close;
+  cl.shove = 0; cl.tilt = 0; cl.trace = null; cl.verdict = null; cl.entryAngle = null;
+}
+// ...and additionally reopen the jaws to where CLOSE was entered (the button).
+function resetClose(){
+  const back = state.close.entryAngle;
+  clearClose();
+  if(back !== null && back !== undefined) state.q.gripper = back;
+  mark();
+}
+
+/* ========================================================================== *
+ * 9. UI                                                                      *
+ * ========================================================================== */
+const $ = s => document.querySelector(s);
+// Must start FALSE: mark() only schedules a frame when the scene is clean, so
+// seeding it true would mean the very first frame is never requested.
+let dirty = false;
+
+function slider(host, key, label, min, max, step, get, set, fmt){
+  const row=document.createElement("div"); row.className="row";
+  row.innerHTML = `<label>${label}</label>`;
+  const r=document.createElement("input"); r.type="range";
+  r.min=min; r.max=max; r.step=step;
+  const n=document.createElement("input"); n.type="number";
+  n.min=min; n.max=max; n.step=step;
+  row.append(r,n); host.append(row);
+  const lim=document.createElement("div"); lim.className="lim";
+  lim.textContent = fmt || `[${(+min).toFixed(3)}, ${(+max).toFixed(3)}]`;
+  host.append(lim);
+  const sync=()=>{ const v=get(); r.value=v; n.value=(+v).toFixed(4); };
+  r.addEventListener("input",()=>{ set(clamp(+r.value,+min,+max)); sync(); mark(); });
+  n.addEventListener("change",()=>{ set(clamp(+n.value,+min,+max)); sync(); mark(); });
+  n.addEventListener("input",()=>{ const v=+n.value;
+    if(Number.isFinite(v)){ set(clamp(v,+min,+max)); r.value=state_get_safe(get); mark(); }});
+  sync();
+  return sync;
+}
+function state_get_safe(g){ return g(); }
+
+const jointSyncers=[], objSyncers=[], closeSyncers=[];
+const syncers = {[Symbol.iterator]:function*(){
+  yield* jointSyncers; yield* objSyncers; yield* closeSyncers; }};
+function buildJointUI(){
+  const host=$("#joints"); host.innerHTML=""; jointSyncers.length=0;
+  for(const name of JOINT_NAMES){
+    const [lo,hi]=JOINT_LIMITS[name];
+    jointSyncers.push(slider(host,name,name,lo,hi,0.001,
+      ()=>state.q[name],(v)=>{clearClose(); state.q[name]=v;},
+      `${lo.toFixed(4)} .. ${hi.toFixed(4)} rad  (${deg(lo).toFixed(1)}..${deg(hi).toFixed(1)}°)`));
+  }
+}
+function buildObjUI(){
+  const sel=$("#objSel"); sel.innerHTML="";
+  for(const k of Object.keys(OBJECTS)){
+    const o=document.createElement("option"); o.value=k;
+    o.textContent = k + (OBJECTS[k].experimental?"  — experimental":"");
+    sel.append(o);
+  }
+  sel.value=state.obj.name;
+  sel.addEventListener("change",()=>{
+    clearClose();
+    state.obj.name=sel.value;
+    const sp=objSpec();
+    const [r0,r1]=REGIONS[sp.mode];
+    state.obj.x = PAN_AXIS_XY[0] + 0.5*(r0+r1);
+    state.obj.y = 0; state.obj.tiltX=0; state.obj.tiltY=0; state.obj.z_extra=0;
+    buildObjCtl(); mark();
+  });
+  buildObjCtl();
+}
+function buildObjCtl(){
+  const host=$("#objCtl"); host.innerHTML=""; objSyncers.length=0;
+  $("#objSel").value = state.obj.name;      // keep the dropdown honest
+  const o=state.obj, S=(...a)=>objSyncers.push(slider(host,...a));
+  S("x","x (m)",-0.60,0.60,0.001,()=>o.x,v=>{clearClose(); o.x=v;},"table x, metres, base_link frame");
+  S("y","y (m)",-0.60,0.60,0.001,()=>o.y,v=>{clearClose(); o.y=v;},"table y, metres");
+  S("yaw","yaw (rad)",-Math.PI,Math.PI,0.005,()=>o.yaw,v=>{clearClose(); o.yaw=v;},"about world +Z");
+  S("tiltX","tilt X (rad)",-Math.PI/2,Math.PI/2,0.005,()=>o.tiltX,v=>{clearClose(); o.tiltX=v;},
+    "about object local +X — lays a standing cylinder down");
+  S("tiltY","tilt Y (rad)",-Math.PI/2,Math.PI/2,0.005,()=>o.tiltY,v=>{clearClose(); o.tiltY=v;},
+    "about object local +Y");
+  S("lift","lift (m)",0,0.20,0.001,()=>o.z_extra,v=>{clearClose(); o.z_extra=v;},
+    "extra height above resting contact (0 = on the table)");
+  const sp=objSpec();
+  const dims = sp.shape==="sphere"
+    ? `sphere  r=${(sp.radius*1000).toFixed(1)} mm`
+    : sp.shape==="cylinder"
+    ? `cylinder  r=${(sp.radius*1000).toFixed(1)} mm  h=${(sp.height*1000).toFixed(1)} mm`
+    : `cuboid  ${(2*sp.he[0]*1000).toFixed(1)} × ${(2*sp.he[1]*1000).toFixed(1)} × ${(2*sp.he[2]*1000).toFixed(1)} mm`;
+  const sq = squeezeFor(sp), tc = tipClearanceFor(sp);
+  $("#objNote").innerHTML =
+    `<b>${dims}</b><br>mass ${(sp.mass*1000).toFixed(1)} g &middot; grasp width `+
+    `${(sp.width*1000).toFixed(1)} mm &middot; grasp mode <b>${sp.mode}</b><br>`+
+    `contact angle ${contactAngleFor(sp.width).toFixed(3)} rad &middot; `+
+    `close target ${closeTargetFor(sp.width,sq).toFixed(3)} rad`+
+    (sp.squeeze!==undefined ? ` <i>(squeeze ${sq.toFixed(3)})</i>` : ``)+`<br>`+
+    `min tip clearance ${(tc*1000).toFixed(2)} mm`+
+    (sp.tipClearance!==undefined ? ` <i>(per-object override)</i>` : ``)+
+    `<br><br>${sp.note||""}`;
+}
+
+// The close-sim controls: just mu, the one thing the model is not free to
+// pin (randomize.py draws it per episode over FRICTION_RANGE).
+function buildCloseUI(){
+  const host=$("#closeCtl"); host.innerHTML="";
+  closeSyncers.length=0;
+  closeSyncers.push(slider(host,"mu","μ table",0.6,1.4,0.01,
+    ()=>state.close.mu, v=>{const rerun=!!state.close.trace; state.close.mu=v;
+                            if(rerun){ simulateClose(); playClose(false); }},
+    `objects.py NOMINAL_FRICTION = 1.00 · randomize.FRICTION_RANGE ${FRICTION_RANGE[0]}–${FRICTION_RANGE[1]}`));
+}
+function closeVerdictPanel(){
+  const v = state.close.verdict, host=$("#closeVerdict");
+  if(!v){ host.innerHTML =
+    `<span class="badge b-mid">NOT RUN</span><br>`+
+    `<span style="color:var(--dim)">Pose the hand around the object, then CLOSE. `+
+    `The moving jaw always arrives first — the static face stands `+
+    `${(JAW_CLEARANCE*1000).toFixed(1)} mm off by design.</span>`;
+    return; }
+  const badge = `<span class="badge ${v.cls}">${v.title}</span>`;
+  const num = [];
+  if(Number.isFinite(v.F_tip))
+    num.push(`F_tip ${v.F_tip.toFixed(3)} N (r ${(v.rBase*1000).toFixed(1)} mm / h `+
+             `${(v.hPush*1000).toFixed(1)} mm) vs F_slide ${v.F_slide.toFixed(3)} N (μ=${state.close.mu.toFixed(2)})`);
+  if(v.disp) num.push(`one-sided travel ${(v.disp*1000).toFixed(2)} mm`);
+  if(v.closeAngle !== undefined)
+    num.push(`close angle ${v.closeAngle.toFixed(4)} rad · catalogue target ${v.target.toFixed(3)} rad`);
+  else num.push(`catalogue close target ${v.target.toFixed(3)} rad (never reached)`);
+  host.innerHTML = badge + `<div style="margin-top:5px;color:var(--dim)">${v.why}</div>`+
+    `<div style="margin-top:5px">${num.join("<br>")}</div>`;
+}
+
+function hud(){
+  const g = graspCheck();
+  const rows = JOINT_NAMES.map((n,i)=>{
+    const v=state.q[n];
+    return `<tr><td>${i}</td><td>${n}</td><td class="n">${v>=0?"+":""}${v.toFixed(4)}</td>`+
+           `<td class="n">${deg(v)>=0?"+":""}${deg(v).toFixed(2)}°</td></tr>`;
+  }).join("");
+  const badge = g.contact
+    ? `<span class="badge b-ok">BOTH PADS ON</span>`
+    : g.overlap
+      ? `<span class="badge b-mid">JAWS THROUGH OBJECT</span>`
+      : (g.staticTouch||g.movingTouch)
+        ? `<span class="badge b-mid">ONE FACE ONLY</span>`
+        : g.inHand
+          ? `<span class="badge b-no">IN HAND, NOT CLAMPED</span>`
+          : `<span class="badge b-no">OBJECT NOT IN HAND</span>`;
+  const mm = v => (v*1000).toFixed(1);
+  $("#hud").innerHTML =
+    `<div class="hdr">joint state &mdash; radians / degrees</div>
+     <table>${rows}</table>
+     <div id="grasp">
+       <div class="hdr" style="margin-bottom:4px">grasp check ${badge}</div>
+       <table>
+        <tr><td>jaw gap (swept)</td><td class="n">${mm(g.gap)} mm</td>
+            <td>object width (along jaw x)</td><td class="n">${mm(g.width)} mm</td></tr>
+        <tr><td>&nbsp;&nbsp;sim linear fit</td>
+            <td class="n" style="color:${Math.abs(g.gap-g.gapFit)<0.002?'var(--dim)':'var(--warn)'}">${mm(g.gapFit)} mm</td>
+            <td>nominal spec width</td><td class="n">${mm(objSpec().width)} mm</td></tr>
+        <tr><td>gap &minus; width</td>
+            <td class="n" style="color:${g.clearance<0?'var(--bad)':g.clearance<0.004?'var(--ok)':'var(--warn)'}">
+              ${mm(g.clearance)} mm</td>
+            <td>pad overlap</td>
+            <td class="n" style="color:${g.padOverlap>0.001?'var(--ok)':'var(--bad)'}">${mm(g.padOverlap)} mm</td></tr>
+        <tr><td>static face gap</td><td class="n">${mm(g.staticGap)} mm</td>
+            <td>moving face gap</td><td class="n">${mm(g.movingGap)} mm</td></tr>
+        <tr><td>obj in TCP frame</td>
+            <td class="n">${mm(g.c[0])}, ${mm(g.c[1])}, ${mm(g.c[2])} mm</td>
+            <td>fingertip z</td>
+            <td class="n" style="color:${g.tipClear>g.tipMin?'var(--ok)':'var(--bad)'}"
+                title="bar for this object: ${mm(g.tipMin)} mm">${mm(g.tipClear)} mm</td></tr>
+        <tr><td>TCP (base_link)</td>
+            <td class="n">${g.tcp.map(v=>v.toFixed(4)).join(", ")}</td>
+            <td>contact / close target</td>
+            <td class="n">${g.contactAngle.toFixed(3)} / ${g.closeTarget.toFixed(3)} rad</td></tr>
+       </table>
+     </div>`+closeTraceBlock();
+  closeVerdictPanel();
+}
+
+// The closing trace, logged where the rest of the numbers are.
+function closeTraceBlock(){
+  const v = state.close.verdict;
+  if(!v) return "";
+  const rows = v.log.map(l =>
+    `<div style="color:${l.startsWith("  ")||l.startsWith("(")?"var(--dim)":"var(--fg)"};`+
+    `white-space:pre-wrap">${l.replace(/^/,"· ")}</div>`).join("");
+  return `<div id="grasp">
+      <div class="hdr" style="margin-bottom:4px">close trace `+
+      `<span class="badge ${v.cls}">${v.title}</span></div>
+      <div style="max-width:560px;line-height:1.5;max-height:230px;overflow-y:auto">${rows}</div>
+    </div>`;
+}
+
+/* --- export ---------------------------------------------------------- */
+function poseObj(){ const o={}; for(const n of JOINT_NAMES) o[n]=+state.q[n].toFixed(6); return o; }
+function copy(text,what){
+  const done=()=>{ const t=$("#toast"); t.textContent="copied "+what;
+    t.style.opacity="1"; setTimeout(()=>t.style.opacity="0",1100); };
+  if(navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done,fallback);
+  else fallback();
+  function fallback(){ const ta=document.createElement("textarea"); ta.value=text;
+    ta.style.position="fixed"; ta.style.opacity="0"; document.body.append(ta);
+    ta.select(); try{document.execCommand("copy");}catch(e){} ta.remove(); done(); }
+}
+// The object's placement, in the one form that round-trips: `z` is the FULL
+// centre height (resting contact + lift), so a lifted object does not silently
+// export as one sitting on the table.
+function objPlacement(){
+  const o=state.obj, rest=restingZ();
+  return {
+    name: o.name,
+    x:+o.x.toFixed(6), y:+o.y.toFixed(6), z:+(rest+o.z_extra).toFixed(6),
+    resting_z:+rest.toFixed(6), lift:+o.z_extra.toFixed(6),
+    yaw:+o.yaw.toFixed(6), tiltX:+o.tiltX.toFixed(6), tiltY:+o.tiltY.toFixed(6),
+  };
+}
+// The CLOSE verdict, in the exports.  `close_angle_rad` is only present when
+// the simulation actually CLAMPED -- a verified angle or nothing, so a failed
+// closure cannot be pasted into a plan as if it were a grasp.
+function closeExport(){
+  const v = state.close.verdict;
+  if(!v) return null;
+  const out = {verdict:v.kind, mechanism:v.mech, mu:+state.close.mu.toFixed(3),
+    catalogue_close_target_rad:+v.target.toFixed(6),
+    entry_angle_rad:+v.entry.toFixed(6),
+    one_sided_travel_mm:+(v.disp*1000).toFixed(3)};
+  if(Number.isFinite(v.F_tip)){ out.f_tip_n=+v.F_tip.toFixed(4); out.f_slide_n=+v.F_slide.toFixed(4); }
+  if(v.closeAngle !== undefined) out.close_angle_rad = +v.closeAngle.toFixed(6);
+  return out;
+}
+function exportHeader(){
+  const g=graspCheck(), p=objPlacement(), cv=closeExport();
+  if(cv) return exportHeaderBase(g,p).concat([
+    `# CLOSE sim: ${cv.verdict}${cv.mechanism?" ("+cv.mechanism+")":""}`+
+      (cv.close_angle_rad!==undefined
+        ? `, verified close angle ${cv.close_angle_rad.toFixed(4)} rad`
+        : `, no verified close angle`)+
+      `  [catalogue target ${cv.catalogue_close_target_rad.toFixed(4)} rad]`,
+  ]).join("\n");
+  return exportHeaderBase(g,p).join("\n");
+}
+function exportHeaderBase(g,p){
+  return [
+    `# SO-101 pose, radians, specs.JOINT_NAMES order (arm q = first five).`,
+    `# object ${p.name}: xyz=(${p.x.toFixed(4)}, ${p.y.toFixed(4)}, ${p.z.toFixed(4)}) m`+
+      `  [resting ${p.resting_z.toFixed(4)} + lift ${p.lift.toFixed(4)}]`,
+    `#   yaw=${p.yaw.toFixed(4)}, tiltX=${p.tiltX.toFixed(4)}, tiltY=${p.tiltY.toFixed(4)} rad`,
+    `# TCP (base_link) = (${g.tcp.map(v=>v.toFixed(5)).join(", ")}) m`,
+    `# jaw gap ${(g.gap*1000).toFixed(2)} mm vs object width ${(g.width*1000).toFixed(2)} mm`,
+  ];
+}
+
+/* ========================================================================== *
+ * 10. Cameras + interaction                                                  *
+ * ========================================================================== */
+const glc=$("#gl"), lab=$("#labels"), pipFrame=$("#pipframe");
+const R = makeGL(glc);              // ONE context; the PiP is a scissored viewport
+const ctx = lab.getContext("2d");
+let DPR = 1;
+
+// PiP viewport in device pixels, y from the bottom (GL convention), taken from
+// the frame div so the CSS chrome and the GL box can never drift apart.
+function pipRect(){
+  const s = glc.getBoundingClientRect(), p = pipFrame.getBoundingClientRect();
+  const w = Math.max(1,Math.round(p.width*DPR)), h = Math.max(1,Math.round(p.height*DPR));
+  return {x: Math.round((p.left-s.left)*DPR),
+          y: Math.round((s.bottom-p.bottom)*DPR), w, h};
+}
+
+function mainVP(w,h){
+  const c=state.cam;
+  const eye = add(c.target,[
+    c.dist*Math.cos(c.el)*Math.cos(c.az),
+    c.dist*Math.cos(c.el)*Math.sin(c.az),
+    c.dist*Math.sin(c.el)]);
+  const P = M4.perspective(0.85, w/h, 0.01, 20);
+  const V = M4.lookAt(eye,c.target,[0,0,1]);
+  return {vp:M4.mul(P,V), eye};
+}
+// An IDEALIZED tool-axis view for posing -- NOT kinematics.wrist_camera_pose,
+// which is the sim's actual offset/tilted wrist cam and sees something else.
+// It looks down the MIDDLE of the jaw opening rather than along the tool axis:
+// the TCP sits on the static finger's own gripping plane, so a camera there
+// stares straight into that finger and sees nothing else.
+function povVP(w,h){
+  const T = fk(qArm()).gripper_frame_link;
+  const o = M4.xform(T,[0,0,0]);
+  const ax = M4.axis(T,0), ay = M4.axis(T,1), az = M4.axis(T,2);
+  const mid = add(o, mul(ax, 0.5*jawFacePoint(state.q.gripper)[0]));
+  const eye = add(mid, mul(az,-0.130));
+  const P = M4.perspective(1.05, w/h, 0.02, 6);
+  const V = M4.lookAt(eye, add(mid,mul(az,0.15)), ay);
+  return M4.mul(P,V);
+}
+
+function resize(){
+  DPR = Math.min(window.devicePixelRatio||1, 2);
+  for(const c of [glc,lab]){
+    const r=c.getBoundingClientRect();
+    c.width=Math.max(1,Math.round(r.width*DPR)); c.height=Math.max(1,Math.round(r.height*DPR));
+  }
+  mark();
+}
+
+function drawLabels(vp,w,h){
+  ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0,0,lab.width,lab.height);
+  ctx.font = `${Math.round(11*Math.min(window.devicePixelRatio||1,2))}px ui-monospace,monospace`;
+  ctx.fillStyle="#8894a5"; ctx.textAlign="center"; ctx.textBaseline="middle";
+  const put=(p,txt)=>{
+    const x=vp[0]*p[0]+vp[4]*p[1]+vp[8]*p[2]+vp[12];
+    const y=vp[1]*p[0]+vp[5]*p[1]+vp[9]*p[2]+vp[13];
+    const wc=vp[3]*p[0]+vp[7]*p[1]+vp[11]*p[2]+vp[15];
+    if(wc<=0) return;
+    ctx.fillText(txt, (x/wc*0.5+0.5)*w, (1-(y/wc*0.5+0.5))*h);
+  };
+  for(let i=1;i<=6;i++){
+    put([i*0.1,-0.018,0], (i*0.1).toFixed(1));
+    put([-0.018,i*0.1,0], (i*0.1).toFixed(1));
+    put([-i*0.1,-0.018,0], (-i*0.1).toFixed(1));
+    put([-0.018,-i*0.1,0], (-i*0.1).toFixed(1));
+  }
+  ctx.fillStyle="#c05252"; put([0.20,-0.02,0],"+X");
+  ctx.fillStyle="#4faa62"; put([-0.02,0.20,0],"+Y");
+  ctx.fillStyle="#5a8ad8"; put([0,0,0.20],"+Z");
+  ctx.fillStyle="#8894a5"; put([0,0,-0.012],"0.1 m grid");
+  // keep tick labels from bleeding over the PiP inset
+  const pr=pipRect(); ctx.clearRect(pr.x, h-pr.y-pr.h, pr.w, pr.h);
+}
+
+function render(){
+  dirty=false;
+  const w=glc.width,h=glc.height;
+  if(w<2||h<2) return;                       // no layout yet; a resize will call back
+  const {vp} = mainVP(w,h);
+  drawScene(R, vp, {x:0,y:0,w,h}, [0.055,0.066,0.086], {});
+  const pr = pipRect();
+  drawScene(R, povVP(pr.w,pr.h), pr, [0.04,0.05,0.07], {pov:true});
+  drawLabels(vp,w,h);
+  hud();
+  for(const s of syncers) s();
+}
+function mark(){ if(!dirty){ dirty=true; requestAnimationFrame(render); } }
+
+/* orbit / pan / zoom */
+(function(){
+  let drag=null;
+  glc.addEventListener("contextmenu",e=>e.preventDefault());
+  glc.addEventListener("mousedown",e=>{
+    drag={x:e.clientX,y:e.clientY,pan:e.shiftKey||e.button===2||e.button===1};
+    e.preventDefault();
+  });
+  window.addEventListener("mousemove",e=>{
+    if(!drag) return;
+    const dx=e.clientX-drag.x, dy=e.clientY-drag.y;
+    drag.x=e.clientX; drag.y=e.clientY;
+    const c=state.cam;
+    if(drag.pan){
+      const right=[-Math.sin(c.az),Math.cos(c.az),0];
+      const up=[-Math.sin(c.el)*Math.cos(c.az),-Math.sin(c.el)*Math.sin(c.az),Math.cos(c.el)];
+      const s=c.dist*0.0016;
+      c.target=add(c.target, add(mul(right,-dx*s), mul(up,dy*s)));
+    }else{
+      c.az -= dx*0.0065;
+      c.el = clamp(c.el + dy*0.0065, -1.45, 1.45);
+    }
+    mark();
+  });
+  window.addEventListener("mouseup",()=>drag=null);
+  glc.addEventListener("wheel",e=>{
+    e.preventDefault();
+    state.cam.dist = clamp(state.cam.dist*Math.exp(e.deltaY*0.0011), 0.08, 4);
+    mark();
+  },{passive:false});
+})();
+
+/* buttons */
+$("#bZero").onclick=()=>{ clearClose(); for(const n of JOINT_NAMES) state.q[n]=0; mark(); };
+$("#bOpen").onclick=()=>{ clearClose(); state.q.gripper=GRIPPER_OPEN; mark(); };
+// A top-down HOVER, not a grasp: pitch sum = PITCH_SUM_VERTICAL so the approach
+// axis points straight down, TCP at z = +75 mm (fingertips +69 mm, i.e. ~39 mm
+// over a 30 mm cube) and TCP radius 165.5 mm about the pan axis -- the middle of
+// GRASP_REGION's 111-220 mm annulus.  The previous seed (lift -0.35, elbow 1.10)
+// satisfied the same pitch sum but put the TCP at z = -15.4 mm, BELOW the table,
+// with the fingertips at -21.7 mm and the object 52 mm off the hand.
+// wrist_flex = pi/2 - lift - elbow = 1.5458 rad, 0.11 rad clear of its stop.
+$("#bTop").onclick=()=>{
+  clearClose();
+  Object.assign(state.q,{shoulder_pan:0,shoulder_lift:-0.175,elbow_flex:0.200,
+    wrist_flex:Math.PI/2+0.175-0.200, wrist_roll:0, gripper:GRIPPER_OPEN});
+  // put the object directly under the TCP so the hover reads as a hover
+  const tcp = graspCheck().tcp;
+  state.obj.x=tcp[0]; state.obj.y=tcp[1]; state.obj.z_extra=0; mark(); };
+$("#bSide").onclick=()=>{  clearClose();  // side family: pitch sum = 0, level jaws
+  Object.assign(state.q,{shoulder_pan:0,shoulder_lift:-0.30,elbow_flex:0.55,
+    wrist_flex:-0.25, wrist_roll:-1.5222, gripper:GRIPPER_OPEN});
+  // mid SIDE_GRASP_REGION (0.352-0.422 m about the pan axis), not 0.350, which
+  // is 2 mm OUTSIDE the annulus the horizontal family is solved over.
+  state.obj.x=PAN_AXIS_XY[0]+0.5*(REGIONS.side[0]+REGIONS.side[1]);
+  state.obj.y=0; mark(); };
+// The two poses manus.expert.plan_grasp() itself produces for the two objects
+// this tool exists for, at the middle of each family's own grasp region.
+// Regenerate with:
+//   PYTHONPATH=src python3 -c "from manus.expert import plan_grasp; \
+//     from manus.objects import OBJECTS; from manus.kinematics import \
+//     SIDE_GRASP_REGION as R, PAN_AXIS_XY as P; \
+//     print(plan_grasp(OBJECTS['cylinder_3cm'],(P[0]+0.5*sum(R.radius),P[1],0)).q_grasp)"
+const EXPERT_POSES = {
+  cylinder_3cm: {q:[-0.023969, 1.054601, -0.093784, -0.960817, -1.522119],
+                 obj:[0.425835, 0.0]},   // tcp_grasp = (0.421429, 0.016899, 0.040)
+  puck_d40x10:  {q:[-0.085936, -0.109737, 0.617371, 1.063162, -1.608233],
+                 obj:[0.204335, 0.0]},   // tcp_grasp = (0.204339, 0.022000, 0.0113)
+};
+// The pose the CLOSE simulation finds that DOES clamp the thin puck, and the two
+// things it changes about the expert's own: the tips go 2.5 mm off the table
+// instead of MIN_TIP_CLEARANCE's 5.0 (plan_grasp with tip_clearance_m = 0.0025,
+// which is grasp_height's floor -- the puck's own centre), which drops the
+// moving finger's ridge from 10.3 mm to 7.6 mm, BELOW the puck's 10 mm top face
+// so it pushes the rim instead of raking the edge; and the object starts against
+// the static pad (the SEAT_GAP_M = 0 state's whole purpose) instead of
+// JAW_CLEARANCE away from it.
+const PUCK_SEATED_POSE = {q:[-0.085936, -0.100064, 0.625591, 1.045270, -1.608233],
+                          obj:[0.204335, 0.002]};   // tcp_grasp = (0.204339, 0.022, 0.0090)
+function loadExpert(name){
+  const e = (name === "puck_seated") ? PUCK_SEATED_POSE : EXPERT_POSES[name];
+  if(name === "puck_seated") name = "puck_d40x10";
+  resetClose();
+  state.obj.name = name; state.obj.x = e.obj[0]; state.obj.y = e.obj[1];
+  state.obj.yaw = 0; state.obj.tiltX = 0; state.obj.tiltY = 0; state.obj.z_extra = 0;
+  JOINT_NAMES.slice(0,5).forEach((n,i)=>state.q[n]=e.q[i]);
+  state.q.gripper = GRIPPER_OPEN;
+  buildObjCtl(); mark();
+}
+$("#bExpCyl").onclick =()=>loadExpert("cylinder_3cm");
+$("#bExpPuck").onclick=()=>loadExpert("puck_d40x10");
+$("#bPuckSeat").onclick=()=>loadExpert("puck_seated");
+$("#bClose").onclick  =()=>runClose(true);
+$("#bReopen").onclick =()=>resetClose();
+
+$("#bJson").onclick=()=>copy(JSON.stringify(
+  {pose:poseObj(), object:objPlacement(),
+   tcp:graspCheck().tcp.map(v=>+v.toFixed(6)), close:closeExport()}, null, 2), "JSON");
+$("#bPy").onclick=()=>copy(exportHeader()+"\npose = {\n"+
+  JOINT_NAMES.map(n=>`    "${n}": ${state.q[n].toFixed(6)},`).join("\n")+"\n}\n","Python dict");
+$("#bQ").onclick=()=>copy(exportHeader()+"\nq = np.array(["+
+  qArm().map(v=>v.toFixed(6)).join(", ")+"])  # shoulder_pan..wrist_roll\n"+
+  `gripper = ${state.q.gripper.toFixed(6)}\n`,"q array");
+$("#bFit").onclick=()=>{ state.cam.target=[0.22,0,0.07]; state.cam.dist=0.80; mark(); };
+document.querySelectorAll("[data-view]").forEach(b=>b.onclick=()=>{
+  const v=b.dataset.view, c=state.cam;
+  if(v==="iso"){ c.az=-0.72; c.el=0.52; }
+  if(v==="front"){ c.az=0.0; c.el=0.06; }
+  if(v==="side"){ c.az=Math.PI/2; c.el=0.06; }
+  if(v==="top"){ c.az=-0.0001; c.el=1.44; }
+  mark();
+});
+
+window.addEventListener("resize",resize);
+buildJointUI(); buildObjUI(); buildCloseUI();
+
+/* ========================================================================== *
+ * 10b. URL scenario -- how the headless verification drives this file.        *
+ *   ?obj=puck_d40x10&q=a,b,c,d,e&grip=1.5&ox=..&oy=..&lift=..&tiltX=..        *
+ *   &yaw=..&mu=..&expert=cylinder_3cm&close=1                                 *
+ * `close=1` runs the simulation and jumps STRAIGHT to its last frame (no      *
+ * animation), so a screenshot is deterministic.  Nothing here is reachable    *
+ * unless a query string asks for it.                                          *
+ * ========================================================================== */
+(function applyURLScenario(){
+  const p = new URLSearchParams(location.search);
+  if(![...p.keys()].length) return;
+  if(p.has("expert")) loadExpert(p.get("expert"));
+  if(p.has("obj")){ state.obj.name = p.get("obj"); buildObjCtl(); }
+  if(p.has("q")) p.get("q").split(",").forEach((v,i)=>{
+    if(i<5) state.q[JOINT_NAMES[i]] = +v; });
+  if(p.has("grip"))  state.q.gripper = +p.get("grip");
+  if(p.has("ox"))    state.obj.x = +p.get("ox");
+  if(p.has("oy"))    state.obj.y = +p.get("oy");
+  if(p.has("lift"))  state.obj.z_extra = +p.get("lift");
+  if(p.has("yaw"))   state.obj.yaw = +p.get("yaw");
+  if(p.has("tiltX")) state.obj.tiltX = +p.get("tiltX");
+  if(p.has("tiltY")) state.obj.tiltY = +p.get("tiltY");
+  if(p.has("mu"))    state.close.mu = +p.get("mu");
+  if(p.has("cam")){ const c=p.get("cam").split(","); state.cam.az=+c[0];
+    state.cam.el=+c[1]; state.cam.dist=+c[2];
+    if(c.length>5) state.cam.target=[+c[3],+c[4],+c[5]]; }
+  buildObjCtl();
+  if(p.get("close")==="1"){
+    const v = runClose(p.get("anim") === "1");   // anim=1 exercises the rAF chain
+    console.log("CLOSE VERDICT", JSON.stringify(
+      {kind:v.kind, title:v.title, mech:v.mech, F_tip:v.F_tip, F_slide:v.F_slide,
+       close_angle:v.closeAngle, target:v.target, disp:v.disp, why:v.why}));
+    v.log.forEach(l=>console.log("TRACE "+l));
+    console.log("CLOSE EXPORT", JSON.stringify(closeExport()));
+    console.log("EXPORT HEADER\n"+exportHeader());
+  }
+})();
+
+// Debug handle for the headless checks; the UI never reads it.
+window.__poser = {state, graspCheck, fk, qArm, simulateClose, runClose, resetClose,
+                  jawFacePoint, closeExport, EXPERT_POSES, OBJECTS};
+
+resize();
+render();                       // paint once immediately, before any interaction
+// The canvases take their pixel size from layout; if fonts or scrollbars settle
+// a frame late, re-measure and repaint rather than leaving a stale first frame.
+window.addEventListener("load",()=>{ resize(); render(); });
+
+/* ========================================================================== *
+ * 11. Self-check: FK at the zero pose against the URDF chain.                *
+ *     Logged to the console; a mismatch means the transcription drifted.     *
+ * ========================================================================== */
+(function selfTest(){
+  const p = fk([0,0,0,0,0]);
+  const out = {};
+  for(const k of ["shoulder_link","upper_arm_link","lower_arm_link",
+                  "wrist_link","gripper_link","gripper_frame_link"])
+    out[k] = M4.xform(p[k],[0,0,0]).map(v=>+v.toFixed(6));
+  console.log("%cSO-101 poser — FK at q = zeros (base_link frame, metres)",
+              "color:#4da3ff;font-weight:bold");
+  console.table(out);
+  // Reach sanity: link lengths straight off the URDF origins.
+  console.log("upper arm |elbow origin| =",
+    Math.hypot(...CHAIN[2].xyz).toFixed(4), "m (expect 0.1160)");
+  console.log("forearm   |wrist origin| =",
+    Math.hypot(...CHAIN[3].xyz).toFixed(4), "m (expect 0.1350)");
+  console.log("wrist->TCP |offset|      =",
+    Math.hypot(...CHAIN[5].xyz).toFixed(4), "m (expect 0.0984)");
+})();
+</script>
