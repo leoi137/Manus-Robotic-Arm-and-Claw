@@ -421,14 +421,16 @@ class ObjectSpec:
 
     def make_spawn_cfg(
         self, color: tuple[float, float, float] = DEFAULT_COLOR
-    ) -> sim_utils.ShapeCfg:
+    ) -> sim_utils.ShapeCfg | sim_utils.MeshCfg:
         """Build this object's Isaac Lab shape spawner.
 
         The returned cfg spawns ``<prim>`` as an Xform carrying the rigid-body
         and mass APIs, with the collider and its materials under
-        ``<prim>/geometry`` — the layout
+        ``<prim>/geometry`` — the layout both
         :func:`isaaclab.sim.spawners.shapes.shapes._spawn_geom_from_prim_type`
-        imposes, and the reason the per-episode colour write targets
+        (cuboids, spheres) and
+        :func:`isaaclab.sim.spawners.meshes.meshes._spawn_mesh_geom_from_mesh`
+        (cylinders) impose, and the reason the per-episode colour write targets
         ``<prim>/geometry/material/Shader``.
 
         .. warning::
@@ -439,8 +441,8 @@ class ObjectSpec:
             color: Linear-RGB diffuse colour to spawn with.
 
         Returns:
-            A :class:`~isaaclab.sim.CuboidCfg`, :class:`~isaaclab.sim.CylinderCfg`
-            or :class:`~isaaclab.sim.SphereCfg`.
+            A :class:`~isaaclab.sim.CuboidCfg`, :class:`~isaaclab.sim.SphereCfg`
+            or :class:`~isaaclab.sim.MeshCylinderCfg`.
         """
         import isaaclab.sim as sim_utils
 
@@ -455,7 +457,10 @@ class ObjectSpec:
                 max_depenetration_velocity=1.0,  # m/s
             ),
             "collision_props": sim_utils.PhysxCollisionPropertiesCfg(collision_enabled=True),
-            "physics_material": sim_utils.PhysxRigidBodyMaterialCfg(
+            # RigidBodyMaterialCfg, not PhysxRigidBodyMaterialCfg: identical config
+            # (same spawn func, fields and defaults; it subclasses the Physx one),
+            # but the mesh spawner's material type check accepts only this name.
+            "physics_material": sim_utils.RigidBodyMaterialCfg(
                 static_friction=NOMINAL_FRICTION,
                 dynamic_friction=NOMINAL_FRICTION,
                 restitution=0.0,
@@ -469,7 +474,19 @@ class ObjectSpec:
             )
         if self.shape == "sphere":
             return sim_utils.SphereCfg(radius=self.radius, **shared)
-        return sim_utils.CylinderCfg(radius=self.radius, height=self.height, axis="Z", **shared)
+        # A triangle-mesh cylinder with a convex-hull collider, NOT the analytic
+        # ``CylinderCfg``. PhysX has no native cylinder shape: an analytic cylinder
+        # prim becomes "custom geometry", and its narrowphase against the jaws' SDF
+        # colliders generates no contacts at all -- measured, not surmised
+        # (``runs/contact_probe/probe.json``): the seated cylinder rested 2 mm from
+        # the fixed pad through all of SEAT and then slid 40 mm *through* the pad
+        # plane over 140 CLOSE steps with zero contacts reported, before being
+        # caught 4.2 mm deep by the jaw's upper structure at 54.9 N. The hull of
+        # the 32-section mesh is within 0.08 mm of the true surface, and
+        # convex-vs-SDF is the pair every working cuboid grasp already exercises.
+        return sim_utils.MeshCylinderCfg(
+            radius=self.radius, height=self.height, axis="Z", **shared
+        )
 
 
 OBJECTS: dict[str, ObjectSpec] = {

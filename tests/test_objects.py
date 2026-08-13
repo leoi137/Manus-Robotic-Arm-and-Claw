@@ -339,7 +339,11 @@ def test_every_spec_builds_its_isaac_spawner():
     sim_utils = pytest.importorskip("isaaclab.sim", reason="Isaac Lab not installed")
     expected = {
         "cuboid": sim_utils.CuboidCfg,
-        "cylinder": sim_utils.CylinderCfg,
+        # A mesh cylinder, not the analytic shape: PhysX turns an analytic
+        # cylinder into "custom geometry", which generates no contacts against
+        # the jaws' SDF colliders (see make_spawn_cfg). The mesh spawner gives
+        # the collider a convex hull instead.
+        "cylinder": sim_utils.MeshCylinderCfg,
         "sphere": sim_utils.SphereCfg,
     }
     for spec in OBJECTS.values():
