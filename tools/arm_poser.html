@@ -673,7 +673,15 @@ function boxM(frame,centre,size){
 // guess.  Only the cross-sections are eyeballed.  Servo bodies are drawn at
 // the URDF visual origins of the sts3215 meshes, oriented by their own rpy.
 const PLASTIC=[0.85,0.68,0.12], SERVO=[0.13,0.13,0.14], METAL=[0.30,0.32,0.36];
-const MOTOR = [0.0452,0.0350,0.0247];       // STS3215 body, datasheet mm
+// STS3215 body, MEASURED off the mesh this box stands in for
+// (assets/sts3215_03a_v1.stl bounding box, metres) rather than off the
+// datasheet: the datasheet lists the case L/H/W in the servo's own order, and
+// transcribing it as x,y,z put the 35 mm face on +Y and the 24.7 mm face on +Z
+// -- a 90 deg error about X on EVERY servo box, worst at base_link's, whose
+// visual rpy is 0 so nothing else disguised it.  The mesh says x = 45.4, y =
+// 24.8, z = 39.6 mm, centred 0.4 mm up its own +Z.
+const MOTOR   = [0.0454,0.0248,0.0396];
+const MOTOR_C = [0,0,0.0004];
 
 function beamM(frame,a,b,w,t){
   const d = sub(b,a), L = Math.max(len(d),1e-6), z = norm(d);
@@ -691,8 +699,18 @@ const SKIN = {
     {kind:"beam", a:[0.0388353,0,0.018], b:J("shoulder_pan"), w:0.044, t:0.044, col:PLASTIC},
     {kind:"servo", o:[0.0263353,0,0.0437], rpy:[0,0,0]},
   ],
+  // The shoulder link is NOT a beam.  It used to be drawn as a 40x40 mm beam
+  // running from the link origin to the shoulder_lift joint origin -- a real
+  // URDF length, but along a diagonal that no part of the machine occupies, so
+  // it read as a slab jutting out of the base and cutting through the upper
+  // arm.  What is actually there is the pan rotor plate and the lift-servo
+  // holder, so both are drawn as mesh-bounding boxes at their own URDF visual
+  // origins, exactly like the servo bodies.
   shoulder_link: [
-    {kind:"beam", a:[0,0,0], b:J("shoulder_lift"), w:0.040, t:0.040, col:PLASTIC},
+    {kind:"mbox", o:[0.0122008,2.22413e-05,0.0464], rpy:[-1.5708,0,0],
+     c:[-0.0299,0.0423,0], s:[0.0598,0.0842,0.046], col:PLASTIC},   // rotation_pitch_so101_v1
+    {kind:"mbox", o:[-0.0675992,-0.000177759,0.0158499], rpy:[1.5708,-1.5708,0],
+     c:[-0.03985,-0.03605,-0.00134], s:[0.028,0.0381,0.05508], col:PLASTIC}, // motor_holder_so101_base_v1
     {kind:"servo", o:[-0.0303992,0.000422241,-0.0417], rpy:[1.5708,1.5708,0]},
   ],
   upper_arm_link: [
@@ -724,8 +742,11 @@ function drawSkin(R, poses, skip){
     for(const p of parts){
       if(p.kind==="beam") R.shape("box", beamM(F,p.a,p.b,p.w,p.t), p.col, 1);
       else if(p.kind==="servo")
-        R.shape("box", M4.mul(F, M4.mul(M4.origin(p.o,p.rpy),
-                       M4.scale(MOTOR[0],MOTOR[1],MOTOR[2]))), SERVO, 1);
+        R.shape("box", boxM(M4.mul(F,M4.origin(p.o,p.rpy)), MOTOR_C, MOTOR), SERVO, 1);
+      // mesh-bounding box: the STL's own bbox centre/extents, placed at the
+      // URDF visual origin -- same rule as the servo bodies.
+      else if(p.kind==="mbox")
+        R.shape("box", boxM(M4.mul(F,M4.origin(p.o,p.rpy)), p.c, p.s), p.col, 1);
       else R.shape("box", boxM(F,p.c,p.s), p.col, 1);
     }
   }
@@ -1263,7 +1284,13 @@ function applyCloseFrame(f){
 }
 function playClose(animate){
   const tr = state.close.trace;
-  if(!tr || !tr.length) return;
+  // A verdict with an EMPTY trace is the normal outcome of the two checks the
+  // simulation makes before the jaws move at all (NOTHING IN HAND, TABLE STRIKE
+  // at the entry angle): nothing is animated, but there IS something to say.
+  // Returning here without mark() was the whole reason CLOSE looked dead in a
+  // real browser -- the default pose is not holding anything, so every first
+  // click hit exactly this path and repainted nothing.
+  if(!tr || !tr.length){ mark(); return; }
   if(closeAnim){ cancelAnimationFrame(closeAnim); closeAnim = null; }
   if(!animate){ applyCloseFrame(tr[tr.length-1]); mark(); return; }
   const t0 = performance.now();
@@ -1722,7 +1749,20 @@ function loadExpert(name){
 $("#bExpCyl").onclick =()=>loadExpert("cylinder_3cm");
 $("#bExpPuck").onclick=()=>loadExpert("puck_d40x10");
 $("#bPuckSeat").onclick=()=>loadExpert("puck_seated");
-$("#bClose").onclick  =()=>runClose(true);
+// CLOSE must NEVER be a no-op click: every path either animates or puts a
+// verdict on screen saying why it could not.  A thrown exception is shown too,
+// rather than dying in a console the user is not reading.
+$("#bClose").onclick  =()=>{
+  try { runClose(true); }
+  catch(err){
+    console.error("CLOSE failed", err);
+    state.close.verdict = {kind:"ERROR", cls:"b-no", title:"CLOSE FAILED",
+      why:`the simulation threw: ${err && err.message ? err.message : err}`,
+      target:NaN, F_slide:NaN, F_tip:NaN, log:[String(err)]};
+    state.close.trace = null;
+    mark();
+  }
+};
 $("#bReopen").onclick =()=>resetClose();
 
 $("#bJson").onclick=()=>copy(JSON.stringify(
@@ -1749,7 +1789,7 @@ buildJointUI(); buildObjUI(); buildCloseUI();
 /* ========================================================================== *
  * 10b. URL scenario -- how the headless verification drives this file.        *
  *   ?obj=puck_d40x10&q=a,b,c,d,e&grip=1.5&ox=..&oy=..&lift=..&tiltX=..        *
- *   &yaw=..&mu=..&expert=cylinder_3cm&close=1                                 *
+ *   &yaw=..&mu=..&expert=cylinder_3cm&close=1&click=bClose                     *
  * `close=1` runs the simulation and jumps STRAIGHT to its last frame (no      *
  * animation), so a screenshot is deterministic.  Nothing here is reachable    *
  * unless a query string asks for it.                                          *
@@ -1773,6 +1813,15 @@ buildJointUI(); buildObjUI(); buildCloseUI();
     state.cam.el=+c[1]; state.cam.dist=+c[2];
     if(c.length>5) state.cam.target=[+c[3],+c[4],+c[5]]; }
   buildObjCtl();
+  // `click=<element id>` fires a REAL click on a real button, so the headless
+  // check exercises the same path a user's mouse does (the `close=1` path below
+  // calls runClose directly and therefore cannot see a broken button).
+  if(p.has("click")){
+    const el = document.getElementById(p.get("click"));
+    if(!el) console.log("CLICK no such element: "+p.get("click"));
+    else { el.click(); console.log("CLICK dispatched on #"+p.get("click")+
+      " -> verdict "+JSON.stringify(state.close.verdict && state.close.verdict.title)); }
+  }
   if(p.get("close")==="1"){
     const v = runClose(p.get("anim") === "1");   // anim=1 exercises the rAF chain
     console.log("CLOSE VERDICT", JSON.stringify(
