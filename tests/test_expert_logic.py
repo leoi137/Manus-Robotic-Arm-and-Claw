@@ -1005,7 +1005,8 @@ def test_the_tip_clearance_override_moves_a_short_objects_grasp():
 
 
 def test_the_puck_cannot_be_fixed_by_grasp_height_alone():
-    """The measurement behind ``puck_d40x10.experimental``.
+    """The sweep measurement that kept ``puck_d40x10`` experimental until the
+    mesh-collider fix.
 
     The preview run's puck was punted off the table by the closing jaw. The
     reason is in the sweep, not in the hover: the moving finger arrives tilted
@@ -1028,7 +1029,9 @@ def test_the_puck_cannot_be_fixed_by_grasp_height_alone():
         after = jaw_clouds(angle - 0.02)[1][:, 2].max()
         assert after > before, f"{clearance_mm} mm: the jaw is rising at contact"
     assert first_rim_contact(PUCK, 0.007)[2] <= 0.003  # the "pads on 3 mm of rim" end
-    assert PUCK.experimental
+    # The sweep geometry above is real but, with live colliders (mesh-cylinder
+    # fix), measured survivable: the puck gates 200/200, so the flag is gone.
+    assert not PUCK.experimental
 
 
 def test_the_measured_stall_anchor_matches_the_meshes():
@@ -2651,8 +2654,8 @@ def test_the_thick_pucks_grasp_is_raised_out_of_the_levering_band():
     the pads' purchase from 12.3 mm to 8.2.
 
     The thin puck cannot have both -- clearing its 5 mm centre of mass would
-    leave the pads 3.2 mm of rim, well under the 8 mm bar -- which is the same
-    reason it is experimental and its thick respec exists.
+    leave the pads 3.2 mm of rim, well under the 8 mm bar -- which is why it
+    was experimental until the mesh-collider fix and its thick respec exists.
     """
     from manus.expert import (
         JAW_TIP_Z,
@@ -2689,21 +2692,22 @@ def test_the_thick_pucks_grasp_is_raised_out_of_the_levering_band():
     thin_purchase = PUCK.extent_z - (thin_height + TCP_TO_PAD_CENTRE - JAW_TIP_Z)
     assert thin_purchase == pytest.approx(0.0032, abs=2e-4)
     assert thin_purchase < 0.008
-    # Both pucks are experimental today: the thin one for rim purchase, the
-    # thick one for the CLOSE-time seating-shove ejection (geometry above is
-    # sound; the failure lives in the closure dynamics, not the grasp height).
-    assert THICK_PUCK.experimental and PUCK.experimental
+    # Neither puck is experimental any more: the tight geometry above is real,
+    # but with live colliders (mesh-cylinder fix) both gate 200/200 -- the old
+    # failures lived in the ghost contacts, not the grasp height.
+    assert not THICK_PUCK.experimental and not PUCK.experimental
 
 
-def test_the_shove_failing_objects_sit_out_of_the_default_sweep():
+def test_the_once_shove_failing_objects_are_back_in_the_default_sweep():
     from manus.objects import DEFAULT_OBJECTS
 
-    # Deliberate state (2026-08-12): both pucks and the side-grasp cylinder
-    # are excluded until the no-shove closure lands -- a default sweep must
-    # never bake datasets from objects that measurably fail at CLOSE.
-    assert "puck_d40x20" not in DEFAULT_OBJECTS
-    assert "puck_d40x10" not in DEFAULT_OBJECTS
-    assert "cylinder_3cm" not in DEFAULT_OBJECTS
+    # Deliberate state (2026-08-13): the "shove" was the analytic-cylinder
+    # colliders generating no contacts at the fixed pad (see
+    # ObjectSpec.make_spawn_cfg); with mesh colliders all three gate at
+    # 96.5-100% and rejoin the sweep the datasets are baked from.
+    assert "puck_d40x20" in DEFAULT_OBJECTS
+    assert "puck_d40x10" in DEFAULT_OBJECTS
+    assert "cylinder_3cm" in DEFAULT_OBJECTS
 
 
 # --- The creeping CLOSE ---------------------------------------------------------------

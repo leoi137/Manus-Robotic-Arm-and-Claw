@@ -536,8 +536,9 @@ OBJECTS: dict[str, ObjectSpec] = {
     # feel. With a live pad the same attempt-0 draw probes and films as a hold
     # (runs/contact_probe/meshcyl.json, runs/expert_demo/cylinder_3cm_0000.mp4:
     # fixed jaw loads on-pad at 29.78 mm gap vs 30.0 mesh, CLOSE moves the
-    # object 0.22 mm / 0.03 deg, held 60/30). ``experimental`` stays set until
-    # the >=200-attempt gate re-runs.
+    # object 0.22 mm / 0.03 deg, held 60/30). The 200-attempt expert_gate
+    # re-run scores 193/200 (7 no_grasp, no flings), inside the shipped
+    # objects' 85-100% band, so ``experimental`` is cleared.
     #
     # Its height is what makes it the side case rather than the puck: the hand's
     # own housing hangs 27.8 mm below the tool axis (manus.expert.SIDE_JAW_DEPTH),
@@ -560,7 +561,6 @@ OBJECTS: dict[str, ObjectSpec] = {
         grasp_mode="side",
         close_creep=True,
         seat_close=True,
-        experimental=True,  # attempt-0 demo grasps since the mesh-collider fix; pending gate re-run
     ),
     # A 16 mm acrylic die (~1200 kg/m^3): the smallest thing in the catalogue,
     # and the object the arm's own convergence residual is worst for -- 5.9 mm
@@ -622,8 +622,8 @@ OBJECTS: dict[str, ObjectSpec] = {
     # through the analytic-cylinder bug (see make_spawn_cfg). With live
     # colliders the attempt-0 filmed demo holds it 58/30 with a 4.4 mm /
     # 3.9 deg nudge at CLOSE (runs/expert_demo/puck_d40x10_0000.mp4) -- the
-    # edge-drag is still visible, just no longer fatal. ``experimental`` stays
-    # set until the >=200-attempt gate re-runs.
+    # edge-drag is still visible, just no longer fatal: the 200-attempt
+    # expert_gate re-run scores 200/200, so ``experimental`` is cleared.
     "puck_d40x10": ObjectSpec(
         name="puck_d40x10",
         shape="cylinder",
@@ -634,7 +634,6 @@ OBJECTS: dict[str, ObjectSpec] = {
         spawn_z=0.005,
         close_target_rad=close_target_for_width(0.040),
         yaw_symmetry="free",
-        experimental=True,  # attempt-0 demo grasps since the mesh-collider fix; pending gate re-run
     ),
     # The 10 mm puck's respec: same 40 mm disc, twice as thick (~1200 kg/m^3,
     # 30 g). The width, and so the close target and the contact angle, are
@@ -661,9 +660,9 @@ OBJECTS: dict[str, ObjectSpec] = {
     # measured through the analytic-cylinder bug (see make_spawn_cfg). With
     # live colliders the attempt-0 filmed demo holds it 58/30, CLOSE moving it
     # 0.29 mm / 0.30 deg (runs/expert_demo/puck_d40x20_0000.mp4). The two
-    # changes below were tuned against the broken contacts and are kept as-is
-    # -- they measure no worse now -- but re-judge them at the gate.
-    # ``experimental`` stays set until the >=200-attempt gate re-runs.
+    # changes below were tuned against the broken contacts and are kept as-is:
+    # the 200-attempt expert_gate re-run scores 200/200 with them in place, so
+    # ``experimental`` is cleared.
     #
     # THE GRASP IS RAISED 4.1 mm OFF ITS OWN CENTRE, and tip_clearance_m is how,
     # because the bar is this object's alone. Centred, the Step 23 preview was
@@ -701,7 +700,6 @@ OBJECTS: dict[str, ObjectSpec] = {
         tip_clearance_m=0.01176,
         close_creep=True,
         seat_close=True,
-        experimental=True,  # attempt-0 demo grasps since the mesh-collider fix; pending gate re-run
     ),
     # A regulation ping-pong ball: 40 mm, 2.7 g, hollow (~80 kg/m^3). Kept at
     # its real mass deliberately -- it is the catalogue's slip-and-roll case,

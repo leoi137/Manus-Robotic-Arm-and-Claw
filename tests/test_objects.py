@@ -291,18 +291,17 @@ def test_a_nonsense_override_is_rejected():
 # --- Experimental objects --------------------------------------------------------
 
 
-def test_the_default_sweep_leaves_the_experimental_objects_out_but_keeps_them_runnable():
-    """The puck fails by geometry (see manus.expert), so it must not ride into a dataset.
+def test_the_default_sweep_covers_the_whole_catalogue_since_the_collider_fix():
+    """No object is experimental since the mesh-collider fix (2026-08-13).
 
-    It stays in OBJECTS -- spawnable, plannable, runnable by name -- and only
-    the default "every object" list drops it.
+    The three cylinders were excluded while the analytic-cylinder colliders
+    made every one of their grasps fail (see ``ObjectSpec.make_spawn_cfg``);
+    with mesh colliders they gate at 193/200, 200/200 and 200/200 -- inside
+    the shipped objects' 85-100% band -- so the default "every object" sweep
+    is the whole catalogue again. The filter mechanism itself stays: an object
+    marked experimental drops out of DEFAULT_OBJECTS without leaving OBJECTS.
     """
-    assert set(DEFAULT_OBJECTS) < set(OBJECTS)
-    assert [name for name in OBJECTS if name not in DEFAULT_OBJECTS] == [
-        "cylinder_3cm",  # CLOSE-time seating-shove failure; side approach itself is proven
-        "puck_d40x10",  # pads can only reach a ~3 mm sliver of rim
-        "puck_d40x20",  # CLOSE-time seating-shove failure (same mechanism as the cylinder)
-    ]
+    assert DEFAULT_OBJECTS == tuple(OBJECTS)
     assert DEFAULT_OBJECTS == tuple(
         name for name, spec in OBJECTS.items() if not spec.experimental
     )

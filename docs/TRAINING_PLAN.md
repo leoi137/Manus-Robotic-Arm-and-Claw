@@ -35,7 +35,10 @@ fixed pad was a ghost the object slid straight through before being flung by a
 late deep-penetration catch. Cylinders now spawn as mesh prims with convex-hull
 colliders (`ObjectSpec.make_spawn_cfg`), and all three pass their attempt-0
 probes/filmed demos (`runs/expert_demo/{cylinder_3cm,puck_d40x10,puck_d40x20}_0000.mp4`).
-They stay excluded from the sweep until the ≥200-attempt expert gate re-runs.
+The ≥200-attempt expert gate re-ran 2026-08-13: `cylinder_3cm` 193/200
+(96.5%), `puck_d40x10` 200/200, `puck_d40x20` 200/200 — all inside the
+shipped objects' band, so `experimental` is cleared and all three are back in
+the default sweep. Their v2 datasets are the next generation run.
 
 ## Stage 1 — ACT baseline (diagnostic, do first)
 
