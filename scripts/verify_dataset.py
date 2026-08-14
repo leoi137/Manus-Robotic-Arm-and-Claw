@@ -57,8 +57,12 @@ from manus import recorder
 VERIFIER_VERSION = 1
 """Bumped whenever a check is added, removed or tightened."""
 
-FRAME_COUNT_RANGE = (30, 600)
-"""Plausible episode length, in control steps: shorter is a stub, longer a stall."""
+FRAME_COUNT_RANGE = (30, 1200)
+"""Plausible episode length, in control steps: shorter is a stub, longer a stall.
+
+The upper bound tracks expert.MAX_CONTROL_STEPS: scan-phase episodes sweep the
+whole workspace before approaching (mean ~485 steps, worst case ~1085), so the
+old 600 cap sized for v2's scan-free episodes would fail legitimate data."""
 
 DT_TOLERANCE = 0.20
 """Fractional slack allowed on each inter-frame interval against 1 / control_hz."""
